@@ -54,7 +54,7 @@ RouteForge/
 | # | Phase | What it lets you show | Size | Status |
 |---|---|---|---|---|
 | 0 | Skeleton and tooling | Empty workspace builds, lints and tests | S | done locally; CI not run yet |
-| 1 | Algorithms (`routeforge-tsp`) | Cost falling stage by stage on a random instance; benchmarks | L | todo |
+| 1 | Algorithms (`routeforge-tsp`) | Cost falling stage by stage on a random instance; benchmarks | L | done |
 | 2 | Schema and job queue (`routeforge-domain`) | Queue tests: exclusive claim, lease expiry, fenced completion | L | todo |
 | 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | todo |
 | 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | todo |
@@ -84,17 +84,24 @@ Not verified yet, because each needs something outside the repository:
 
 ## Phase 1: algorithms (`routeforge-tsp`)
 
-Needs no Docker, so it can start immediately.
+Delivered:
 
-- Types: `DistanceMatrix` (flat `Vec<u32>`), `Problem` (depot, stops with planar point and demand, courier capacities), `Tour`, `Clustering`.
+- Types: `DistanceMatrix` (flat `Vec<u32>`, symmetric by construction), `Problem` (depot, stops with planar point and demand, courier capacities), `Tour`, `Clustering`.
 - Construction and local search: nearest neighbour, 2-opt, Or-opt (segments of 1 to 3), alternated until neither improves.
 - Simulated annealing over 2-opt, relocate and swap moves, keeping the best tour seen.
-- Run control shared by all stages: iteration budget and/or deadline, an `AtomicBool` cancel flag, a progress callback.
-- Sweep clustering by capacity, trying several start angles and keeping the best. Stops that fit no courier are returned as unassigned, never silently dropped.
-- Two public entry points, matching the two job kinds: `cluster(&Problem) -> Clustering` and `optimize_route(&DistanceMatrix, seed, control) -> Tour`.
-- Tests: proptest properties (every stop exactly once; capacity never exceeded; local search never worsens and ends 2-opt-optimal; incremental delta equals full recomputation; same seed and budget give the same tour; cancel and deadline are honoured), a brute-force oracle for up to 9 stops, and a few embedded TSPLIB instances with known optima as a quality regression.
-- Criterion benchmarks per stage at 50, 200 and 1000 stops; an example binary that prints the cost after each stage.
-- **Done when:** tests pass, benchmarks run, and the example shows the cost falling at each stage.
+- Run control shared by all stages (`Control`): iteration budget and/or deadline, an `AtomicBool` cancel flag, a progress callback.
+- Sweep clustering by capacity, from up to 36 start positions, keeping the best. Stops that fit no courier are returned as unassigned, never silently dropped.
+- Two public entry points, matching the two job kinds: `cluster(&Problem) -> Clustering` and `optimize_route(&DistanceMatrix, seed, &mut Control) -> Tour`.
+- Tests: proptest properties (every stop exactly once; capacity never exceeded; local search never worsens and ends 2-opt- and Or-opt-optimal; incremental delta equals full recomputation; same seed and budget give the same tour; a larger budget never gives a longer one; cancel and deadline are honoured), a brute-force oracle for up to 9 stops, and three TSPLIB instances with their published optimal tours as a quality regression (eil51, berlin52, kroA100).
+- Criterion benchmarks per stage at 50, 200 and 1000 stops: `cargo bench -p routeforge-tsp`.
+- An example that plans a seeded random day and prints the total length after each stage: `cargo run -p routeforge-tsp --release --example stages`.
+
+What later phases need from it, with the reasons in the decision log:
+
+- Phase 3: a route with four or more stops is annealed until its budget, its deadline or the cancel flag stops it (D18), so the solver's time budget per route sets how long a plan takes.
+- Phase 3: an iteration budget counts local search moves as well (D15). Routes of 250 stops need more than a million before annealing starts.
+- Phase 3: a `Control` borrows the cancel flag and owns the progress callback, so it is built inside the `spawn_blocking` closure, not moved into it.
+- Phase 8: an OSRM table has to be symmetrized before it becomes a `DistanceMatrix` (D14).
 
 ## Phase 2: schema and job queue (`routeforge-domain`)
 
@@ -175,7 +182,7 @@ First phase that needs Postgres.
 - **sqlx compile-time queries** need a live database or committed `.sqlx/` metadata. Docker builds use `SQLX_OFFLINE=true`; CI runs `cargo sqlx prepare --check`.
 - **Native build tools.** The development machine has no CMake or NASM. Phase 0 chose features that need neither (D12); a new dependency must not bring OpenSSL or aws-lc back in.
 - **Recent major releases.** sqlx 0.9, utoipa 6, rand 0.10, jsonwebtoken 11, argon2 0.6 and criterion 0.8 are all newer than most tutorials. Read docs.rs for the pinned version.
-- **2-opt assumes a symmetric matrix**, and OSRM road distances are not symmetric. Symmetrize for the search and report the real directed length.
+- **2-opt assumes a symmetric matrix**, and OSRM road distances are not symmetric. `DistanceMatrix` rejects an asymmetric table (D14), so the solver symmetrizes for the search and reports the real directed length itself.
 - **Two route jobs finishing at once** must not each see the other as unfinished. The plan row's counter update serializes them; Phase 2 has a test for it.
 - **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well. Payloads are capped near 8 kB, so they carry ids and small numbers only.
 - **Browser `EventSource` cannot send an `Authorization` header.** The page reads the SSE stream with `fetch`.
