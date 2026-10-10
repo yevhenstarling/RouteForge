@@ -1,0 +1,22 @@
+name: routeforge
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-routeforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-routeforge}
+      POSTGRES_DB: ${POSTGRES_DB:-routeforge}
+    ports:
+      # Published on localhost only, for running the services and tests outside Docker.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  db-data:

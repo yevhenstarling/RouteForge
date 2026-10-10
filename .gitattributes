@@ -1,0 +1,2 @@
+# LF everywhere, so shell scripts and Dockerfiles work when checked out on Windows.
+* text=auto eol=lf

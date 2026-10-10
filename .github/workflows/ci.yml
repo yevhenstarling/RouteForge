@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: routeforge
+          POSTGRES_PASSWORD: routeforge
+          POSTGRES_DB: routeforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U routeforge -d routeforge"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://routeforge:routeforge@localhost:5432/routeforge
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs the toolchain and components named in rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The bot must build without the `db` feature of routeforge-domain.
+      - name: Bot builds without database code
+        run: cargo check -p routeforge-bot --locked
+
+      - name: Test
+        run: cargo test --workspace --locked

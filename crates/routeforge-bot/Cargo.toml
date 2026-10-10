@@ -1,0 +1,24 @@
+[package]
+name = "routeforge-bot"
+description = "RouteForge Telegram bot: an LLM agent that places orders through the HTTP API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Without the `db` feature: the bot reaches the system only through the HTTP API.
+routeforge-domain.workspace = true
+
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+teloxide.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
