@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+repository = "https://github.com/yevhenstarling/RouteForge"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# `unwrap` is allowed in tests only, see clippy.toml.
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[workspace.dependencies]
+# Workspace crates
+routeforge-domain = { path = "crates/routeforge-domain" }
+routeforge-tsp = { path = "crates/routeforge-tsp" }
+
+# Runtime, web, OpenAPI
+actix-web = { version = "4.15", default-features = false, features = ["macros"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+utoipa = { version = "6.0", features = ["chrono", "uuid"] }
+utoipa-actix-web = "0.2"
+# `vendored` ships the Swagger UI assets in a crate, so the build downloads nothing.
+utoipa-swagger-ui = { version = "10.0", features = ["actix-web", "vendored"] }
+
+# Database. No TLS feature: Postgres is only reached on localhost or the compose network.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "migrate",
+    "json",
+    "uuid",
+    "chrono",
+] }
+
+# Auth. `rust_crypto` is the pure-Rust backend: nothing to compile with CMake or NASM.
+argon2 = "0.6"
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+
+# Telegram bot and outgoing HTTP. reqwest stays on the 0.12 line because teloxide 0.17
+# is built on it; both use rustls with ring, so there is one HTTP stack and no OpenSSL.
+reqwest = { version = "0.12.28", default-features = false, features = ["charset", "http2", "json", "rustls-tls"] }
+teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler", "macros", "rustls"] }
+
+# Observability
+tracing = "0.1.44"
+tracing-actix-web = "0.7.25"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# Data types and errors
+anyhow = "1.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.28", features = ["serde", "v7"] }
+
+# Algorithms. rand is built without OS entropy on purpose: every random number in
+# routeforge-tsp must come from a seeded generator.
+rand = { version = "0.10.3", default-features = false, features = ["std"] }
+rand_chacha = "0.10"
+
+# Tests and benchmarks
+criterion = "0.8.2"
+proptest = "1.12"

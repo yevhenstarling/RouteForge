@@ -1,0 +1,6 @@
+[advisories]
+# RUSTSEC-2023-0071, rsa: timing side channel in RSA private-key operations, no fixed release.
+# The crate is compiled in by jsonwebtoken's pure-Rust backend, but RouteForge signs and
+# verifies tokens with HS256 only and never performs an RSA operation.
+# Remove this entry if tokens ever move to an RSA algorithm. See D12 in docs/architecture.md.
+ignore = ["RUSTSEC-2023-0071"]

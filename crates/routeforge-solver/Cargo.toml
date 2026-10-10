@@ -1,0 +1,24 @@
+[package]
+name = "routeforge-solver"
+description = "RouteForge queue worker: claims plan and route jobs and computes courier routes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+routeforge-domain = { workspace = true, features = ["db"] }
+routeforge-tsp.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

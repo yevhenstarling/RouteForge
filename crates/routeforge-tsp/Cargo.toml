@@ -1,0 +1,19 @@
+[package]
+name = "routeforge-tsp"
+description = "Clustering and route optimization for RouteForge: pure computation, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
