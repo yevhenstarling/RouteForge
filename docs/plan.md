@@ -1,0 +1,198 @@
+# RouteForge: implementation plan
+
+Phase status is in the table under "Phases at a glance". The reasons behind the decisions are in [architecture.md](architecture.md); the approved description is in [description.md](description.md).
+
+## Context
+
+RouteForge is the approved capstone for the Rust bootcamp: a backend that turns a day's parcel orders into optimized courier routes and spreads the NP-hard part over horizontally scalable workers. The approved description is the contract: one Cargo workspace of five crates, PostgreSQL as both data store and job queue, actix-web, sqlx, a single Leaflet page, and one `docker compose up`.
+
+The repository started empty, so everything is new code. There is no fixed due date, so the phases are in priority order with a cut line that can move. PostgreSQL is assumed throughout, because the queue design names `SKIP LOCKED` and `LISTEN/NOTIFY`.
+
+## Decisions the plan rests on
+
+Confirmed with the project owner:
+
+- **Order model.** One order is one stop: a delivery from the depot or a pickup back to it. Couriers start and end at the depot. This is capacitated vehicle routing, which is what sweep + 2-opt/Or-opt/SA solves.
+- **Job unit.** A plan request enqueues one `plan` job. A worker runs sweep clustering and, in the same transaction, enqueues one `route` job per cluster. Each worker then optimizes one courier's route with its own time budget, so more workers finish a plan sooner.
+- **Docker.** Docker Desktop with the WSL2 backend.
+
+Derived from the description:
+
+- **Crate boundaries.**
+  - `routeforge-tsp`: no I/O, no async, no workspace dependencies. It works on a distance matrix and planar points and knows nothing about lat/lon, orders or couriers.
+  - `routeforge-domain`: domain types and request/response DTOs, geo helpers, the `DistanceProvider` trait with its Haversine implementation, and, behind a `db` feature, the sqlx repositories, migrations and job queue. Persistence lives here because both `api` and `solver` need it and the workspace is fixed at five crates.
+  - `routeforge-api`: depends on `domain` only. It never links solver code.
+  - `routeforge-solver`: depends on `domain` and `tsp`; owns the OSRM client.
+  - `routeforge-bot`: talks to `api` over HTTP only; uses `domain` without `db` for the DTOs.
+- **Costs are integer metres** (`u32` matrix). Move deltas are exact, local search cannot loop on float noise, and property tests can assert that incremental cost equals recomputed cost.
+- **Anytime and deterministic.** The RNG is a named seeded generator (ChaCha8). Annealing cools by iteration count, in fixed-length epochs with reheats; the deadline and the cancel flag only cut that trajectory short. Same seed plus same iteration budget gives an identical route. Tests use iteration budgets, not wall-clock time.
+- **Queue guarantee.** Delivery is at-least-once: a lease can expire and the job is retried. Completion is fenced: results are written in the same transaction that marks the job done, and only if the worker still holds the lease. Lease times use the database clock, never the worker's.
+- **Capacity, version 1.** A route is feasible when the sum of all its demands, pickups and deliveries together, fits the courier's capacity. This is stricter than mixed routes need and always safe. Tracking the real load along the route is in Phase 8.
+- **Offline.** Haversine by default, Leaflet vendored into the repo, map tiles optional (routes still draw without them), and the bot idles when its tokens are absent.
+- **Bot authority.** The bot calls the API with the Telegram user's own short-lived JWT, so the model can never do more than that user's role allows. Anything with a side effect needs a button confirmation handled in code.
+
+## Target layout
+
+```
+RouteForge/
+├─ Cargo.toml, rust-toolchain.toml, .env.example
+├─ Dockerfile, docker-compose.yml
+├─ crates/
+│  ├─ routeforge-tsp/       pure algorithms; benches/, examples/
+│  ├─ routeforge-domain/    types, geo, db + queue (feature `db`); migrations/
+│  ├─ routeforge-api/       actix-web binary
+│  ├─ routeforge-solver/    worker binary
+│  └─ routeforge-bot/       teloxide binary
+├─ web/                     index.html, vendor/leaflet
+├─ scripts/                 demo.ps1, demo.sh
+├─ docs/                    description.md, plan.md, architecture.md
+└─ .sqlx/                   offline query metadata (committed)
+```
+
+## Phases at a glance
+
+| # | Phase | What it lets you show | Size | Status |
+|---|---|---|---|---|
+| 0 | Skeleton and tooling | Empty workspace builds, lints and tests | S | done locally; CI not run yet |
+| 1 | Algorithms (`routeforge-tsp`) | Cost falling stage by stage on a random instance; benchmarks | L | todo |
+| 2 | Schema and job queue (`routeforge-domain`) | Queue tests: exclusive claim, lease expiry, fenced completion | L | todo |
+| 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | todo |
+| 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | todo |
+| 5 | Live updates and map | Routes appearing and improving live in the browser | M | todo |
+| 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | todo |
+| 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | todo |
+| 8 | OSRM, hardening, presentation | Road distances, benchmark report | M | todo |
+
+**Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two tools (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description.
+
+## Phase 0: skeleton and tooling
+
+Delivered:
+
+- Root `Cargo.toml`: members `crates/*`, edition 2024, `[workspace.lints]` (no `unsafe`; no `unwrap`, `dbg!` or `todo!` outside tests) and `[workspace.dependencies]` pinned to the releases current on 2026-10-10: actix-web 4.15, sqlx 0.9, tokio 1.53, utoipa 6, utoipa-swagger-ui 10, jsonwebtoken 11, argon2 0.6, teloxide 0.17, rand 0.10, criterion 0.8, proptest 1.12. reqwest is on 0.12, not 0.13, to match teloxide; see D12 in the decision log.
+- `rust-toolchain.toml` pinned to 1.99.0. sqlx 0.9 needs 1.94 or newer.
+- Five crates with stubs, wired to the dependencies they will use, so the feature choices are already proven to build on Windows.
+- `.gitattributes` (LF endings), `.dockerignore`, `.env.example`, and `docker-compose.yml` with only `db`.
+- GitHub Actions: `fmt --check`, `clippy -D warnings`, the bot built without the `db` feature, tests with a Postgres service.
+- `docs/description.md`, this plan, `docs/architecture.md`, and `CLAUDE.md`.
+- `.cargo/audit.toml` with one justified ignore (D12).
+
+Not verified yet, because each needs something outside the repository:
+
+- The CI workflow has not run. It runs on the first push of `dev` or the first pull request.
+- `docker compose up -d db` has not been run, because Docker Desktop was not installed yet. Phase 2 is the first phase that needs it.
+
+## Phase 1: algorithms (`routeforge-tsp`)
+
+Needs no Docker, so it can start immediately.
+
+- Types: `DistanceMatrix` (flat `Vec<u32>`), `Problem` (depot, stops with planar point and demand, courier capacities), `Tour`, `Clustering`.
+- Construction and local search: nearest neighbour, 2-opt, Or-opt (segments of 1 to 3), alternated until neither improves.
+- Simulated annealing over 2-opt, relocate and swap moves, keeping the best tour seen.
+- Run control shared by all stages: iteration budget and/or deadline, an `AtomicBool` cancel flag, a progress callback.
+- Sweep clustering by capacity, trying several start angles and keeping the best. Stops that fit no courier are returned as unassigned, never silently dropped.
+- Two public entry points, matching the two job kinds: `cluster(&Problem) -> Clustering` and `optimize_route(&DistanceMatrix, seed, control) -> Tour`.
+- Tests: proptest properties (every stop exactly once; capacity never exceeded; local search never worsens and ends 2-opt-optimal; incremental delta equals full recomputation; same seed and budget give the same tour; cancel and deadline are honoured), a brute-force oracle for up to 9 stops, and a few embedded TSPLIB instances with known optima as a quality regression.
+- Criterion benchmarks per stage at 50, 200 and 1000 stops; an example binary that prints the cost after each stage.
+- **Done when:** tests pass, benchmarks run, and the example shows the cost falling at each stage.
+
+## Phase 2: schema and job queue (`routeforge-domain`)
+
+First phase that needs Postgres.
+
+- Migrations inside the crate: `users`, `depots`, `couriers`, `orders`, `plans`, `routes`, `route_stops`, `jobs`, `workers`. A partial index on claimable jobs; a unique index allowing one active plan per service date.
+- Types: id newtypes, `Role`, order/plan/job status enums, `JobPayload` (tagged enum stored as JSONB), `LatLon`, DTOs.
+- Geo: haversine, a local planar projection for sweep, `DistanceProvider` and `Haversine`.
+- Repositories for users, couriers, orders, plans and routes with sqlx compile-time checked queries.
+- Queue operations:
+  - `enqueue`, with `NOTIFY`.
+  - `claim`: `FOR UPDATE SKIP LOCKED`; also takes jobs whose lease has expired.
+  - `heartbeat`: extends the lease, stores progress, reports a cancel request or a lost lease.
+  - `complete`: fenced; runs the caller's result writes in the same transaction.
+  - `fail` (retry with backoff, terminal after max attempts), `release`, `request_cancel`.
+  - Worker registry upsert, for the worker-load view.
+- Tests against real Postgres with `#[sqlx::test]`: many concurrent claimers and each job claimed once; an expired lease is re-claimed; a stale worker cannot complete; cancel propagates; max attempts ends in `failed`; route jobs completing at the same moment mark the plan done exactly once.
+- **Done when:** the queue test suite passes against the compose database.
+
+## Phase 3: solver worker (`routeforge-solver`)
+
+- Worker loop: connect with retry, register, `LISTEN` plus a jittered polling fallback, claim, run, complete or fail. One job at a time per instance by default, so capacity scales with the instance count.
+- `plan` job: load the date's orders, active couriers and depot; project; `cluster`; insert the `route` jobs and update the plan inside the completing transaction.
+- `route` job: build the matrix through `DistanceProvider`; run `optimize_route` in `spawn_blocking`; a heartbeat task extends the lease, publishes progress from a `watch` channel, and sets the cancel flag on a cancel request or a lost lease; fenced completion writes `routes` and `route_stops` and increments the plan's done counter.
+- Graceful shutdown on Ctrl-C or SIGTERM: stop claiming, cancel the solve, release the job back to the queue.
+- `tracing` spans carrying `worker_id`, `job_id`, `plan_id`, `request_id`.
+- `Dockerfile` (multi-stage with cargo-chef, `SQLX_OFFLINE=true`) and a `solver` service in compose, so image builds are exercised from here on.
+- Tests: headless end to end (seed orders, enqueue a plan, run three in-process workers, every order routed exactly once within capacity); abort a worker mid-solve and the plan still completes after lease expiry; cancel stops jobs within one heartbeat.
+- **Done when:** those tests pass and `docker compose up --scale solver=3` starts three idle workers.
+
+## Phase 4: API (`routeforge-api`)
+
+- Skeleton: config from env, pool, migrations at startup, request-id middleware (accept or generate `X-Request-Id`, echo it, put it in the span), problem+json errors, `/healthz`, `/readyz`.
+- Auth: register and login, argon2id hashing off the async threads, JWT with a role claim, an `AuthUser` extractor, role and ownership checks. Admin seeded from env.
+- Resources: orders (clients see their own; operators and admins see all), couriers, depot, users.
+- Plans: create (plan row, `plan` job and `NOTIFY` in one transaction; `409` when the date already has an active plan; the request id is stored on the job), get, list routes with ordered stops, cancel.
+- System stats: queue depth by status, workers alive and busy.
+- OpenAPI through utoipa on every DTO and handler; Swagger UI at `/docs` with vendored assets.
+- Demo data: an admin endpoint that generates N random orders around the depot from a seed. This lives in the API so no sixth crate is needed.
+- Tests: role matrix (each role against each endpoint), ownership, validation, enqueue atomicity, OpenAPI snapshot.
+- **Done when:** the whole flow works from Swagger UI: log in, create orders, create a plan, read back the routes.
+
+## Phase 5: live updates and map
+
+- API: one `PgListener` feeding a `tokio::sync::broadcast` channel; SSE endpoints for one plan's events and for system stats.
+- Workers publish status and throttled progress with `NOTIFY`.
+- `web/index.html`, served by the API: login, date picker, generate demo orders, plan, cancel; a Leaflet map with the depot, stops and one coloured line per courier; per-route progress; queue depth and worker list.
+- Leaflet vendored under `web/vendor/`; the tile layer is optional.
+- **Done when:** pressing Plan shows routes appear and improve live, with the network unplugged as well.
+
+## Phase 6: one-command stack, scaling and failure demo
+
+- Compose: `db`, `api`, `solver` (no fixed name or ports, so it scales), `bot`; healthchecks and `depends_on: service_healthy`.
+- Scaling run: the same seeded plan with 1 and with 4 solvers, time to completion recorded.
+- Failure run: `docker kill` a solver mid-solve; the lease expires and another worker finishes. Scripted in `scripts/demo.ps1` and `scripts/demo.sh`.
+- **Done when:** a fresh clone needs only `docker compose up --build --scale solver=4`.
+
+## Phase 7: Telegram bot (`routeforge-bot`)
+
+- API side: `users.telegram_id`, and a service-key endpoint that maps a Telegram user to a RouteForge user and returns a short-lived JWT for them.
+- Bot: teloxide long polling, so no public URL is needed; bounded per-chat history in memory.
+- Claude client over `reqwest` against the Messages API (there is no official Rust SDK), with a hand-written tool loop: capped iterations, all tool results of a turn returned in one message, assistant content echoed back unchanged, `refusal` and `max_tokens` stop reasons handled.
+- Tools with strict schemas. Clients: `create_order`, `list_my_orders`, `get_order`, `cancel_order`. Operators also: `list_pending_orders`, `create_plan`, `get_plan_status`.
+- Location comes from Telegram's share-location message.
+- Model id from env, default `claude-opus-5-5`. Running a cheaper model is a config change and the owner's call.
+- Tests: the tool loop against a scripted fake model; request and response shapes with wiremock.
+- **Done when:** sharing a location and writing "deliver two parcels here tomorrow" produces, after confirmation, an order visible on the map.
+
+## Phase 8: OSRM, hardening, presentation
+
+- `OsrmProvider` in the solver using OSRM's table service, falling back to Haversine on error; an `osrm` compose profile.
+- Real load tracking for mixed pickup and delivery routes.
+- Address geocoding for the bot.
+- README with benchmark numbers, quality against time, and the scaling table; final architecture doc; `cargo audit` in CI.
+
+## Known traps
+
+- **sqlx compile-time queries** need a live database or committed `.sqlx/` metadata. Docker builds use `SQLX_OFFLINE=true`; CI runs `cargo sqlx prepare --check`.
+- **Native build tools.** The development machine has no CMake or NASM. Phase 0 chose features that need neither (D12); a new dependency must not bring OpenSSL or aws-lc back in.
+- **Recent major releases.** sqlx 0.9, utoipa 6, rand 0.10, jsonwebtoken 11, argon2 0.6 and criterion 0.8 are all newer than most tutorials. Read docs.rs for the pinned version.
+- **2-opt assumes a symmetric matrix**, and OSRM road distances are not symmetric. Symmetrize for the search and report the real directed length.
+- **Two route jobs finishing at once** must not each see the other as unfinished. The plan row's counter update serializes them; Phase 2 has a test for it.
+- **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well. Payloads are capped near 8 kB, so they carry ids and small numbers only.
+- **Browser `EventSource` cannot send an `Authorization` header.** The page reads the SSE stream with `fetch`.
+
+## Needed from the project owner
+
+- Docker Desktop installed before Phase 2. Phase 1 does not need it.
+- Before Phase 7: a Telegram bot token from @BotFather and an Anthropic API key.
+- If the bootcamp grades against a rubric (coverage, report, presentation format), it gets folded into Phase 8.
+
+## Verification
+
+1. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` with the compose `db` up, and `cargo bench -p routeforge-tsp`.
+2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, generate 300 orders, press Plan. Routes appear and improve live; `/docs` lists every endpoint.
+3. Determinism: run the same plan twice with the same seed and an iteration budget; the routes are identical.
+4. Scaling: the same plan with 1 solver and with 4; completion time drops until workers outnumber routes.
+5. Failure: `docker kill` one solver mid-solve; within the lease time another worker takes over and every order is still routed exactly once.
+6. Tracing: take the `X-Request-Id` of the plan request and find it in the logs of the API and of every solver that worked on that plan.
+7. Offline: disconnect the network and repeat step 2. Routes draw without map tiles and the bot idles.
+8. Bot: place an order by chat and see it on the map.
