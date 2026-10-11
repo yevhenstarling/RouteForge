@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs\n             SET status = 'queued',\n                 run_at = now() + $4::bigint * interval '1 millisecond',\n                 claimed_by = NULL,\n                 lease_expires_at = NULL,\n                 error = $5\n             WHERE id = $1 AND status = 'running' AND claimed_by = $2 AND attempt = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4a1ed9ad3b28f275c8e6807094d21c0ed110f39867fce06a9184eb12f0198d89"
+}

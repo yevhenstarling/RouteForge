@@ -1,0 +1,1202 @@
+//! The queue's test suite, against a real PostgreSQL.
+//!
+//! Nothing here waits for a lease to run out. A job that must stay held gets a long
+//! lease, and one that must be expired gets a lease of no length, which the database
+//! sees as over by the next statement.
+
+use std::collections::HashSet;
+
+use sqlx::postgres::PgListener;
+use tokio::task::JoinSet;
+
+use super::*;
+use crate::db::testing::{self, LONG, Routing, complete_route, date, soon};
+use crate::db::{orders, plans, routes};
+use crate::ids::{CourierId, OrderId};
+use crate::job::JobKind;
+use crate::model::{NewRoute, OrderStatus};
+
+/// The database's clock, which is the only one the queue uses.
+async fn db_now(pool: &PgPool) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT now()")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Whether `at` lies `span` after a moment between two readings of the clock.
+///
+/// The readings are taken just before and just after the call under test. That pins
+/// the time the call stored exactly, however long the machine took over it.
+fn is_span_after(
+    at: DateTime<Utc>,
+    span: Duration,
+    before: DateTime<Utc>,
+    after: DateTime<Utc>,
+) -> bool {
+    before + span <= at && at <= after + span
+}
+
+/// Makes a queued job the oldest one that is due, so the next claim takes it.
+async fn make_due(pool: &PgPool, job_id: JobId) {
+    sqlx::query("UPDATE jobs SET run_at = now() - interval '1 day' WHERE id = $1")
+        .bind(job_id.0)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn stored(pool: &PgPool, job_id: JobId) -> Job {
+    get(pool, job_id).await.unwrap().unwrap()
+}
+
+async fn statuses(pool: &PgPool, routing: &Routing) -> Vec<JobStatus> {
+    let jobs = list_for_plan(pool, routing.plan.id).await.unwrap();
+    jobs.into_iter().map(|job| job.status).collect()
+}
+
+/// Every order of the plan is pending and belongs to no plan.
+async fn orders_are_free(pool: &PgPool, routing: &Routing) -> bool {
+    for order_id in routing.order_ids() {
+        let order = orders::get(pool, order_id).await.unwrap().unwrap();
+        if (order.status, order.plan_id) != (OrderStatus::Pending, None) {
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn the_retry_delay_doubles_up_to_a_minute() {
+    let seconds: Vec<u64> = (1..=8)
+        .map(|attempt| retry_delay(attempt).as_secs())
+        .collect();
+    assert_eq!(seconds, [2, 4, 8, 16, 32, 60, 60, 60]);
+    // Attempts are counted from 1, and no count is too large.
+    assert_eq!(retry_delay(0), retry_delay(1));
+    assert_eq!(retry_delay(u32::MAX), Duration::from_secs(60));
+}
+
+#[sqlx::test]
+async fn an_enqueued_job_is_queued_and_due(pool: PgPool) {
+    let plan = testing::plan(&pool, date(12)).await;
+    let payload = JobPayload::Route {
+        plan_id: plan.id,
+        courier_id: CourierId::generate(),
+        order_ids: vec![OrderId::generate()],
+        seed: u64::MAX,
+    };
+    let id = enqueue(&pool, &payload, Some("req-42")).await.unwrap();
+
+    let job = stored(&pool, id).await;
+    assert_eq!((job.id, job.plan_id), (id, plan.id));
+    // The payload survives JSONB, a 64-bit seed included.
+    assert_eq!(job.payload, payload);
+    assert_eq!(job.status, JobStatus::Queued);
+    assert_eq!((job.attempt, job.max_attempts), (0, MAX_ATTEMPTS));
+    assert_eq!((job.claimed_by, job.lease_expires_at), (None, None));
+    assert_eq!(
+        (job.progress, &job.error, job.finished_at),
+        (None, &None, None)
+    );
+    assert_eq!(job.request_id.as_deref(), Some("req-42"));
+    assert!(job.run_at <= db_now(&pool).await);
+
+    assert_eq!(get(&pool, JobId::generate()).await.unwrap(), None);
+}
+
+#[sqlx::test]
+async fn the_schema_accepts_every_kind_and_status_of_job(pool: PgPool) {
+    let plan = testing::plan(&pool, date(12)).await;
+    let payloads = [
+        JobPayload::Plan { plan_id: plan.id },
+        JobPayload::Route {
+            plan_id: plan.id,
+            courier_id: CourierId::generate(),
+            order_ids: Vec::new(),
+            seed: 1,
+        },
+    ];
+    let mut kinds = Vec::new();
+    for payload in &payloads {
+        let id = enqueue(&pool, payload, None).await.unwrap();
+        kinds.push(stored(&pool, id).await.payload.kind());
+    }
+    assert_eq!(kinds, JobKind::ALL);
+
+    let id = enqueue(&pool, &payloads[1], None).await.unwrap();
+    for &status in JobStatus::ALL {
+        sqlx::query(
+            "UPDATE jobs
+             SET status = $2,
+                 claimed_by = $3,
+                 lease_expires_at = CASE WHEN $2 = 'running' THEN now() END,
+                 finished_at = CASE WHEN $2 IN ('done', 'failed', 'cancelled') THEN now() END
+             WHERE id = $1",
+        )
+        .bind(id.0)
+        .bind(status.as_str())
+        .bind(WorkerId::generate().0)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored(&pool, id).await.status, status);
+    }
+}
+
+#[sqlx::test]
+async fn a_payload_must_agree_with_its_columns(pool: PgPool) {
+    let plan = testing::plan(&pool, date(12)).await;
+    let other = testing::plan(&pool, date(13)).await;
+    let insert = "INSERT INTO jobs (id, plan_id, kind, payload, max_attempts)
+                  VALUES ($1, $2, $3, $4, 3)";
+    let payload = Json(JobPayload::Plan { plan_id: plan.id });
+
+    for (plan_id, kind) in [(plan.id, "route"), (other.id, "plan")] {
+        let error = sqlx::query(insert)
+            .bind(JobId::generate().0)
+            .bind(plan_id.0)
+            .bind(kind)
+            .bind(&payload)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        let database = error.as_database_error().unwrap();
+        assert_eq!(database.constraint(), Some("jobs_payload_check"));
+    }
+}
+
+#[sqlx::test]
+async fn workers_hear_of_a_job_when_its_transaction_commits(pool: PgPool) {
+    let plan = testing::plan(&pool, date(12)).await;
+    let payload = JobPayload::Plan { plan_id: plan.id };
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(JOBS_CHANNEL).await.unwrap();
+    let silence = Duration::from_millis(300);
+
+    // Rolled back: no job, and no word of one.
+    let mut tx = pool.begin().await.unwrap();
+    enqueue(&mut *tx, &payload, None).await.unwrap();
+    tx.rollback().await.unwrap();
+    assert!(
+        tokio::time::timeout(silence, listener.recv())
+            .await
+            .is_err()
+    );
+    assert!(list_for_plan(&pool, plan.id).await.unwrap().is_empty());
+
+    // Committed: nothing before the commit, the notification after it.
+    let mut tx = pool.begin().await.unwrap();
+    enqueue(&mut *tx, &payload, None).await.unwrap();
+    assert!(
+        tokio::time::timeout(silence, listener.recv())
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    let notification = soon(listener.recv()).await.unwrap();
+    assert_eq!(notification.channel(), JOBS_CHANNEL);
+    assert_eq!(notification.payload(), "plan");
+}
+
+/// The payload is the kind of the job and nothing more, so that PostgreSQL folds the
+/// notifications of one transaction into one (D26).
+#[sqlx::test]
+async fn a_plan_that_fans_out_wakes_a_worker_once(pool: PgPool) {
+    let plan = testing::plan(&pool, date(12)).await;
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(JOBS_CHANNEL).await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    for seed in 0..20 {
+        let payload = JobPayload::Route {
+            plan_id: plan.id,
+            courier_id: CourierId::generate(),
+            order_ids: Vec::new(),
+            seed,
+        };
+        enqueue(&mut *tx, &payload, None).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let notification = soon(listener.recv()).await.unwrap();
+    assert_eq!(notification.payload(), "route");
+    let silence = Duration::from_millis(300);
+    assert!(
+        tokio::time::timeout(silence, listener.recv())
+            .await
+            .is_err(),
+        "twenty jobs were announced more than once"
+    );
+    assert_eq!(list_for_plan(&pool, plan.id).await.unwrap().len(), 20);
+}
+
+#[sqlx::test]
+async fn a_claim_takes_the_oldest_due_job_and_starts_its_lease(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 3, 1).await;
+    let worker = WorkerId::generate();
+    let not_yet = routing.routes[0].job_id;
+    sqlx::query("UPDATE jobs SET run_at = now() + interval '1 hour' WHERE id = $1")
+        .bind(not_yet.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let before = db_now(&pool).await;
+    let first = claim(&pool, worker, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let after = db_now(&pool).await;
+    assert_eq!(
+        first.lease,
+        Lease {
+            job_id: routing.routes[1].job_id,
+            plan_id: routing.plan.id,
+            worker_id: worker,
+            attempt: 1,
+            max_attempts: MAX_ATTEMPTS,
+        }
+    );
+    assert!(!first.lease.is_last_attempt());
+    assert_eq!(first.request_id.as_deref(), Some("req-1"));
+    let JobPayload::Route { courier_id, .. } = first.payload else {
+        panic!("a route job was enqueued");
+    };
+    assert_eq!(courier_id, routing.routes[1].courier_id);
+
+    let job = stored(&pool, first.lease.job_id).await;
+    assert_eq!(job.status, JobStatus::Running);
+    assert_eq!((job.attempt, job.claimed_by), (1, Some(worker)));
+    let expires = job.lease_expires_at.unwrap();
+    assert!(
+        is_span_after(expires, Duration::from_secs(60), before, after),
+        "{expires}"
+    );
+
+    // A held job is not handed out again, and a job is not due before its time.
+    let second = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!(second.lease.job_id, routing.routes[2].job_id);
+    assert_eq!(claim(&pool, worker, LONG).await.unwrap(), None);
+    assert_eq!(stored(&pool, not_yet).await.status, JobStatus::Queued);
+}
+
+/// The database adds the span to its own clock, and says so when it cannot.
+#[sqlx::test]
+async fn a_lease_the_database_cannot_add_to_its_clock_is_refused(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 1).await;
+    let worker = WorkerId::generate();
+
+    let error = claim(&pool, worker, Duration::MAX).await.unwrap_err();
+    assert!(
+        matches!(&error, DbError::Sqlx(sqlx::Error::Database(_))),
+        "{error:?}"
+    );
+    // The claim failed as a whole: the job was not taken.
+    let job = stored(&pool, routing.routes[0].job_id).await;
+    assert_eq!((job.status, job.attempt), (JobStatus::Queued, 0));
+
+    let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    let error = heartbeat(&pool, &job.lease, Duration::MAX, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, DbError::Sqlx(sqlx::Error::Database(_))),
+        "{error:?}"
+    );
+    assert_eq!(
+        heartbeat(&pool, &job.lease, LONG, None).await.unwrap(),
+        Heartbeat::Extended
+    );
+}
+
+#[sqlx::test]
+async fn concurrent_claimers_each_get_different_jobs(pool: PgPool) {
+    const JOBS: usize = 60;
+    const CLAIMERS: usize = 8;
+    let plan = testing::plan(&pool, date(12)).await;
+    let mut enqueued = HashSet::new();
+    for seed in 0..JOBS {
+        let payload = JobPayload::Route {
+            plan_id: plan.id,
+            courier_id: CourierId::generate(),
+            order_ids: Vec::new(),
+            seed: seed as u64,
+        };
+        enqueued.insert(enqueue(&pool, &payload, None).await.unwrap());
+    }
+
+    let mut claimers = JoinSet::new();
+    for _ in 0..CLAIMERS {
+        let pool = pool.clone();
+        claimers.spawn(async move {
+            let worker = WorkerId::generate();
+            let mut mine = Vec::new();
+            while let Some(job) = claim(&pool, worker, LONG).await.unwrap() {
+                assert_eq!((job.lease.worker_id, job.lease.attempt), (worker, 1));
+                mine.push(job.lease.job_id);
+            }
+            (worker, mine)
+        });
+    }
+    let claimed: Vec<(WorkerId, Vec<JobId>)> = soon(claimers.join_all()).await;
+
+    let handed_out: usize = claimed.iter().map(|(_, mine)| mine.len()).sum();
+    let distinct: HashSet<JobId> = claimed
+        .iter()
+        .flat_map(|(_, mine)| mine.iter().copied())
+        .collect();
+    assert_eq!(handed_out, JOBS, "a job was handed out twice");
+    assert_eq!(distinct, enqueued);
+    let busy = claimed.iter().filter(|(_, mine)| !mine.is_empty()).count();
+    assert!(busy > 1, "the claimers did not run side by side");
+
+    // The table agrees with what the claimers were told.
+    for (worker, mine) in claimed {
+        for job_id in mine {
+            let job = stored(&pool, job_id).await;
+            assert_eq!(
+                (job.status, job.attempt, job.claimed_by),
+                (JobStatus::Running, 1, Some(worker))
+            );
+        }
+    }
+}
+
+#[sqlx::test]
+async fn a_claim_does_not_wait_for_a_job_someone_else_has_locked(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 3, 1).await;
+    let [oldest, middle, newest] = [0, 1, 2].map(|at: usize| routing.routes[at].job_id);
+    let worker = WorkerId::generate();
+
+    // What a concurrent claim holds while it is between its select and its commit.
+    let mut other = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(oldest.0)
+        .execute(&mut *other)
+        .await
+        .unwrap();
+
+    // A claim that waited for the lock would wait for as long as this test holds it,
+    // which is for ever. So the limit can be generous: on a busy machine a claim may
+    // spend seconds just getting a connection.
+    for expected in [Some(middle), Some(newest), None] {
+        let claimed = soon(claim(&pool, worker, LONG)).await.unwrap();
+        assert_eq!(claimed.map(|job| job.lease.job_id), expected);
+    }
+
+    other.rollback().await.unwrap();
+    let claimed = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!(claimed.lease.job_id, oldest);
+}
+
+#[sqlx::test]
+async fn an_expired_lease_is_claimed_again_by_another_worker(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 2).await;
+    let (dead, alive) = (WorkerId::generate(), WorkerId::generate());
+
+    let first = claim(&pool, dead, Duration::ZERO).await.unwrap().unwrap();
+    let second = claim(&pool, alive, LONG).await.unwrap().unwrap();
+
+    assert_eq!(second.lease.job_id, first.lease.job_id);
+    assert_eq!((first.lease.attempt, second.lease.attempt), (1, 2));
+    assert_eq!(second.payload, first.payload);
+    let job = stored(&pool, routing.routes[0].job_id).await;
+    assert_eq!(
+        (job.status, job.attempt, job.claimed_by),
+        (JobStatus::Running, 2, Some(alive))
+    );
+    // The new lease is the new worker's, and it holds.
+    assert_eq!(claim(&pool, dead, LONG).await.unwrap(), None);
+}
+
+#[sqlx::test]
+async fn a_worker_that_lost_its_job_can_do_nothing_to_it(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 2).await;
+    let (slow, quick) = (WorkerId::generate(), WorkerId::generate());
+    let stale = claim(&pool, slow, Duration::ZERO).await.unwrap().unwrap();
+    let fresh = claim(&pool, quick, LONG).await.unwrap().unwrap();
+    let before = stored(&pool, fresh.lease.job_id).await;
+
+    let progress = JobProgress {
+        iterations: 1,
+        best_cost_m: 1,
+    };
+    assert_eq!(
+        heartbeat(&pool, &stale.lease, LONG, Some(progress))
+            .await
+            .unwrap(),
+        Heartbeat::Lost
+    );
+    assert_eq!(complete_route(&pool, &stale).await, None);
+    assert!(!fail(&pool, &stale.lease, "too late").await.unwrap());
+    assert!(!release(&pool, &stale.lease).await.unwrap());
+
+    // Nothing it tried has left a mark.
+    assert_eq!(stored(&pool, fresh.lease.job_id).await, before);
+    assert!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!((plan.status, plan.routes_done), (PlanStatus::Routing, 0));
+
+    // The worker that has the job stores its result, once.
+    assert_eq!(complete_route(&pool, &fresh).await, Some(PlanStatus::Done));
+    assert_eq!(complete_route(&pool, &stale).await, None);
+    assert_eq!(complete_route(&pool, &fresh).await, None);
+    let stored_routes = routes::list_for_plan(&pool, routing.plan.id).await.unwrap();
+    assert_eq!(stored_routes.len(), 1);
+    assert_eq!(stored_routes[0].stops.len(), 2);
+}
+
+/// The case the attempt number is there for. The worker's id is the same on both
+/// claims, so nothing but the number tells the abandoned work from the current one.
+#[sqlx::test]
+async fn an_earlier_claim_is_void_even_for_the_worker_that_claims_the_job_again(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 2).await;
+    let worker = WorkerId::generate();
+    let abandoned = claim(&pool, worker, Duration::ZERO).await.unwrap().unwrap();
+    let current = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!(current.lease.job_id, abandoned.lease.job_id);
+    assert_eq!(current.lease.worker_id, abandoned.lease.worker_id);
+    assert_eq!((abandoned.lease.attempt, current.lease.attempt), (1, 2));
+    let before = stored(&pool, current.lease.job_id).await;
+
+    assert_eq!(
+        heartbeat(&pool, &abandoned.lease, LONG, None)
+            .await
+            .unwrap(),
+        Heartbeat::Lost
+    );
+    assert_eq!(complete_route(&pool, &abandoned).await, None);
+    assert!(!fail(&pool, &abandoned.lease, "too late").await.unwrap());
+    assert!(!release(&pool, &abandoned.lease).await.unwrap());
+    assert_eq!(stored(&pool, current.lease.job_id).await, before);
+
+    assert_eq!(
+        heartbeat(&pool, &current.lease, LONG, None).await.unwrap(),
+        Heartbeat::Extended
+    );
+    assert_eq!(
+        complete_route(&pool, &current).await,
+        Some(PlanStatus::Done)
+    );
+    let stored_routes = routes::list_for_plan(&pool, routing.plan.id).await.unwrap();
+    assert_eq!(stored_routes.len(), 1);
+}
+
+#[sqlx::test]
+async fn a_late_worker_keeps_a_job_nobody_else_has_claimed(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 1).await;
+    let (late, other) = (WorkerId::generate(), WorkerId::generate());
+    let job = claim(&pool, late, Duration::ZERO).await.unwrap().unwrap();
+    let lapsed = stored(&pool, job.lease.job_id).await.lease_expires_at;
+    assert!(lapsed.unwrap() <= db_now(&pool).await);
+
+    // Its lease has lapsed, but it is still the one meant to do the job.
+    assert_eq!(
+        heartbeat(&pool, &job.lease, LONG, None).await.unwrap(),
+        Heartbeat::Extended
+    );
+    assert_eq!(claim(&pool, other, LONG).await.unwrap(), None);
+
+    // The same holds for completing after the lease has lapsed.
+    sqlx::query("UPDATE jobs SET lease_expires_at = now() WHERE id = $1")
+        .bind(job.lease.job_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(complete_route(&pool, &job).await, Some(PlanStatus::Done));
+    let done = stored(&pool, routing.routes[0].job_id).await;
+    assert_eq!((done.status, done.attempt), (JobStatus::Done, 1));
+}
+
+#[sqlx::test]
+async fn a_heartbeat_extends_the_lease_and_stores_progress(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 1).await;
+    let worker = WorkerId::generate();
+    let job = claim(&pool, worker, Duration::from_secs(10))
+        .await
+        .unwrap()
+        .unwrap();
+    let job_id = routing.routes[0].job_id;
+    let short = stored(&pool, job_id).await.lease_expires_at.unwrap();
+
+    let progress = JobProgress {
+        iterations: 16_384,
+        best_cost_m: u64::MAX,
+    };
+    let before = db_now(&pool).await;
+    let answer = heartbeat(&pool, &job.lease, Duration::from_secs(120), Some(progress))
+        .await
+        .unwrap();
+    let after = db_now(&pool).await;
+    assert_eq!(answer, Heartbeat::Extended);
+    let extended = stored(&pool, job_id).await;
+    let expires = extended.lease_expires_at.unwrap();
+    assert!(
+        is_span_after(expires, Duration::from_secs(120), before, after),
+        "{expires}"
+    );
+    assert!(expires > short);
+    assert_eq!(extended.progress, Some(progress));
+
+    // A heartbeat without progress keeps what was stored.
+    heartbeat(&pool, &job.lease, LONG, None).await.unwrap();
+    assert_eq!(stored(&pool, job_id).await.progress, Some(progress));
+
+    // A heartbeat for a job that does not exist has lost it.
+    let nowhere = Lease {
+        job_id: JobId::generate(),
+        ..job.lease
+    };
+    assert_eq!(
+        heartbeat(&pool, &nowhere, LONG, None).await.unwrap(),
+        Heartbeat::Lost
+    );
+}
+
+#[sqlx::test]
+async fn a_completion_stores_the_results_together_with_the_job(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 2, 3).await;
+    let worker = WorkerId::generate();
+    let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    let job_id = job.lease.job_id;
+    let JobPayload::Route {
+        courier_id,
+        order_ids,
+        ..
+    } = job.payload.clone()
+    else {
+        panic!("a route job was enqueued");
+    };
+    let route = NewRoute {
+        plan_id: routing.plan.id,
+        courier_id,
+        distance_m: 4_200,
+        stops: order_ids,
+    };
+
+    // Dropped before the commit: the route is not there and the job is still held.
+    let mut completion = begin_complete(&pool, &job.lease).await.unwrap().unwrap();
+    routes::insert(completion.conn(), &route).await.unwrap();
+    plans::route_finished(completion.conn(), routing.plan.id)
+        .await
+        .unwrap();
+    drop(completion);
+    assert!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.routes_done, 0);
+    assert_eq!(stored(&pool, job_id).await.status, JobStatus::Running);
+    assert_eq!(
+        heartbeat(&pool, &job.lease, LONG, None).await.unwrap(),
+        Heartbeat::Extended
+    );
+
+    // Committed: the route, the count and the job being done arrive together.
+    let mut completion = begin_complete(&pool, &job.lease).await.unwrap().unwrap();
+    routes::insert(completion.conn(), &route).await.unwrap();
+    let status = plans::route_finished(completion.conn(), routing.plan.id)
+        .await
+        .unwrap();
+    assert_eq!(status, Some(PlanStatus::Routing));
+    completion.commit().await.unwrap();
+
+    let stored_routes = routes::list_for_plan(&pool, routing.plan.id).await.unwrap();
+    assert_eq!(stored_routes.len(), 1);
+    assert_eq!(stored_routes[0].distance_m, 4_200);
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!((plan.status, plan.routes_done), (PlanStatus::Routing, 1));
+    let done = stored(&pool, job_id).await;
+    assert_eq!(done.status, JobStatus::Done);
+    assert_eq!(
+        (done.lease_expires_at, done.claimed_by),
+        (None, Some(worker))
+    );
+    assert!(done.finished_at.is_some());
+
+    // Done is final for every call.
+    assert_eq!(
+        heartbeat(&pool, &job.lease, LONG, None).await.unwrap(),
+        Heartbeat::Lost
+    );
+    assert!(!fail(&pool, &job.lease, "after the fact").await.unwrap());
+    assert!(!release(&pool, &job.lease).await.unwrap());
+    assert!(begin_complete(&pool, &job.lease).await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn a_failed_attempt_is_retried_after_a_growing_delay(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 1).await;
+    let job_id = routing.routes[0].job_id;
+    let worker = WorkerId::generate();
+
+    for (attempt, delay) in [(1, 2), (2, 4)] {
+        let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+        assert_eq!(job.lease.attempt, attempt);
+        let before = db_now(&pool).await;
+        assert!(
+            fail(&pool, &job.lease, "the matrix was too large")
+                .await
+                .unwrap()
+        );
+        let after = db_now(&pool).await;
+
+        let retry = stored(&pool, job_id).await;
+        assert_eq!((retry.status, retry.attempt), (JobStatus::Queued, attempt));
+        assert_eq!((retry.claimed_by, retry.lease_expires_at), (None, None));
+        assert_eq!(retry.error.as_deref(), Some("the matrix was too large"));
+        assert_eq!(retry.finished_at, None);
+        // Due again two seconds after the first failure and four after the second.
+        assert!(
+            is_span_after(retry.run_at, Duration::from_secs(delay), before, after),
+            "{}",
+            retry.run_at
+        );
+
+        // Not before its time. Pushed far out so that a slow machine cannot reach it.
+        sqlx::query("UPDATE jobs SET run_at = now() + interval '1 hour' WHERE id = $1")
+            .bind(job_id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(claim(&pool, worker, LONG).await.unwrap(), None);
+        make_due(&pool, job_id).await;
+    }
+
+    // A plan survives the retries of its jobs.
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.status, PlanStatus::Routing);
+    let third = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert!(third.lease.is_last_attempt());
+}
+
+#[sqlx::test]
+async fn the_last_failed_attempt_fails_the_job_and_its_plan(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 4, 2).await;
+    let [stored_route, failing, held, waiting] =
+        [0, 1, 2, 3].map(|at: usize| routing.routes[at].job_id);
+    let (unlucky, bystander) = (WorkerId::generate(), WorkerId::generate());
+
+    // One route is stored, one is being worked on, one is still waiting.
+    let first = claim(&pool, unlucky, LONG).await.unwrap().unwrap();
+    assert_eq!(first.lease.job_id, stored_route);
+    assert_eq!(
+        complete_route(&pool, &first).await,
+        Some(PlanStatus::Routing)
+    );
+    let mut job = claim(&pool, unlucky, LONG).await.unwrap().unwrap();
+    assert_eq!(job.lease.job_id, failing);
+    let in_progress = claim(&pool, bystander, LONG).await.unwrap().unwrap();
+    assert_eq!(in_progress.lease.job_id, held);
+
+    for _ in 1..MAX_ATTEMPTS {
+        assert!(fail(&pool, &job.lease, "out of memory").await.unwrap());
+        make_due(&pool, failing).await;
+        job = claim(&pool, unlucky, LONG).await.unwrap().unwrap();
+        assert_eq!(job.lease.job_id, failing);
+    }
+    assert!(job.lease.is_last_attempt());
+    assert!(
+        fail(&pool, &job.lease, "out of memory again")
+            .await
+            .unwrap()
+    );
+
+    let failed = stored(&pool, failing).await;
+    assert_eq!(
+        (failed.status, failed.attempt),
+        (JobStatus::Failed, MAX_ATTEMPTS)
+    );
+    assert_eq!(failed.error.as_deref(), Some("out of memory again"));
+    assert!(failed.finished_at.is_some() && failed.lease_expires_at.is_none());
+
+    // The plan fails with it, and its other outstanding jobs are stopped.
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.status, PlanStatus::Failed);
+    assert_eq!(plan.error.as_deref(), Some("out of memory again"));
+    assert!(plan.finished_at.is_some());
+    assert_eq!(
+        statuses(&pool, &routing).await,
+        [
+            JobStatus::Done,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+            JobStatus::Cancelled
+        ]
+    );
+    assert_eq!(stored(&pool, waiting).await.attempt, 0);
+    assert_eq!(claim(&pool, bystander, LONG).await.unwrap(), None);
+    assert_eq!(
+        heartbeat(&pool, &in_progress.lease, LONG, None)
+            .await
+            .unwrap(),
+        Heartbeat::Cancelled
+    );
+    assert_eq!(complete_route(&pool, &in_progress).await, None);
+
+    // What the plan had done is undone, so the date can be planned again.
+    assert!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(orders_are_free(&pool, &routing).await);
+    testing::plan(&pool, date(12)).await;
+
+    // A failed job stays failed.
+    assert!(!fail(&pool, &job.lease, "once more").await.unwrap());
+    assert_eq!(stored(&pool, failing).await, failed);
+}
+
+#[sqlx::test]
+async fn a_worker_that_dies_on_the_last_attempt_fails_the_plan_as_well(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 2, 1).await;
+    let [doomed, other] = [0, 1].map(|at: usize| routing.routes[at].job_id);
+    let (dying, idle) = (WorkerId::generate(), WorkerId::generate());
+
+    // Two workers die holding the job, and a third one too, on the last attempt.
+    for attempt in 1..=MAX_ATTEMPTS {
+        make_due(&pool, doomed).await;
+        let job = claim(&pool, dying, Duration::ZERO).await.unwrap().unwrap();
+        assert_eq!((job.lease.job_id, job.lease.attempt), (doomed, attempt));
+    }
+
+    // Nobody may claim it a fourth time. The next worker takes the other job, and
+    // the first claim that finds nothing buries the dead one.
+    let job = claim(&pool, idle, LONG).await.unwrap().unwrap();
+    assert_eq!(job.lease.job_id, other);
+    assert_eq!(stored(&pool, doomed).await.status, JobStatus::Running);
+    assert_eq!(claim(&pool, idle, LONG).await.unwrap(), None);
+
+    let buried = stored(&pool, doomed).await;
+    assert_eq!(
+        (buried.status, buried.attempt),
+        (JobStatus::Failed, MAX_ATTEMPTS)
+    );
+    assert_eq!(buried.error.as_deref(), Some(WORKER_LOST));
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.status, PlanStatus::Failed);
+    assert_eq!(plan.error.as_deref(), Some(WORKER_LOST));
+    assert_eq!(stored(&pool, other).await.status, JobStatus::Cancelled);
+    assert_eq!(
+        heartbeat(&pool, &job.lease, LONG, None).await.unwrap(),
+        Heartbeat::Cancelled
+    );
+    assert!(orders_are_free(&pool, &routing).await);
+}
+
+#[sqlx::test]
+async fn a_worker_that_comes_back_on_its_last_attempt_is_not_buried(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 1).await;
+    let job_id = routing.routes[0].job_id;
+    let (slow, idle) = (WorkerId::generate(), WorkerId::generate());
+    sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(job_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let job = claim(&pool, slow, Duration::ZERO).await.unwrap().unwrap();
+    assert!(job.lease.is_last_attempt());
+
+    // Its heartbeat arrives before anyone has looked.
+    assert_eq!(
+        heartbeat(&pool, &job.lease, LONG, None).await.unwrap(),
+        Heartbeat::Extended
+    );
+    assert_eq!(claim(&pool, idle, LONG).await.unwrap(), None);
+    assert_eq!(stored(&pool, job_id).await.status, JobStatus::Running);
+    assert_eq!(complete_route(&pool, &job).await, Some(PlanStatus::Done));
+}
+
+/// A solver that is older than the API can meet a job it does not understand. It must
+/// say so, and the job must not sit under a lease that nobody is working behind.
+#[sqlx::test]
+async fn a_job_this_build_cannot_read_fails_openly(pool: PgPool) {
+    let plan = testing::plan(&pool, date(12)).await;
+    let job_id = JobId::generate();
+    let from_a_newer_build = serde_json::json!({
+        "kind": "route",
+        "plan_id": plan.id,
+        "vehicle": "cargo_bike",
+    });
+    sqlx::query(
+        "INSERT INTO jobs (id, plan_id, kind, payload, max_attempts)
+         VALUES ($1, $2, 'route', $3, 2)",
+    )
+    .bind(job_id.0)
+    .bind(plan.id.0)
+    .bind(&from_a_newer_build)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let worker = WorkerId::generate();
+    let state = async || -> (String, i64, Option<String>) {
+        sqlx::query_as("SELECT status, attempt, error FROM jobs WHERE id = $1")
+            .bind(job_id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+
+    let error = claim(&pool, worker, LONG).await.unwrap_err();
+    assert!(
+        matches!(&error, DbError::Unreadable(what) if what.contains("payload")),
+        "{error:?}"
+    );
+    // The attempt was used and has failed, so the job waits for its retry.
+    let (status, attempt, reason) = state().await;
+    assert_eq!((status.as_str(), attempt), ("queued", 1));
+    assert!(reason.unwrap().contains("cannot be read"));
+
+    // Reading the job says the same.
+    let error = get(&pool, job_id).await.unwrap_err();
+    assert!(matches!(error, DbError::Unreadable(_)), "{error:?}");
+    let error = list_for_plan(&pool, plan.id).await.unwrap_err();
+    assert!(matches!(error, DbError::Unreadable(_)), "{error:?}");
+
+    // After the last attempt the plan fails, with the reason for the operator to see.
+    make_due(&pool, job_id).await;
+    claim(&pool, worker, LONG).await.unwrap_err();
+    let (status, attempt, _) = state().await;
+    assert_eq!((status.as_str(), attempt), ("failed", 2));
+    let plan = plans::get(&pool, plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.status, PlanStatus::Failed);
+    assert!(plan.error.unwrap().contains("cannot be read"));
+    assert_eq!(claim(&pool, worker, LONG).await.unwrap(), None);
+}
+
+#[sqlx::test]
+async fn a_released_job_is_due_at_once_and_has_used_no_attempt(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 2, 1).await;
+    let [first, second] = [0, 1].map(|at: usize| routing.routes[at].job_id);
+    let (leaving, staying) = (WorkerId::generate(), WorkerId::generate());
+    let job = claim(&pool, leaving, LONG).await.unwrap().unwrap();
+    assert_eq!(job.lease.job_id, first);
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(JOBS_CHANNEL).await.unwrap();
+    assert!(release(&pool, &job.lease).await.unwrap());
+    let notification = soon(listener.recv()).await.unwrap();
+    assert_eq!(notification.payload(), "route");
+    drop(listener);
+
+    let released = stored(&pool, first).await;
+    assert_eq!((released.status, released.attempt), (JobStatus::Queued, 0));
+    assert_eq!(
+        (released.claimed_by, released.lease_expires_at),
+        (None, None)
+    );
+    assert!(
+        !release(&pool, &job.lease).await.unwrap(),
+        "it is not held any more"
+    );
+
+    // It kept its place in front of the job that was enqueued after it.
+    let again = claim(&pool, staying, LONG).await.unwrap().unwrap();
+    assert_eq!((again.lease.job_id, again.lease.attempt), (first, 1));
+    let next = claim(&pool, staying, LONG).await.unwrap().unwrap();
+    assert_eq!(next.lease.job_id, second);
+}
+
+#[sqlx::test]
+async fn cancelling_a_plan_stops_its_jobs_and_frees_its_orders(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 4, 2).await;
+    let (finished, busy) = (WorkerId::generate(), WorkerId::generate());
+    let first = claim(&pool, finished, LONG).await.unwrap().unwrap();
+    assert_eq!(
+        complete_route(&pool, &first).await,
+        Some(PlanStatus::Routing)
+    );
+    let in_progress = claim(&pool, busy, LONG).await.unwrap().unwrap();
+
+    assert!(cancel_plan(&pool, routing.plan.id).await.unwrap());
+
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!((plan.status, &plan.error), (PlanStatus::Cancelled, &None));
+    assert!(plan.finished_at.is_some());
+    assert_eq!(
+        statuses(&pool, &routing).await,
+        [
+            JobStatus::Done,
+            JobStatus::Cancelled,
+            JobStatus::Cancelled,
+            JobStatus::Cancelled
+        ]
+    );
+
+    // Queued jobs are gone from the queue.
+    assert_eq!(claim(&pool, busy, LONG).await.unwrap(), None);
+    // The worker in the middle of one is told, and can no longer store its route.
+    assert_eq!(
+        heartbeat(&pool, &in_progress.lease, LONG, None)
+            .await
+            .unwrap(),
+        Heartbeat::Cancelled
+    );
+    assert_eq!(complete_route(&pool, &in_progress).await, None);
+    assert!(!fail(&pool, &in_progress.lease, "cancelled").await.unwrap());
+    assert!(!release(&pool, &in_progress.lease).await.unwrap());
+    let cancelled = stored(&pool, in_progress.lease.job_id).await;
+    assert_eq!(cancelled.status, JobStatus::Cancelled);
+    assert!(cancelled.finished_at.is_some() && cancelled.lease_expires_at.is_none());
+
+    // The route that was stored is gone, and every order can be planned again.
+    assert!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(orders_are_free(&pool, &routing).await);
+    let mut tx = pool.begin().await.unwrap();
+    let pending = orders::lock_pending(&mut tx, date(12)).await.unwrap();
+    assert_eq!(pending.len(), 8);
+    tx.rollback().await.unwrap();
+    testing::plan(&pool, date(12)).await;
+
+    // Cancelling is done once.
+    assert!(!cancel_plan(&pool, routing.plan.id).await.unwrap());
+}
+
+#[sqlx::test]
+async fn a_plan_that_is_over_cannot_be_cancelled(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 2).await;
+    let job = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(complete_route(&pool, &job).await, Some(PlanStatus::Done));
+
+    assert!(!cancel_plan(&pool, routing.plan.id).await.unwrap());
+    assert!(!cancel_plan(&pool, PlanId::generate()).await.unwrap());
+
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.status, PlanStatus::Done);
+    assert_eq!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!orders_are_free(&pool, &routing).await);
+}
+
+#[sqlx::test]
+async fn a_queued_plan_is_cancelled_before_it_is_clustered(pool: PgPool) {
+    let new = testing::new_plan(&pool, date(12)).await;
+    let plan = plans::submit(&pool, &new, None).await.unwrap();
+    let worker = WorkerId::generate();
+    let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!(job.payload, JobPayload::Plan { plan_id: plan.id });
+
+    assert!(cancel_plan(&pool, plan.id).await.unwrap());
+
+    // The worker cannot fan the plan out any more.
+    assert!(begin_complete(&pool, &job.lease).await.unwrap().is_none());
+    let plan = plans::get(&pool, plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.status, PlanStatus::Cancelled);
+    plans::submit(&pool, &new, None).await.unwrap();
+}
+
+/// Two transactions that are made to overlap: the second one starts while the
+/// first holds its locks, and has to wait for it.
+#[sqlx::test]
+async fn two_routes_finishing_together_mark_the_plan_done_once(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 2, 2).await;
+    let first = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    let JobPayload::Route {
+        courier_id,
+        order_ids,
+        ..
+    } = first.payload.clone()
+    else {
+        panic!("a route job was enqueued");
+    };
+
+    let mut completion = begin_complete(&pool, &first.lease).await.unwrap().unwrap();
+    let route = NewRoute {
+        plan_id: routing.plan.id,
+        courier_id,
+        distance_m: 1_000,
+        stops: order_ids,
+    };
+    routes::insert(completion.conn(), &route).await.unwrap();
+    let seen_by_first = plans::route_finished(completion.conn(), routing.plan.id)
+        .await
+        .unwrap();
+
+    let other = tokio::spawn({
+        let pool = pool.clone();
+        async move { complete_route(&pool, &second).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!other.is_finished(), "the second completion did not wait");
+
+    completion.commit().await.unwrap();
+    let seen_by_second = soon(other).await.unwrap();
+
+    assert_eq!(seen_by_first, Some(PlanStatus::Routing));
+    assert_eq!(seen_by_second, Some(PlanStatus::Done));
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!(
+        (plan.status, plan.routes_done, plan.routes_total),
+        (PlanStatus::Done, 2, 2)
+    );
+    assert_eq!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[sqlx::test]
+async fn many_routes_finishing_together_mark_the_plan_done_once(pool: PgPool) {
+    const ROUTES: usize = 8;
+    let routing = testing::routing(&pool, date(12), ROUTES, 2).await;
+    let mut held = Vec::new();
+    for _ in 0..ROUTES {
+        let job = claim(&pool, WorkerId::generate(), LONG).await.unwrap();
+        held.push(job.unwrap());
+    }
+
+    let mut finishing = JoinSet::new();
+    for job in held {
+        let pool = pool.clone();
+        finishing.spawn(async move { complete_route(&pool, &job).await });
+    }
+    let seen: Vec<Option<PlanStatus>> = soon(finishing.join_all()).await;
+
+    let done = seen
+        .iter()
+        .filter(|&&status| status == Some(PlanStatus::Done))
+        .count();
+    let routing_still = seen
+        .iter()
+        .filter(|&&status| status == Some(PlanStatus::Routing))
+        .count();
+    assert_eq!((done, routing_still), (1, ROUTES - 1));
+
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!(
+        (plan.status, plan.routes_done),
+        (PlanStatus::Done, ROUTES as u32)
+    );
+    assert_eq!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .len(),
+        ROUTES
+    );
+    assert_eq!(statuses(&pool, &routing).await, [JobStatus::Done; ROUTES]);
+}
+
+/// What the lock order is for. Routes complete, one job fails for good and the plan
+/// is cancelled, all at once and in every starting order. Nothing may deadlock, and
+/// the plan must end whole: done with all its routes, or over with none.
+#[sqlx::test]
+async fn completions_a_final_failure_and_a_cancel_cannot_deadlock(pool: PgPool) {
+    const ROUTES: usize = 4;
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Step {
+        Complete(usize),
+        FailForGood(usize),
+        Cancel,
+    }
+
+    for round in 0..12 {
+        let service_date = date(1 + round);
+        let routing = testing::routing(&pool, service_date, ROUTES, 2).await;
+        let one_fails = round % 2 == 1;
+        if one_fails {
+            sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
+                .bind(routing.routes[ROUTES - 1].job_id.0)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut held = Vec::new();
+        for _ in 0..ROUTES {
+            let job = claim(&pool, WorkerId::generate(), LONG).await.unwrap();
+            held.push(job.unwrap());
+        }
+
+        let mut steps: Vec<Step> = (0..ROUTES).map(Step::Complete).collect();
+        if one_fails {
+            steps[ROUTES - 1] = Step::FailForGood(ROUTES - 1);
+        }
+        steps.push(Step::Cancel);
+        steps.rotate_left(round as usize % (ROUTES + 1));
+
+        let mut racing = JoinSet::new();
+        for step in steps {
+            let pool = pool.clone();
+            let plan_id = routing.plan.id;
+            let job = match step {
+                Step::Complete(at) | Step::FailForGood(at) => Some(held[at].clone()),
+                Step::Cancel => None,
+            };
+            racing.spawn(async move {
+                match (step, job) {
+                    (Step::Complete(_), Some(job)) => {
+                        complete_route(&pool, &job).await;
+                        false
+                    }
+                    (Step::FailForGood(_), Some(job)) => {
+                        fail(&pool, &job.lease, "broken").await.unwrap();
+                        false
+                    }
+                    _ => cancel_plan(&pool, plan_id).await.unwrap(),
+                }
+            });
+        }
+        let cancelled = soon(racing.join_all()).await.contains(&true);
+
+        let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+        let stored_routes = routes::list_for_plan(&pool, plan.id).await.unwrap();
+        let jobs = statuses(&pool, &routing).await;
+        assert!(
+            jobs.iter()
+                .all(|status| !matches!(status, JobStatus::Queued | JobStatus::Running)),
+            "round {round}: {jobs:?}"
+        );
+        match plan.status {
+            PlanStatus::Done => {
+                assert!(!one_fails && !cancelled, "round {round}");
+                assert_eq!(stored_routes.len(), ROUTES, "round {round}");
+                assert_eq!(jobs, [JobStatus::Done; ROUTES], "round {round}");
+                assert!(!orders_are_free(&pool, &routing).await, "round {round}");
+            }
+            PlanStatus::Cancelled | PlanStatus::Failed => {
+                assert_eq!(
+                    cancelled,
+                    plan.status == PlanStatus::Cancelled,
+                    "round {round}"
+                );
+                assert!(stored_routes.is_empty(), "round {round}");
+                assert!(orders_are_free(&pool, &routing).await, "round {round}");
+            }
+            status => panic!("round {round}: the plan is still {status}"),
+        }
+    }
+}

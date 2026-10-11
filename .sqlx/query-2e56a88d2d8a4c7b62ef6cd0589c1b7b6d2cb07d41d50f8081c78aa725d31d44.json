@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2e56a88d2d8a4c7b62ef6cd0589c1b7b6d2cb07d41d50f8081c78aa725d31d44"
+}

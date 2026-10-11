@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH extended AS (\n               UPDATE jobs\n               SET lease_expires_at = now() + $4::bigint * interval '1 millisecond',\n                   progress = COALESCE($5, progress)\n               WHERE id = $1 AND status = 'running' AND claimed_by = $2 AND attempt = $3\n               RETURNING id\n           )\n           SELECT status, EXISTS (SELECT 1 FROM extended) AS \"extended!\"\n           FROM jobs\n           WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "extended!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "99f79cc85e8bff4aa1e365c0b327b7a769c42da132218a08864ac73c751b1ce4"
+}

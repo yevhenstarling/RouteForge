@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs\n             SET status = 'failed', lease_expires_at = NULL, finished_at = now(), error = $2\n             WHERE id = $1 AND status = 'running' AND lease_expires_at <= now()\n               AND attempt >= max_attempts",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "235738019769a1d8bba3b34ae5b3b352d7f270387fb45a951c95a6e30b43b4e6"
+}

@@ -11,6 +11,8 @@
 //!
 //! The decisions cited as D1, D2, … are in `docs/architecture.md`.
 
+#[cfg(feature = "db")]
+pub mod db;
 mod geo;
 mod ids;
 mod job;

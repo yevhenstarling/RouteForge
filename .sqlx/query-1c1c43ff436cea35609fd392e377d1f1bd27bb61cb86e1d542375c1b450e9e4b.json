@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH route AS (\n             INSERT INTO routes (id, plan_id, courier_id, distance_m)\n             VALUES ($1, $2, $3, $4)\n             RETURNING id\n         )\n         INSERT INTO route_stops (route_id, position, order_id)\n         SELECT route.id, (stop.number - 1)::integer, stop.order_id\n         FROM route, unnest($5::uuid[]) WITH ORDINALITY AS stop (order_id, number)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1c1c43ff436cea35609fd392e377d1f1bd27bb61cb86e1d542375c1b450e9e4b"
+}

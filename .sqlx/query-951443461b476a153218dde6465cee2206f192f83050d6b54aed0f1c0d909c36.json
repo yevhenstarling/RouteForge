@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE orders SET status = 'planned', plan_id = $1\n         WHERE id = ANY($2) AND status = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "951443461b476a153218dde6465cee2206f192f83050d6b54aed0f1c0d909c36"
+}
