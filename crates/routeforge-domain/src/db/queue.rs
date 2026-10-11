@@ -38,12 +38,16 @@
 //! outstanding jobs with it, deletes the routes it had stored and gives its orders
 //! back as pending, all in one transaction.
 //!
+//! A plan that is done has no job left. [`discard_plan`] takes such a plan back: the
+//! same undo, for a plan that got to its end (D30).
+//!
 //! # Lock order
 //!
 //! Those three lock the plan row before any job row. With the job first, a completing
 //! route would hold its job and wait for the plan while a cancel held the plan and
 //! waited for that job. [`claim`], [`heartbeat`], [`release`] and the retry of [`fail`]
 //! lock a single job row in a single statement, so they cannot be part of a cycle.
+//! [`discard_plan`] locks the plan row and no job.
 
 use std::time::Duration;
 
@@ -54,7 +58,7 @@ use uuid::Uuid;
 
 use super::{DbError, millis, parsed, unsigned};
 use crate::ids::{JobId, PlanId, WorkerId};
-use crate::job::{Job, JobPayload, JobProgress, JobStatus};
+use crate::job::{Job, JobPayload, JobProgress, JobStatus, QueueDepth};
 use crate::model::PlanStatus;
 
 /// The channel a worker listens on to learn that a job may be waiting.
@@ -409,6 +413,33 @@ pub async fn cancel_plan(pool: &PgPool, plan_id: PlanId) -> Result<bool, DbError
     Ok(cancelled)
 }
 
+/// Discards a plan that is done (D30).
+///
+/// In one transaction the plan becomes discarded, its routes are deleted and its
+/// orders are pending again, as after a plan that failed or was cancelled. The date
+/// can then be planned afresh, and the new plan takes every pending order of it.
+///
+/// A plan that is done has no job on the queue, so no worker has to be told.
+///
+/// Returns `false`, and changes nothing, if the plan is not done or does not exist. A
+/// plan that is still queued or routing is cancelled instead: see [`cancel_plan`].
+pub async fn discard_plan(pool: &PgPool, plan_id: PlanId) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    // The update locks the plan row, as every operation on a plan does first.
+    let discarded = sqlx::query!(
+        "UPDATE plans SET status = 'discarded' WHERE id = $1 AND status = 'done'",
+        plan_id.0,
+    )
+    .execute(&mut *tx)
+    .await?;
+    if discarded.rows_affected() == 0 {
+        return Ok(false);
+    }
+    undo_plan(&mut tx, plan_id).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 struct JobRow {
     id: Uuid,
     plan_id: Uuid,
@@ -497,6 +528,28 @@ pub async fn list_for_plan(
     .collect()
 }
 
+/// How many jobs stand in each status: the depth of the queue, and what became of the
+/// jobs that have left it.
+pub async fn depth(executor: impl PgExecutor<'_>) -> Result<QueueDepth, DbError> {
+    let rows = sqlx::query!(r#"SELECT status, count(*) AS "jobs!" FROM jobs GROUP BY status"#)
+        .fetch_all(executor)
+        .await?;
+
+    let mut depth = QueueDepth::default();
+    for row in rows {
+        // A count is never negative.
+        let jobs = row.jobs.unsigned_abs();
+        match parsed(&row.status)? {
+            JobStatus::Queued => depth.queued = jobs,
+            JobStatus::Running => depth.running = jobs,
+            JobStatus::Done => depth.done = jobs,
+            JobStatus::Failed => depth.failed = jobs,
+            JobStatus::Cancelled => depth.cancelled = jobs,
+        }
+    }
+    Ok(depth)
+}
+
 /// Locks a plan row until the transaction ends. See the lock order in the module docs.
 async fn lock_plan(conn: &mut PgConnection, plan_id: PlanId) -> Result<(), DbError> {
     sqlx::query!("SELECT id FROM plans WHERE id = $1 FOR UPDATE", plan_id.0)
@@ -547,6 +600,13 @@ async fn end_plan(
     )
     .execute(&mut *conn)
     .await?;
+    undo_plan(conn, plan_id).await?;
+    Ok(true)
+}
+
+/// Takes back what a plan has done: deletes the routes it has stored and makes its
+/// orders pending again (D20). The caller holds the lock on the plan row.
+async fn undo_plan(conn: &mut PgConnection, plan_id: PlanId) -> Result<(), DbError> {
     // The stops go with their routes.
     sqlx::query!("DELETE FROM routes WHERE plan_id = $1", plan_id.0)
         .execute(&mut *conn)
@@ -557,7 +617,7 @@ async fn end_plan(
     )
     .execute(&mut *conn)
     .await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Fails the jobs whose worker stopped responding during their last attempt, and

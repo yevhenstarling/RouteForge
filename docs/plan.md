@@ -18,6 +18,7 @@ Confirmed with the project owner:
 - **Planning a date again.** A plan that is done can be discarded: its routes are deleted, its orders are pending again, and the date is planned afresh. Without a discard, a later plan for the date takes only the orders that are still pending (D30).
 - **Route budget.** A plan says how long each of its routes may be searched for: a time, a number of moves, or both (D31).
 - **Migrations.** The API applies them. A solver applies none and waits until the schema is there (D32).
+- **Phases keep to their list.** When Phase 4 was planned, the image and compose service of the API were offered ahead of Phase 6, and a list of plans ahead of Phase 5. Both stayed where this plan has them.
 
 Derived from the description:
 
@@ -61,7 +62,7 @@ RouteForge/
 | 1 | Algorithms (`routeforge-tsp`) | Cost falling stage by stage on a random instance; benchmarks | L | done |
 | 2 | Schema and job queue (`routeforge-domain`) | Queue tests: exclusive claim, lease expiry, fenced completion | L | done |
 | 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | done |
-| 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | todo |
+| 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | done |
 | 5 | Live updates and map | Routes appearing and improving live in the browser | M | todo |
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | todo |
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | todo |
@@ -169,15 +170,42 @@ What later phases need from it:
 
 ## Phase 4: API (`routeforge-api`)
 
-- Skeleton: config from env, pool, migrations at startup, request-id middleware (accept or generate `X-Request-Id`, echo it, put it in the span), problem+json errors, `/healthz`, `/readyz`.
-- Auth: register and login, argon2id hashing off the async threads, JWT with a role claim, an `AuthUser` extractor, role and ownership checks. Admin seeded from env.
-- Resources: orders (clients see their own; operators and admins see all), couriers, depot, users.
-- Plans: create (plan row, `plan` job and `NOTIFY` in one transaction; `409` when the date already has an active plan; the request id is stored on the job), get, list routes with ordered stops, cancel, discard (D30: a plan that is done only; its routes are deleted and its orders are pending again).
-- System stats: queue depth by status, workers alive and busy.
-- OpenAPI through utoipa on every DTO and handler; Swagger UI at `/docs` with vendored assets.
-- Demo data: an admin endpoint that generates N random orders around the depot from a seed. This lives in the API so no sixth crate is needed.
-- Tests: role matrix (each role against each endpoint), ownership, validation, enqueue atomicity, OpenAPI snapshot.
-- **Done when:** the whole flow works from Swagger UI: log in, create orders, create a plan, read back the routes.
+Delivered:
+
+- In `routeforge-domain`, what the API needed: migration `0004_discarded.sql`, `PlanStatus::Discarded` and `queue::discard_plan` (D30); paging in `orders::list` through `after` and `limit` on `OrderFilter` (D44); `queue::depth`; the `openapi` feature, with a schema on every type the API sends or receives; and the module `dto` with the bodies that are not entities (D43).
+- Start-up: settings from the environment, the pool, the migrations, the first admin from `ADMIN_EMAIL` and `ADMIN_PASSWORD`. A database that does not answer ends the start (D47).
+- A request id on every request: taken from `X-Request-Id` when it is well formed, made otherwise, echoed, in the span, and stored on the jobs of a plan (D42).
+- Errors as `application/problem+json`, the framework's own included (D39). `/healthz` and `/readyz`.
+- Auth: register and login, Argon2id on blocking threads, an HS256 token with the role in it, and the extractors `AuthUser`, `Staff` and `Admin` (D40, D41).
+- Orders, which a client sees and withdraws as their own and operators and admins see all; couriers; the depot; users and their roles.
+- Plans: create, with the plan row, the `plan` job and its `NOTIFY` in one transaction, a `409` when the date has a plan in progress, and the request id on the job; get; the routes with their stops in calling order; cancel; discard. A plan that names no budget or no seed is given one (D45).
+- System stats: jobs by status, and the workers that were seen lately with the job each holds.
+- The OpenAPI document from the handlers and the types, committed as `crates/routeforge-api/openapi.json`, and Swagger UI at `/docs/` out of the binary (D43).
+- Demo data: `POST /api/demo/orders`, from a seed (D46).
+- Tests: 71 in the crate, 39 of them against PostgreSQL, and 10 more in the domain crate. The five this plan asked for are among them: the role matrix, each role and nobody against each endpoint, with the endpoints read from the document so that none can be left out; ownership; validation; the plan and its job appearing together or not at all; and the snapshot of the document. Beside them: tokens that are forged, expired or altered; the request id on the response, on the job and in the log; paging; the demo seed; the stats; the admin made once; and the whole flow with a stand-in for the solver, which the API may not link.
+- The tests were tried against 29 faults put into the code on purpose, six of them in the domain crate. Each made a test fail. Among them: a signature or an expiry not checked, a role gate removed, a list not forced to the client's own orders, an order withdrawn before it is checked whose it is, the body read before the token, the request id not passed on, a plan stored outside the transaction of its job, an endpoint added without a row in the matrix.
+- Tried by hand, on a database that had just been created, with the API on the host and two solvers in containers: the solvers waited for the schema and started when the API had applied it; through the API an admin logged in, set the depot, added four couriers and generated 300 orders, and a client placed one; a plan put the 301 orders onto four routes, each order on exactly one and no courier over its capacity; the plan was discarded and planned again with the same seed and a budget of moves, and the routes were identical; a plan with a minute a route was cancelled while routing; and the `X-Request-Id` of the plan request was in the API's log and in the log of both solvers.
+
+Where it differs from what this plan first said:
+
+- There are three extractors and not one. `AuthUser` is anybody with a token, and `Staff` and `Admin` are the gates (D41).
+- Two things were left where this plan has them, although they were considered: the API has no image and no compose service yet, and plans cannot be listed.
+- The code was committed as one commit for the domain crate and one for the API, because the API's parts do not build without each other.
+
+What later phases need from it:
+
+- Phase 5: plans cannot be listed. The page needs `GET /api/plans?service_date=` to find the plan of a date, and `plans::list` under it. Whoever asked for a plan has its id from the answer, and nobody else has it.
+- Phase 5: the API serves nothing at `/`. Whatever matches no route is answered `404` as a problem by `error::not_found`, the default service in `app.rs`, so the page and `web/vendor` have to be registered before it.
+- Phase 5: a token lasts an hour. The page has to send the user back to the login on a `401`. The login answers with the user and the role, so the page need not read the token.
+- Phase 5: `GET /api/plans/{id}/routes` gives the routes that are stored so far, so it grows while a plan is routing. `GET /api/system/stats` is the queue depth and the worker list.
+- Phase 5: the request span stays open while a body is streamed, and "handled the request" is logged when the response starts, not when the stream ends.
+- Phase 6: the image needs `routeforge-api` in the two `--package` lines and a target (D38). In a container the API needs `API_BIND=0.0.0.0:8080`, a `JWT_SECRET`, for which the binary has no default, and `ADMIN_EMAIL` with `ADMIN_PASSWORD` for the admin the verification logs in as.
+- Phase 6: the API ends when the database does not answer (D47), so its service needs `depends_on` with the health of `db`, as `solver` has. `/healthz` and `/readyz` are there for a health check, but the runtime image has no `curl` to ask them with.
+- Phase 6: every request is logged at `info`, a health check every few seconds included.
+- Phase 6: the scaling run asks for its plans with a budget of moves and the same seed, and discards with `POST /api/plans/{id}/discard`. A budget of moves ends as soon as the moves are made: four routes of a hundred stops with three million moves each were done in a third of a second on two solvers, so the run needs a larger budget, or one of time, to show anything.
+- Phase 7: the bot's DTOs are in `routeforge_domain`, with no feature: `Login`, `Session`, `OrderRequest`, `PlanRequest`, `Problem`. The ids of the operations in `openapi.json` are the names of the handlers: `create_order`, `list_orders`, `get_order`, `cancel_order`, `create_plan`, `get_plan`.
+- Phase 7: `Tokens` in `auth.rs` signs with one lifetime. The endpoint that gives the bot a short-lived token needs it to take one. The migration for `users.telegram_id` is number 0005.
+- Phase 8: hardening that was left out: nothing limits how often a login is tried or how many passwords are hashed at once, and each hash takes 19 MiB. The words of the OpenAPI document are the doc comments, which cite decisions by number.
 
 ## Phase 5: live updates and map
 
@@ -224,7 +252,12 @@ What later phases need from it:
 - **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well. Payloads are capped near 8 kB, so they carry ids and small numbers only.
 - **Browser `EventSource` cannot send an `Authorization` header.** The page reads the SSE stream with `fetch`.
 - **A `tracing` subscriber for one thread loses lines in tests.** `tracing` remembers for every place that logs whether anybody listens, and with one subscriber that belongs to one thread it may ask a thread that has none. A test that reads the log sets a subscriber for the whole process and picks its own lines out by an id: see `captured_log` in the solver's tests.
-- **A fresh database has no schema until the API exists.** A solver waits for it and applies none (D32). Until Phase 4, run `scripts/sqlx-prepare` or `cargo sqlx migrate run --source crates/routeforge-domain/migrations`.
+- **A fresh database has no schema until an API has started against it.** A solver waits for it and applies none (D32). The API has no service in compose before Phase 6, so until then it is run on the host: `CLAUDE.md` says how. `scripts/sqlx-prepare` applies the migrations to the compose database as well.
+- **utoipa leaves things out without a word.** An enumeration whose values come out of a macro as `literal`s is documented by the names of its variants; `web::Path<OrderId>` is read as a struct of parameters; a query struct that is not named in `params(...)` is not described at all. Each compiled and gave a document that was wrong (D43). Read `openapi.json` after changing a type or a handler.
+- **A number that has been through JSON may differ in its last digit.** serde_json reads a float fast and not exactly, unless its `float_roundtrip` feature is on. A test that compares a position the API returned with one it computed allows for that.
+- **A handler's name is taken.** `#[post("/api/auth/login")]` on `async fn login` makes `login` a type. A `let login = …` in any handler of that module then fails to compile, with a message about mismatched types.
+- **sqlx 0.9 takes no SQL that was put together at run time.** `sqlx::query(&format!(…))` does not compile. Tests write their SQL out.
+- **Argon2 is slow in a debug build**: a third of a second for one hash. Tests that need accounts store them directly and sign their tokens themselves, and those that log in use `Passwords::cheap()`.
 
 ## Needed from the project owner
 

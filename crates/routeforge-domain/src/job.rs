@@ -103,8 +103,22 @@ pub struct Job {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// How many jobs stand in each status.
+///
+/// `queued` and `running` are the work still to be done. The other three only grow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct QueueDepth {
+    pub queued: u64,
+    pub running: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+}
+
 /// A solver process, as it last registered itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WorkerInfo {
     pub id: WorkerId,
     pub hostname: String,

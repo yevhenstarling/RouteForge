@@ -16,6 +16,7 @@ macro_rules! id_type {
         #[derive(
             Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
+        #[cfg_attr(feature = "openapi", derive(::utoipa::ToSchema))]
         #[serde(transparent)]
         pub struct $name(pub Uuid);
 

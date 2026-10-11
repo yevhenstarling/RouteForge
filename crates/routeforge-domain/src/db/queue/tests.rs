@@ -1200,3 +1200,221 @@ async fn completions_a_final_failure_and_a_cancel_cannot_deadlock(pool: PgPool) 
         }
     }
 }
+
+/// A plan as its last route job leaves it: done, with every route stored.
+async fn done_plan(pool: &PgPool, day: u32, routes: usize, stops: usize) -> Routing {
+    let routing = testing::routing(pool, date(day), routes, stops).await;
+    let mut status = None;
+    for _ in 0..routes {
+        let job = claim(pool, WorkerId::generate(), LONG).await.unwrap();
+        status = complete_route(pool, &job.unwrap()).await;
+    }
+    assert_eq!(status, Some(PlanStatus::Done));
+    routing
+}
+
+#[sqlx::test]
+async fn discarding_a_done_plan_frees_its_orders_and_keeps_the_row(pool: PgPool) {
+    let routing = done_plan(&pool, 12, 3, 2).await;
+    let done = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert!(!orders_are_free(&pool, &routing).await);
+
+    assert!(discard_plan(&pool, routing.plan.id).await.unwrap());
+
+    let plan = plans::get(&pool, routing.plan.id).await.unwrap().unwrap();
+    assert_eq!((plan.status, &plan.error), (PlanStatus::Discarded, &None));
+    // What the plan had come to stays on record, and so does when it was done.
+    assert_eq!(
+        (plan.orders_total, plan.routes_total, plan.routes_done),
+        (6, 3, 3)
+    );
+    assert_eq!(plan.finished_at, done.finished_at);
+
+    assert!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(orders_are_free(&pool, &routing).await);
+    // Its jobs are history. None of them comes back to the queue.
+    assert_eq!(statuses(&pool, &routing).await, [JobStatus::Done; 3]);
+    assert_eq!(
+        claim(&pool, WorkerId::generate(), LONG).await.unwrap(),
+        None
+    );
+
+    // Discarding is done once.
+    assert!(!discard_plan(&pool, routing.plan.id).await.unwrap());
+}
+
+#[sqlx::test]
+async fn only_a_plan_that_is_done_can_be_discarded(pool: PgPool) {
+    let status = async |plan_id: PlanId| {
+        let plan = plans::get(&pool, plan_id).await.unwrap().unwrap();
+        plan.status
+    };
+
+    // Queued.
+    let queued = testing::plan(&pool, date(12)).await;
+    assert!(!discard_plan(&pool, queued.id).await.unwrap());
+    assert_eq!(status(queued.id).await, PlanStatus::Queued);
+
+    // Routing, with one of its two routes stored. That is for a cancel to undo.
+    let routing = testing::routing(&pool, date(13), 2, 2).await;
+    let first = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        complete_route(&pool, &first).await,
+        Some(PlanStatus::Routing)
+    );
+    assert!(!discard_plan(&pool, routing.plan.id).await.unwrap());
+    assert_eq!(status(routing.plan.id).await, PlanStatus::Routing);
+    assert_eq!(
+        routes::list_for_plan(&pool, routing.plan.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!orders_are_free(&pool, &routing).await);
+
+    // Cancelled.
+    assert!(cancel_plan(&pool, routing.plan.id).await.unwrap());
+    assert!(!discard_plan(&pool, routing.plan.id).await.unwrap());
+    assert_eq!(status(routing.plan.id).await, PlanStatus::Cancelled);
+
+    // Failed.
+    let failing = testing::routing(&pool, date(14), 1, 1).await;
+    sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(failing.routes[0].job_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let job = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fail(&pool, &job.lease, "broken").await.unwrap());
+    assert!(!discard_plan(&pool, failing.plan.id).await.unwrap());
+    assert_eq!(status(failing.plan.id).await, PlanStatus::Failed);
+
+    // And a plan that does not exist.
+    assert!(!discard_plan(&pool, PlanId::generate()).await.unwrap());
+}
+
+/// What a discard is for (D30): the date is planned again, and the new plan gets
+/// every order of it.
+#[sqlx::test]
+async fn a_discarded_date_is_planned_afresh_with_every_order(pool: PgPool) {
+    let first = done_plan(&pool, 12, 2, 3).await;
+    let mut all = first.order_ids();
+    all.sort_unstable();
+    let pending = async || {
+        let mut tx = pool.begin().await.unwrap();
+        let locked = orders::lock_pending(&mut tx, date(12)).await.unwrap();
+        tx.rollback().await.unwrap();
+        locked.into_iter().map(|order| order.id).collect::<Vec<_>>()
+    };
+
+    // While the plan stands, a later plan is offered none of its orders (D20).
+    assert!(pending().await.is_empty());
+
+    assert!(discard_plan(&pool, first.plan.id).await.unwrap());
+    assert_eq!(pending().await, all);
+
+    // The new plan can put them on routes. The old stops went with the old routes,
+    // so no order is on two routes.
+    let again = testing::plan(&pool, date(12)).await;
+    let courier = testing::courier(&pool, 100).await;
+    assert_eq!(
+        orders::mark_planned(&pool, again.id, &all).await.unwrap(),
+        6
+    );
+    let route = NewRoute {
+        plan_id: again.id,
+        courier_id: courier.id,
+        distance_m: 1_000,
+        stops: all.clone(),
+    };
+    routes::insert(&pool, &route).await.unwrap();
+
+    let listed = routes::list_for_plan(&pool, again.id).await.unwrap();
+    assert_eq!(listed[0].stops.len(), 6);
+    let discarded = plans::get(&pool, first.plan.id).await.unwrap().unwrap();
+    assert_eq!(discarded.status, PlanStatus::Discarded);
+    assert!(
+        routes::list_for_plan(&pool, first.plan.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Two operators press the button at the same moment.
+#[sqlx::test]
+async fn discards_at_the_same_moment_succeed_once(pool: PgPool) {
+    let routing = done_plan(&pool, 12, 2, 2).await;
+
+    let mut racing = JoinSet::new();
+    for _ in 0..4 {
+        let pool = pool.clone();
+        let plan_id = routing.plan.id;
+        racing.spawn(async move { discard_plan(&pool, plan_id).await.unwrap() });
+    }
+    let discarded: Vec<bool> = soon(racing.join_all()).await;
+
+    assert_eq!(discarded.iter().filter(|&&did| did).count(), 1);
+    assert!(orders_are_free(&pool, &routing).await);
+}
+
+#[sqlx::test]
+async fn the_depth_of_the_queue_counts_the_jobs_of_each_status(pool: PgPool) {
+    assert_eq!(depth(&pool).await.unwrap(), QueueDepth::default());
+
+    let routing = testing::routing(&pool, date(12), 4, 1).await;
+    let finished = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    complete_route(&pool, &finished).await.unwrap();
+    claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        depth(&pool).await.unwrap(),
+        QueueDepth {
+            queued: 2,
+            running: 1,
+            done: 1,
+            failed: 0,
+            cancelled: 0,
+        }
+    );
+
+    assert!(cancel_plan(&pool, routing.plan.id).await.unwrap());
+    let failing = testing::routing(&pool, date(13), 1, 1).await;
+    sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(failing.routes[0].job_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let job = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fail(&pool, &job.lease, "broken").await.unwrap());
+    assert_eq!(
+        depth(&pool).await.unwrap(),
+        QueueDepth {
+            queued: 0,
+            running: 0,
+            done: 1,
+            failed: 1,
+            cancelled: 3,
+        }
+    );
+}

@@ -2676,6 +2676,8 @@ dependencies = [
  "argon2",
  "chrono",
  "jsonwebtoken",
+ "rand 0.10.3",
+ "rand_chacha 0.10.0",
  "routeforge-domain",
  "serde",
  "serde_json",
@@ -2718,6 +2720,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "utoipa",
  "uuid",
 ]
 

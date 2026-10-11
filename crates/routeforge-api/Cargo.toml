@@ -8,13 +8,16 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-routeforge-domain = { workspace = true, features = ["db"] }
+routeforge-domain = { workspace = true, features = ["db", "openapi"] }
 
 actix-web.workspace = true
 anyhow.workspace = true
 argon2.workspace = true
 chrono.workspace = true
 jsonwebtoken.workspace = true
+# For the demo orders, from a generator seeded by the request.
+rand.workspace = true
+rand_chacha.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

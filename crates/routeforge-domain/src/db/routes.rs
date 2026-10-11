@@ -1,8 +1,8 @@
 //! Routes and their stops.
 //!
 //! A route is written once, when its route job completes, and is read for the map. It
-//! is deleted only together with the other routes of a plan that failed or was
-//! cancelled (D20).
+//! is deleted only together with the other routes of its plan: when the plan fails or
+//! is cancelled (D20), or is discarded after it was done (D30).
 
 use sqlx::PgExecutor;
 use uuid::Uuid;

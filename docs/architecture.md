@@ -22,7 +22,7 @@ How a plan is made:
 3. Solvers claim the `route` jobs. Each one optimizes the stop order for a single courier and writes the route in the transaction that completes its job.
 4. When the last `route` job completes, the plan is marked done.
 
-A plan that is cancelled, or that loses a job for good, undoes itself: its routes are deleted and its orders are pending again (D20).
+A plan that is cancelled, or that loses a job for good, undoes itself: its routes are deleted and its orders are pending again (D20). A plan that is done can be discarded, which undoes it the same way, so that its date can be planned again (D30).
 
 ## Crates
 
@@ -31,8 +31,8 @@ The workspace has exactly five crates, as the [approved description](description
 | Crate | Role | Workspace crates it may use |
 |---|---|---|
 | `routeforge-tsp` | Clustering and route optimization. Pure computation. | none |
-| `routeforge-domain` | Domain types, DTOs and geo helpers. With the `db` feature: persistence and the job queue. | none |
-| `routeforge-api` | HTTP API, auth, OpenAPI, the map page. | `domain` with `db` |
+| `routeforge-domain` | Domain types, DTOs and geo helpers. With the `db` feature: persistence and the job queue. With the `openapi` feature: the schemas of the DTOs. | none |
+| `routeforge-api` | HTTP API, auth, OpenAPI, the map page. | `domain` with `db` and `openapi` |
 | `routeforge-solver` | Queue worker. | `domain` with `db`, `tsp` |
 | `routeforge-bot` | Telegram bot. | `domain` without `db` |
 
@@ -310,9 +310,9 @@ Why:
 - The sweep needs the direction of each stop from the depot and a rough distance. On an equirectangular map round the depot, distances are within 2 % of the globe for stops up to 0.3 degrees from the depot each way, which is 33 km to the north and south, at latitudes up to 60 degrees. A property test checks that. A real map projection would be a dependency for nothing.
 - A sphere is within about 0.5 % of the ellipsoid. A straight line differs from a road by far more.
 
-### D30. A plan that is done can be discarded, and its date planned again (planned)
+### D30. A plan that is done can be discarded, and its date planned again (in place)
 
-Decided by the project owner on 2026-10-11. Phase 4 builds it.
+Decided by the project owner on 2026-10-11.
 
 Discarding undoes a plan that is done, the way a plan that fails or is cancelled undoes itself (D20): its routes are deleted and its orders are pending again. The plan row stays, with the status `discarded`. The operator then plans the date again, and the new plan takes every pending order of the date. Only a plan that is done can be discarded. One that is still in progress is cancelled instead.
 
@@ -325,10 +325,15 @@ Why:
 - Keeping the old routes until the new plan is done would leave no moment without routes. It would also put an order on two routes at once, an old one and a new one, which is what the unique constraint of D20 rules out. The price of a discard is that the date has no routes until the new plan is done.
 - Discarding and planning stay two steps, so each does one thing. A discard made by mistake costs the routes and nothing else: the orders are all there, pending.
 
-What it needs:
+How it is built:
 
-- A `discarded` value for `plans.status`. The two `CHECK`s that list the statuses, `plans_status_check` and `plans_finished_check`, are in a migration that is merged, so this is a new migration.
-- `queue::discard_plan` beside `queue::cancel_plan`. The undo exists as `end_plan` in `db::queue`, where it is limited to plans that are queued or routing. Like every operation on a plan, it locks the plan row first (D24).
+- Migration `0004_discarded.sql` adds `discarded` to the two `CHECK`s that list the statuses of a plan.
+- `queue::discard_plan`, beside `queue::cancel_plan`, is one transaction. Its first statement makes the plan `discarded` if it is `done`, which locks the plan row before anything else, as every operation on a plan does (D24). Then come the two statements that undo a plan, which `end_plan` runs as well and which are now `undo_plan`.
+- A plan that is done has no job left on the queue. So a discard touches no job, and no worker has to be told.
+- The plan keeps its `finished_at`, the moment it was done. When it was discarded is not recorded.
+- The API offers it as `POST /api/plans/{id}/discard`, to operators and admins. A plan that is not done is answered `409`, with what can be done to it instead.
+
+Tests: a discard frees the orders and keeps the row; a plan that is queued, routing, cancelled or failed cannot be discarded; a date that was discarded is planned again and the new plan is offered every order of it; and of several discards at the same moment exactly one succeeds.
 
 ### D31. How long a route is searched for is part of the plan (in place)
 
@@ -344,13 +349,13 @@ Why:
 
 Each attempt of a route job gets the whole budget. The solver measures the time itself, from the moment the search starts. It is a span, like every time a worker handles (D6).
 
-The schema accepts any time a `u32` of milliseconds can hold, which is seven weeks. The API of Phase 4 has to give the budget a default and an upper limit.
+The schema accepts any time a `u32` of milliseconds can hold, which is seven weeks. The API gives the budget a default and an upper limit (D45).
 
-### D32. The API owns the schema, and a solver waits for it (in place for the solver; the API is Phase 4)
+### D32. The API owns the schema, and a solver waits for it (in place)
 
 Decided by the project owner on 2026-10-11.
 
-A solver applies no migrations. After it has connected it asks once a second whether the database has every migration its build knows (`db::is_migrated`), and starts its workers when it has. The API applies the migrations when it starts.
+A solver applies no migrations. After it has connected it asks once a second whether the database has every migration its build knows (`db::is_migrated`), and starts its workers when it has. The API applies the migrations when it starts, before it serves anything (D47).
 
 Why:
 
@@ -358,7 +363,11 @@ Why:
 - A solver that is older than the schema still starts: a database with migrations the build does not know counts as migrated. That is in line with how the queue treats a job such a solver cannot read (D22). Had the solver run the migrator itself, the migrator would refuse a database that is ahead of it.
 - The stack needs no start order. A solver that comes up before the API waits.
 
-Cost: there is no API before Phase 4, so until then a fresh database is migrated by hand, or a solver waits for ever: `cargo sqlx migrate run --source crates/routeforge-domain/migrations`, which `scripts/sqlx-prepare` runs as well.
+The two sides treat a database that is ahead of them differently, and on purpose. A solver takes it as migrated and works. The API refuses to start: sqlx's migrator does not run against migrations it does not know, and the API, which writes to every table, must not write to a schema it has not seen.
+
+Cost: a database gets its schema only when an API has started against it, and on any other a solver waits for ever. The API has no service in compose before Phase 6, so until then it is run on the host for that. `scripts/sqlx-prepare` applies the migrations as well, since it needs them to describe the queries.
+
+Tried in containers: two solvers started against a database that had just been created said that they were waiting, and began to look for jobs within a second of the API having applied the schema.
 
 `is_migrated` reads `_sqlx_migrations`, the table sqlx keeps its own books in, through a compile-time checked query like every other (D28). The metadata in `.sqlx/` is therefore prepared against a database that has been migrated, which the script and the CI step both see to.
 
@@ -447,3 +456,165 @@ The Dockerfile at the root builds every service, and each service is a target: `
 Why one file: the services are binaries of one workspace and share almost all their dependencies. With one builder stage they are compiled once, however many targets are built.
 
 CI builds the image in a job of its own, so a dependency that needs a native library fails there and not on the day of the demo.
+
+### D39. The HTTP API: one prefix, plain JSON, one shape of error (in place)
+
+Everything the API serves as data is under `/api`. Beside it are `/healthz` and `/readyz`, the OpenAPI document at `/api/openapi.json` and Swagger UI at `/docs/`. The root is left for the page of Phase 5.
+
+- A thing is read with `GET`, made with `POST`, which answers `201`, replaced with `PUT` and changed in part with `PATCH`. What changes the state of a thing and is no edit of it is a `POST` to a path of its own: `/api/orders/{id}/cancel`, `/api/plans/{id}/cancel`, `/api/plans/{id}/discard`.
+- An id is a UUID in the path.
+- Every error is `application/problem+json` (RFC 9457), a `Problem` of the domain crate: `type`, `title`, `status`, a `detail` in words, and `errors` with the fields that were refused, where it is known which.
+
+| Status | |
+|---|---|
+| 400 | The request could not be read: broken JSON, a path or a query that does not parse. |
+| 401 | No token, or one that is not valid. |
+| 403 | A valid token whose role does not allow this. |
+| 404 | No such thing, or none that the caller may know of. |
+| 409 | The thing is not in a state for this: the date has a plan in progress, the order is planned already, the plan is not done. |
+| 413, 415 | A body that is too large, or is not JSON. |
+| 422 | The request was read, and something in it cannot be accepted. |
+| 500 | The fault is the server's. |
+
+An order that belongs to another client is a `404` to a client, with the very body an id that names nothing gets.
+
+Why:
+
+- A client has one shape of error to read: the page, and the bot, whose model is handed the `detail`. actix-web answers a body it cannot read, or a path it does not serve, in plain text. So the API sets its own handlers for bodies, paths and queries, and its own answer for whatever matches no route.
+- A `403` for somebody else's order would say that the order exists.
+- The cause of a `500` may name a table, a constraint or a host. It is logged, with the id of the request (D42), and not sent.
+- The path has no version in it. Nothing plans a second one, and whoever calls the API beside Swagger UI is in this repository.
+
+Good to know: a path that is served, asked for with a method it does not take, is a `404` as well. actix-web tells routes apart by method before it knows that the path exists.
+
+### D40. Passwords and tokens (in place)
+
+- A password is stored as an Argon2id hash, with the parameters the `argon2` crate recommends: 19 MiB, two passes, one lane. Hashing and checking run on blocking threads, through `web::block`. The parameters are part of the stored hash, so they can be raised later without touching the accounts that are there.
+- A login for an address that has no account is checked all the same, against the hash of a password nobody has. Then it is refused exactly as a wrong password is, with the same status and the same words.
+- A login gives a JWT signed with HS256. It names the user (`sub`) and the role, and when it was issued and expires (`iat`, `exp`). It is good for `JWT_TTL_SECS`, an hour by default, and there is no leeway. The key is `JWT_SECRET`, at least 32 bytes long. The binary has no default for it.
+- The role is in the token, and nothing is looked up to check a request.
+- An account is opened as a client's. An admin makes operators and admins of them, and cannot change their own role.
+- The first admin comes from `ADMIN_EMAIL` and `ADMIN_PASSWORD`, when the API starts and no account has that address. An account that is there is left as it is.
+
+Why:
+
+- Hashing is slow on purpose. On the threads that serve requests, a handful of logins at once would stall every other request.
+- Without the decoy the time a login takes would say which addresses have accounts.
+- With the role in the token a request costs no query. The price is that a changed role applies from the user's next login. Until the token they hold expires, an hour at most by default, they keep the old one. A lookup on every request would make that immediate, and would also make the role in the token pointless.
+- There is no way to end a token early, and none to renew one. A token ends by expiring, and the user logs in again. For a demonstration that is enough, and it keeps the API free of state.
+- An admin who could demote themselves could leave the system without an admin, and only the database could mend that.
+- If the settings could change an existing account, a stale `ADMIN_PASSWORD` would reset a password at every start, and somebody who had registered the address first would be made an admin by it.
+
+Only HS256 tokens are accepted, so the RSA advisory of D12 still does not apply.
+
+A debug build takes about a third of a second over a hash. The tests use the smallest parameters there are, except one test that checks the real ones.
+
+### D41. Who may call what is a table, and the tests hold the API to it (in place)
+
+| | Client | Operator | Admin |
+|---|---|---|---|
+| Open an account, log in, health, the document | without a token | | |
+| Orders: place, list, read, withdraw | their own | all | all |
+| The depot: read | yes | yes | yes |
+| The depot: set | no | no | yes |
+| Couriers | no | yes | yes |
+| Plans, their routes, cancel, discard | no | yes | yes |
+| The stats | no | yes | yes |
+| Users, roles, demo orders | no | no | yes |
+
+A handler says who may call it by the type of its first argument: `AuthUser` for anybody with a token, `Staff` for an operator or an admin, `Admin`. actix-web takes the arguments of a handler in their order, so with this one first the gate is checked before the body is read.
+
+One test has the table, written out by hand as a list of every endpoint with the least role it needs. It sends every request as nobody and as each role, and expects `401`, `403` or anything else, as the table says. Another test reads the endpoints out of the OpenAPI document and compares them with the list.
+
+Why:
+
+- The type in the signature is the gate. A handler cannot run for a caller its signature does not name, and what a handler needs is read off its first line.
+- With the body first, somebody without a token would be told what is wrong with their JSON, which is none of their business, and the API would have parsed input from a stranger for nothing.
+- The table is written by hand so that a gate changed by mistake does not change what is expected along with it. Reading the endpoints from the document closes the other gap: an endpoint that is added without a line in the table fails the test.
+
+### D42. One id follows a request into the logs of the solvers (in place)
+
+Every request has an id. A client may send its own as `X-Request-Id`. One of 1 to 64 letters, digits, dots, underscores and hyphens is kept, and otherwise the API makes one, a UUIDv7. The id
+
+- is echoed on the response, a refusal included,
+- is the `request_id` of the span everything about the request is logged in, together with the method, the path, the user once the token has been read, and the status,
+- and, when the request asks for a plan, is stored on the plan's job by `plans::submit`. The route jobs inherit it (D36), and a solver logs each job in a span that has it under the same name (D33).
+
+So one id is found in the log of the API and of every solver that worked on the plan. In a run with two solver containers it was on the request for the plan, on the `plan` job and on all four route jobs.
+
+Why the span is built here: `tracing-actix-web` gives every request an id of its own making and cannot take one from a header. Its middleware is kept, with a `RootSpanBuilder` of ours, `RequestSpan`. A small middleware in front of it decides the id, so that the id is there when the span is made, and puts it on the response.
+
+Why an id from outside is checked: it goes into a log line, a response header and a column. One with a line break or a quote in it could forge a log line.
+
+The middleware logs one line when a request has been handled, with the status. What a handler refuses is logged as a warning with the reason, and what fails on the server as an error with its cause, both by `tracing-actix-web` and both inside the span.
+
+### D43. The OpenAPI document comes from the types and the handlers (in place)
+
+- The types the API sends and receives have their schema derived by utoipa, in the domain crate, behind its `openapi` feature. Each of them has a `cfg_attr` for it.
+- The bodies that are not entities, such as a login or the request for a plan, are in the domain crate too, in `dto`. The bot uses them without either feature.
+- Every handler has a `#[utoipa::path]`, and its name is the id of the operation. The routes are registered through `utoipa-actix-web`, which collects what they say about themselves. So what is served is what is documented.
+- The document is committed, as `crates/routeforge-api/openapi.json`, and a test compares what the API serves with it. `UPDATE_OPENAPI=1` rewrites the file.
+- Swagger UI is served at `/docs/` from files inside the binary. The `vendored` feature of `utoipa-swagger-ui` carries them in a crate, so neither the build nor the page fetches anything (D8).
+
+Why:
+
+- D19 kept sqlx out of the domain types, and with it a `cfg_attr` on every one of them. Here the attribute is the lesser cost. A schema has to describe the very type that serde writes, and a second type that mirrors it for the document could drift from it unnoticed. utoipa also needs nothing of a type but its shape, where sqlx would have wanted the types flat.
+- The bot is to send what the API reads and read what it sends. Shared types make that a matter of compiling.
+- The document is the API's contract with the page and the bot. Committed, a change to it shows up in review, including one nobody meant, such as a field renamed in passing.
+
+Three traps, each of which gave a document that was wrong and looked right:
+
+- `text_enum!` has to take the text of a value as a `tt`. As a `literal` it is handed on wrapped in an invisible group, which serde looks into and utoipa does not, and the document named the values `Queued` and `Routing`.
+- A handler takes an id as `web::Path<Uuid>`. utoipa reads `Path<OrderId>` as a struct of parameters.
+- A query that is a struct, such as `OrderFilter`, has to be named in `params(...)` as well as being an argument. Without that utoipa leaves its parameters out and says nothing.
+
+The words of the document are the doc comments of the types and the handlers. So some of them cite decisions of this file by number.
+
+### D44. A list is read in pages, by the id of the last item (in place)
+
+`GET /api/orders` takes `limit` and `after`. It answers with at most `limit` orders, oldest first, that come after the order with the id `after`. A client reads on by passing the id of the last order it got. `limit` is 100 unless said otherwise and 1000 at most.
+
+`OrderFilter` is both the query string of the endpoint and the filter of `orders::list`. Without a `limit` the repository returns everything, which is what the solver and the tests want.
+
+Why:
+
+- Ids are UUIDv7 (D11), so their order is the order of creation, and the primary key serves the query.
+- A page asked for by position shifts when an order is placed meanwhile, and one order is then seen twice or not at all. A page asked for by id does not.
+- The answer is a plain array. A page with fewer orders than `limit` is the last.
+
+The couriers and the users are listed whole. There are a handful of each.
+
+### D45. The API gives a plan its budget and its seed when it names none (in place)
+
+- A request for a plan may leave out the budget (D31). It then gets `API_BUDGET_DEFAULT_MS`, ten seconds a route by default.
+- A budget that is given may be at most `API_BUDGET_MAX_MS` of time, five minutes by default, and at most `API_BUDGET_MAX_ITERATIONS` moves, ten thousand million by default. Each limit holds on its own. More is a `422`.
+- A request may leave out the seed. It then gets one from the random bytes of a UUID, and the plan says which, so the plan can be run again with it.
+
+Why:
+
+- A route job holds a worker for the whole of its budget (D18). A budget typed with three noughts too many would hold every worker for days.
+- The limits are settings and not constants, because how long a number of moves takes depends on the machine the solvers run on.
+- A plan that asked for no seed should still be repeatable.
+
+### D46. Demo orders come from the API, from a seed (in place)
+
+`POST /api/demo/orders`, for admins, stores up to 2000 pending orders for a date, spread evenly over a disc round the depot. Its radius is 5 km by default and 30 km at most. About one in five is a pickup, and each has a demand of 1 to 3. They belong to the admin who asked. They are stored in one transaction.
+
+Every random choice comes from a ChaCha8 generator seeded with the request's seed, as in `routeforge-tsp` (D5). The same seed gives the same orders round the same depot.
+
+Why:
+
+- A demonstration needs a few hundred orders, and a tool to make them would be a sixth crate. In the API it is one more endpoint.
+- With a seed, the scaling run of Phase 6 plans the same day with one solver and with four, and anybody can repeat a demonstration.
+- The distance from the depot is the radius times the square root of a random number. Without the root the orders would crowd round the depot, since a ring's share of the disc grows with its radius.
+- Beyond some 30 km the flat map the plans are clustered on is no longer a good one (D29).
+
+### D47. The API ends at once when it cannot start (in place)
+
+When it starts, the API connects to the database, applies the migrations (D32), makes the first admin if one is asked for (D40), and only then listens. If the database does not answer, or a setting is wrong, the process ends with the reason.
+
+Why: a solver waits for its database for as long as it takes (D37), because a worker that waits harms nobody. An API that listened without a database would accept connections and answer every one with an error. A process that ends says more, and whatever started it can start it again. In compose that will be `depends_on` with the health of the database, which the `solver` service has already.
+
+While it migrates, sqlx holds a lock on the database. Two APIs that start together apply each migration once.
+
+The pool has ten connections. A request that gets none within five seconds is answered `500`.

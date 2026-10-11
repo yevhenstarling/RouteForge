@@ -13,9 +13,14 @@ pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 /// of this type holds nothing else, NaN included: [`LatLon::new`] and deserialization
 /// both check.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(try_from = "Unchecked")]
 pub struct LatLon {
+    /// Degrees north of the equator.
+    #[cfg_attr(feature = "openapi", schema(minimum = -90.0, maximum = 90.0))]
     lat: f64,
+    /// Degrees east of Greenwich.
+    #[cfg_attr(feature = "openapi", schema(minimum = -180.0, maximum = 180.0))]
     lon: f64,
 }
 
