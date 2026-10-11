@@ -22,8 +22,9 @@ services:
   # service has no container name and publishes no port, so nothing stands in the way.
   #
   # A solver applies no migrations. It waits until the database has the schema (D32),
-  # which the API applies from Phase 4 on. Until then, migrate the database by hand:
-  #   cargo sqlx migrate run --source crates/routeforge-domain/migrations
+  # which the API applies when it starts. The API gets a service of its own here in
+  # Phase 6. Until then it runs on the host:
+  #   cargo run -p routeforge-api
   solver:
     build:
       context: .
