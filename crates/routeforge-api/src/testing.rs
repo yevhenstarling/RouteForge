@@ -1,10 +1,13 @@
 //! Shared by the tests: the application inside a test, people with tokens, a small
 //! JSON client, a reader of event streams, and a stand-in for the solver.
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
+use actix_web::HttpServer;
 use actix_web::body::{BoxBody, MessageBody};
+use actix_web::dev::ServerHandle;
 use actix_web::http::header::{self, HeaderMap};
 use actix_web::http::{Method, StatusCode};
 use actix_web::test::{self, TestRequest};
@@ -279,6 +282,22 @@ impl Api {
             body: response.into_body().boxed(),
             arrived: String::new(),
         }
+    }
+
+    /// Serves the application on a port of this machine, as `main` does, for a test
+    /// that has to ask over a socket. It is served until the handle is told to stop.
+    pub(crate) fn serve(&self) -> (SocketAddr, ServerHandle) {
+        let state = self.state.clone();
+        let server = HttpServer::new(move || app(state.clone()))
+            .workers(1)
+            .disable_signals()
+            .bind(("127.0.0.1", 0))
+            .expect("a free port on this machine");
+        let address = server.addrs()[0];
+        let server = server.run();
+        let handle = server.handle();
+        tokio::spawn(server);
+        (address, handle)
     }
 
     /// The hub of the application, for a test that feeds it by hand.

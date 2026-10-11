@@ -10,7 +10,7 @@ mod auth;
 mod couriers;
 mod demo;
 mod depot;
-mod health;
+pub(crate) mod health;
 mod orders;
 mod plans;
 mod system;

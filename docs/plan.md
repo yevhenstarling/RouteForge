@@ -21,6 +21,9 @@ Confirmed with the project owner:
 - **Phases keep to their list.** When Phase 4 was planned, the image and compose service of the API were offered ahead of Phase 6, and a list of plans ahead of Phase 5. Both stayed where this plan has them.
 - **Routes are drawn while they are searched for.** The search hands out its best tour, the worker announces it, and the map shows it as a line that moves. The progress of a job as two numbers was not enough for "improve live" (D49).
 - **The page has three controls beyond the list of Phase 5:** discarding a done plan, a demo setup for an empty database, and a budget and a seed for a plan (D52).
+- **The stack starts with no settings.** A fresh clone has no key to sign tokens with and no admin. Compose falls back to values for a demonstration, which are in the repository for everybody to read, and the ports are open to the machine alone (D54).
+- **The bot is in the stack before it is built.** Its image and its compose service are Phase 6's, with a stub that idles. The bot itself stays Phase 7's (D56).
+- **Phase 6 has a quick start in the README, and leaves CI alone.** Starting the stack in CI, and running the demo script there, were offered beside it and not taken.
 
 Derived from the description:
 
@@ -51,7 +54,7 @@ RouteForge/
 │  ├─ routeforge-solver/    worker binary
 │  └─ routeforge-bot/       teloxide binary
 ├─ web/                     index.html, vendor/leaflet
-├─ scripts/                 sqlx-prepare.ps1, sqlx-prepare.sh; later demo.ps1, demo.sh
+├─ scripts/                 sqlx-prepare and demo, each as .ps1 and .sh
 ├─ docs/                    description.md, plan.md, architecture.md
 └─ .sqlx/                   offline query metadata (committed)
 ```
@@ -66,7 +69,7 @@ RouteForge/
 | 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | done |
 | 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | done |
 | 5 | Live updates and map | Routes appearing and improving live in the browser | M | done |
-| 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | todo |
+| 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | done |
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | todo |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | M | todo |
 
@@ -254,10 +257,53 @@ What later phases need from it:
 
 ## Phase 6: one-command stack, scaling and failure demo
 
-- Compose: `db`, `api`, `solver` (no fixed name or ports, so it scales), `bot`; healthchecks and `depends_on: service_healthy`.
-- Scaling run: the same seeded plan with 1 and with 4 solvers, time to completion recorded. The plan is discarded between the two runs (D30).
-- Failure run: `docker kill` a solver mid-solve; the lease expires and another worker finishes. Scripted in `scripts/demo.ps1` and `scripts/demo.sh`.
-- **Done when:** a fresh clone needs only `docker compose up --build --scale solver=4`.
+Delivered:
+
+- The image has a target for each service: `api`, `solver`, `bot`. The one builder stage builds all three, so what they share is compiled once (D38).
+- Compose has the whole stack: `db`, `api`, `solver`, `bot`. A clone needs `docker compose up --build --scale solver=4` and nothing else. It needs no `.env`, because every setting has a value to fall back on, and the three that are secrets fall back to values for a demonstration (D54). The API is published on `127.0.0.1:8080`.
+- Health checks where something waits for one: the database's, now asked over TCP, and the API's. The API waits for the database and the bot for the API. A solver waits for the database and, by itself, for the schema.
+- In the API: `routeforge-api healthcheck` asks the API that runs beside it for `/readyz`, as the health check of an image that has no `curl`. A health check that went well is logged at `debug` (D55).
+- The stub of the bot idles until it is told to stop, and hears SIGTERM (D56).
+- `scripts/demo.ps1` and `scripts/demo.sh`: the scaling run and the failure run, through the API alone (D57).
+- `README.md` says how to run the stack and the demonstration. `.env.example` says what compose passes on, and what the three demo values are good for.
+- Tests: 8 more, all in the API, which has 100 now. Four hold the probe to what it asks and to what it takes for a yes, one of them against the application over a real socket. One reads the log after health checks that went well and one that did not. One reads the `api` service out of `docker-compose.yml` and starts the API's settings from what it falls back to. Two run the binary itself, with `healthcheck` and with an argument it does not know.
+- The tests were tried against 18 faults put into the code and into the compose file on purpose. Each made a test fail but two: with the `healthcheck` argument not looked at, and with an unknown argument taken for none, every test passed, because none of them came in through `main`. The two tests that run the binary were added for that, and fail for both. Among the others: a probe that asks `/healthz`, takes any status, takes a `200` from what is no HTTP, or waits without end; an address that means everywhere asked as it is; a check that went well logged like any request, and one that did not go well not logged; a demo key too short to sign with, a demo password too short for an account, a variable with nothing to fall back on, and the port published to every machine.
+- Tried by hand, with the development database left alone: a clone of the phase branch in a directory of its own, with no `.env`, under another project name and on other ports.
+  - **The one command.** The stack was up, with the database and the API healthy, four workers alive, the admin made and the bot idling. Ten starts on a new volume took 8.5 to 9.0 seconds each and all went well. The API logged no health check. `docker compose down` took 2.8 seconds.
+  - **The database's health check.** Ten starts with the check as it was, over the socket, went well too. The window is there: on a new volume the socket said yes for 0.14 seconds while the port was closed. sqlx's five seconds of trying again cover it. With the set-up of the database stretched by twelve seconds, the old check let the API start and the API gave up; with the new one the stack came up (D54).
+  - **In a browser,** a headless Edge driven over the DevTools protocol at `http://localhost:8080`, with the pictures looked at. On a new database: logged in as the seeded admin, set up the demo city, generated 300 orders, pressed Plan. Four dashed routes of 87, 86, 78 and 49 stops were searched by four solvers, each named by the id of its container, and stored: 125.29 km, the figures of Phase 5. Once more with 1200 orders: routes of 333, 336, 328 and 203 stops, of which one went from 64.43 km a second in to 63.40, 63.25 and at last 62.97 km. Swagger UI listed 27 operations. The only line in the browser's console was its own note of the `404` the page gets when it asks for a depot that is not there yet.
+  - **The scaling run,** 300 orders on four vans, 200 million moves a route: 15.2 seconds with one solver, 8.1 with two, 4.5 with four and 4.6 with eight, the same routes every time. A second round gave 15.1, 7.9, 4.5 and 4.4.
+  - **The failure run,** four solvers and ten seconds a route: the killed solver's route was taken over 27.8 seconds after the kill, and the plan was done after 40.2, with every order on exactly one route. With a lease of ten seconds and a heartbeat of two it was 12.4 and 24.7.
+  - **Both scripts,** all the way through: `demo.ps1` in PowerShell 7 and in Windows PowerShell 5.1, and `demo.sh` under dash on Ubuntu with curl and jq 1.8.1.
+  - **At the end, the branch as it was committed,** in a clone made anew: built from an empty cache in a minute and a half, started, and shown by `demo.ps1` once more, with the numbers above.
+  - **The request id** a script sent for a plan was in the log of the API and of each of the four solvers, and the job that was taken over was logged with `attempt=2`.
+
+Where it differs from what this plan first said:
+
+- Two services have a health check and not four. Nothing waits for a solver or for the bot, and which solvers are alive is what the registry says (D54).
+- The scaling run has a budget of moves, and compares the routes of its runs. That makes it verification steps 3 and 4 at once: the same seed gives the same routes, with one solver or with eight.
+- The scripts plan tomorrow and not the day the page opens on, and size their orders to the couriers that are there. A day of 300 orders on vans that were sized for 1200 is one route, and one route is nothing to share out.
+- The database's health check, which is Phase 0's, was changed.
+- By the project owner's choice: the bot is in the stack now, as a stub; the README has a quick start, which is otherwise Phase 8's; and CI is as it was.
+
+Three things went wrong while it was tried. Two are guarded against now (D57), and the third can only be known about:
+
+- `pwsh -File scripts/demo.ps1 scaling -Solvers 1,2,4,8` asked compose for 1248 solvers. Every one of those containers was created, in a project made for trying things, before the run was stopped and they were removed. The scripts read the counts as text now and refuse more than twenty.
+- A moment later Docker could not resolve the registry's name, and `docker compose up --build` failed with every layer cached. The scripts no longer pass `--build`. It happened once more, with crates.io, in a build that had its dependencies to fetch, and the next attempt went through.
+- At the very end `docker compose build` was refused three times running, with `additional privileges requested`. The shell it was started from, a Git Bash, had its directory spelled `d:\`. From PowerShell the same build went through. Compose 5 does this on Windows, nothing in the repository can stop it, and the README now says to start the stack from PowerShell. The trap is among the known ones below.
+
+What later phases need from it:
+
+- Phase 7: the `bot` service is there and waits for the API to be healthy. It is handed nothing yet. It will need its tokens, the address of the API on the compose network, which is `http://api:8080`, and `LOG_FORMAT` and `RUST_LOG` as the other two have them. Each of them needs a fallback, or has to be allowed to be missing: the stack starts with no `.env` (D54), and a bot without tokens idles (D8). The test that holds the compose file to that reads the `api` service alone.
+- Phase 7: the bot is the first process of its container. Whatever takes the place of the stub's wait has to hear SIGTERM: check that teloxide's `ctrlc_handler` does, or keep `told_to_stop` beside it (D56).
+- Phase 7: the runtime image has no CA certificates (D38), and the bot is the first service to speak TLS. reqwest's `rustls-tls` carries its own roots. If teloxide's client does not go that way, the certificates have to be added to the runtime stage.
+- Phase 7: the key that guards the endpoint for the bot's tokens is a fourth secret for compose. It needs a demo fallback like the other three, or an endpoint that is off without it.
+- Phase 7: in the image the bot is linked against a domain crate that was built with `db` (D38). `cargo check -p routeforge-bot` is what keeps the bot's source from using it.
+- Phase 8: the scaling table for the README is in D57, and `scripts/demo.ps1 scaling -Solvers 1,2,4,8` prints it again. It wants a machine that is doing nothing else: one run on a busy one took 28.6 seconds where the others took 15.
+- Phase 8: OSRM as a compose profile. A service with a profile stays out of `docker compose up` unless the profile is named, which keeps the stack free of the network by default (D8). The solver's setting for it goes onto the list of variables compose passes on.
+- Phase 8: CI builds the `solver` target and nothing else of Phase 6. Starting the stack there, and running `scripts/demo.sh`, were offered and left out. They are a step each if they are wanted: `docker compose up -d --wait --scale solver=2`, and the script, for which the runners have `curl` and `jq`.
+- Phase 8: a presentation without a network wants the images built beforehand. `docker compose up --build` asks the registry (D54).
+- Phase 8: hardening that was left out. The demo key and the demo admin are public by design (D54), so the stack is for one machine as it stands. Nothing is said to a person who starts it with those values on a port they have opened wider themselves.
 
 ## Phase 7: Telegram bot (`routeforge-bot`)
 
@@ -294,7 +340,16 @@ What later phases need from it:
 - **Leaflet draws a canvas in the order things were added to it.** Dots that are drawn again cover a line that was there before them. The page draws its lines in SVG, above the canvas of the dots (D52). A tooltip that is given a string takes it as HTML, so the page gives it an element.
 - **On Windows, whether a process ignores Ctrl-C is inherited.** A service started from a tool that ignores it cannot be stopped with it, whatever the service does. To try D51 the API was started by a launcher that turns Ctrl-C back on (`SetConsoleCtrlHandler(NULL, FALSE)`), in a console of its own.
 - **A `tracing` subscriber for one thread loses lines in tests.** `tracing` remembers for every place that logs whether anybody listens, and with one subscriber that belongs to one thread it may ask a thread that has none. A test that reads the log sets a subscriber for the whole process and picks its own lines out by an id: see `captured_log` in the solver's tests.
-- **A fresh database has no schema until an API has started against it.** A solver waits for it and applies none (D32). The API has no service in compose before Phase 6, so until then it is run on the host: `CLAUDE.md` says how. `scripts/sqlx-prepare` applies the migrations to the compose database as well.
+- **A fresh database has no schema until an API has started against it.** A solver waits for it and applies none (D32). `docker compose up` starts an API. `docker compose up -d db solver` does not, and its solvers wait. `scripts/sqlx-prepare` applies the migrations to the compose database as well.
+- **`pg_isready` over the socket says yes too early.** While it sets up a new database, the postgres image runs a server that listens on the socket alone. A service that is let go then and comes over the network finds the port closed. The compose file asks over TCP (D54).
+- **sqlx waits five seconds for a database that refuses.** A refused connection is tried again until the pool's acquire timeout. That hid the trap above in every ordinary start, and it is why an API with no database takes five seconds to say so (D47).
+- **The first process of a container is not ended by SIGTERM unless it listens for it.** A binary that does not is killed after the ten seconds `docker stop` allows. The solver, the API and the stub of the bot all listen (D35, D51, D56).
+- **`docker compose up --build` asks the registry every time,** for the Dockerfile frontend and the base images, with every layer cached. Without a network it fails, where `docker compose up` starts the images that are there (D54).
+- **On Windows a build is refused from a directory spelled with a lower-case drive letter.** `docker compose build`, and `docker compose up` when it has something to build, end with `additional privileges requested: pass "--allow=fs.read=Dockerfile"`. Compose 5 hands its builds to `buildx bake`, which takes the Dockerfile to lie outside the directory it was started in when the two are spelled `d:\` and `D:\`. `cmd` and Git Bash keep a working directory as they were given it, and the terminals of VS Code give it as `d:\...`. PowerShell hands `D:\...` on to what it starts, and is not affected. Three ways out: run it from PowerShell, `cd` to the directory spelled with a capital, or set `BUILDX_BAKE_ENTITLEMENTS_FS=0`, which turns that check off. `COMPOSE_BAKE=false` does not help. Seen with Compose 5.5.1 and buildx 0.37.2. `docker build --target api .` is not affected, and neither is starting images that are built.
+- **The compose file names its project.** A second copy of the repository on the same machine is the same project, with the same containers and the same volume. To try something beside the development stack: `COMPOSE_PROJECT_NAME`, with other ports in `POSTGRES_PORT` and `API_PORT`. A script that calls `docker compose` acts on whichever project that is.
+- **A list on PowerShell's command line is a list only inside PowerShell.** `pwsh -File demo.ps1 -Solvers 1,2,4,8` hands the script the one text `1,2,4,8`, which an `[int[]]` parameter reads as the number 1248. The demo script takes the counts as text (D57).
+- **PowerShell's two versions read JSON differently.** Windows PowerShell hands a JSON array on as one thing where PowerShell 7 takes it apart, and PowerShell 7 writes a `double` that is a whole number as `165.0`, which serde does not take for a `u32`. `scripts/demo.ps1` passes what it reads through the pipeline once more, and casts what it sends to `[int]`.
+- **Headless Edge wants an absolute `--user-data-dir`.** With a relative one it ends at once and says nothing, and nothing listens on the DevTools port.
 - **utoipa leaves things out without a word.** An enumeration whose values come out of a macro as `literal`s is documented by the names of its variants; `web::Path<OrderId>` is read as a struct of parameters; a query struct that is not named in `params(...)` is not described at all. Each compiled and gave a document that was wrong (D43). Read `openapi.json` after changing a type or a handler.
 - **A number that has been through JSON may differ in its last digit.** serde_json reads a float fast and not exactly, unless its `float_roundtrip` feature is on. A test that compares a position the API returned with one it computed allows for that.
 - **A handler's name is taken.** `#[post("/api/auth/login")]` on `async fn login` makes `login` a type. A `let login = …` in any handler of that module then fails to compile, with a message about mismatched types.
@@ -304,16 +359,17 @@ What later phases need from it:
 ## Needed from the project owner
 
 - `sqlx-cli` on any machine where a query or a migration is changed. The command that installs it is at the top of `scripts/sqlx-prepare`.
+- `curl` and `jq` on a machine where `scripts/demo.sh` is run. `scripts/demo.ps1` needs neither.
 - Before Phase 7: a Telegram bot token from @BotFather and an Anthropic API key.
 - If the bootcamp grades against a rubric (coverage, report, presentation format), it gets folded into Phase 8.
 
 ## Verification
 
 1. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` with the compose `db` up, and `cargo bench -p routeforge-tsp`.
-2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, set up the demo city, generate 300 orders, press Plan. Routes appear and improve live; `/docs` lists every endpoint. With 1200 orders in the field before the city is set up, the routes are long enough to be seen improving for seconds (D49).
-3. Determinism: run a plan, discard it (D30), and run it again with the same seed and an iteration budget; the routes are identical.
-4. Scaling: the same plan with 1 solver and with 4, discarded in between; completion time drops until workers outnumber routes.
-5. Failure: `docker kill` one solver mid-solve; within the lease time another worker takes over and every order is still routed exactly once.
-6. Tracing: take the `X-Request-Id` of the plan request and find it in the logs of the API and of every solver that worked on that plan.
-7. Offline: disconnect the network and repeat step 2. Routes draw without map tiles and the bot idles.
+2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, `admin@example.com` with the password `routeforge` (D54), set up the demo city, generate 300 orders, press Plan. Routes appear and improve live; `/docs` lists every endpoint. With 1200 orders in the field before the city is set up, the routes are long enough to be seen improving for seconds (D49).
+3. Determinism: run a plan, discard it (D30), and run it again with the same seed and an iteration budget; the routes are identical. The scaling run of `scripts/demo` does this with every run it makes (D57).
+4. Scaling: `scripts/demo scaling` plans the same day with 1 solver and with 4, discarded in between. With `-Solvers 1,2,4,8`, or `DEMO_SOLVERS='1 2 4 8'` for the sh one, completion time drops until workers outnumber routes.
+5. Failure: `scripts/demo failure` kills one solver mid-solve; within the lease time another worker takes over and every order is still routed exactly once.
+6. Tracing: take the `X-Request-Id` of the plan request and find it in the logs of the API and of every solver that worked on that plan. The demo scripts print the one they sent.
+7. Offline: disconnect the network and repeat step 2 without `--build`, which asks the registry (D54). Routes draw without map tiles and the bot idles.
 8. Bot: place an order by chat and see it on the map.

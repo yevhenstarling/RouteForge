@@ -1,5 +1,15 @@
 name: routeforge
 
+# The whole stack. On a fresh clone, with no .env:
+#
+#   docker compose up --build --scale solver=4
+#
+# The page with the map is then at http://127.0.0.1:8080/ and Swagger UI at /docs/.
+#
+# Every setting has a value to fall back on, so a clone needs no .env (D54). Three of
+# those values are no secrets at all, and are marked below. They are for showing the
+# system on this machine, which is the only place the ports are open to.
+
 services:
   db:
     image: postgres:17-alpine
@@ -13,7 +23,51 @@ services:
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # Asked over TCP and not over the socket. While a new database is being set up,
+      # the image runs a server that listens on the socket alone. A check that asked
+      # there would say yes, and the API, which is let go by it and comes over the
+      # network, would find the port closed (D54).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The HTTP API, with the page and Swagger UI inside it. It applies the schema when
+  # it starts (D32), and ends at once if the database does not answer (D47), which is
+  # why it waits for the database to be healthy.
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      # `db` is the service above, on the compose network. The URL in .env is for
+      # programs outside Docker and says 127.0.0.1.
+      DATABASE_URL: postgres://${POSTGRES_USER:-routeforge}:${POSTGRES_PASSWORD:-routeforge}@db:5432/${POSTGRES_DB:-routeforge}
+      # Every address of the container, which is where the published port arrives.
+      API_BIND: 0.0.0.0:8080
+      # For a demonstration, and no secrets. Whoever has read this file can sign a
+      # token, or log in as the admin. Set your own in .env before the port below is
+      # opened to anything but this machine.
+      JWT_SECRET: ${JWT_SECRET:-routeforge-demo-signing-key-not-a-secret}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-routeforge}
+      # Passed on if set in .env or in the shell, and left to their defaults if not.
+      JWT_TTL_SECS:
+      API_BUDGET_DEFAULT_MS:
+      API_BUDGET_MAX_MS:
+      API_BUDGET_MAX_ITERATIONS:
+      API_WORKER_ALIVE_SECS:
+      LOG_FORMAT:
+      RUST_LOG:
+    ports:
+      # On localhost only, like the database: the login above is known to everybody.
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # The image has no curl. The binary asks its own /readyz (D55).
+      test: ["CMD", "routeforge-api", "healthcheck"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -22,16 +76,16 @@ services:
   # service has no container name and publishes no port, so nothing stands in the way.
   #
   # A solver applies no migrations. It waits until the database has the schema (D32),
-  # which the API applies when it starts. The API gets a service of its own here in
-  # Phase 6. Until then it runs on the host:
-  #   cargo run -p routeforge-api
+  # which the API applies when it starts. So it waits for the database alone, and the
+  # two may start in either order.
+  #
+  # It has no health check. Nothing waits for a solver, and which of them are alive
+  # is what the registry says (D27) and the page shows.
   solver:
     build:
       context: .
       target: solver
     environment:
-      # `db` is the service above, on the compose network. The URL in .env is for
-      # programs outside Docker and says 127.0.0.1.
       DATABASE_URL: postgres://${POSTGRES_USER:-routeforge}:${POSTGRES_PASSWORD:-routeforge}@db:5432/${POSTGRES_DB:-routeforge}
       # Passed on if set in .env or in the shell, and left to their defaults if not.
       SOLVER_CONCURRENCY:
@@ -43,6 +97,16 @@ services:
       RUST_LOG:
     depends_on:
       db:
+        condition: service_healthy
+
+  # The Telegram bot. It is built in Phase 7. Until then it starts, says so, and idles
+  # (D56). It reaches the system through the API alone, so that is what it waits for.
+  bot:
+    build:
+      context: .
+      target: bot
+    depends_on:
+      api:
         condition: service_healthy
 
 volumes:

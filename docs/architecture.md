@@ -30,6 +30,12 @@ How a plan is watched:
 2. One connection of the api listens. What it hears reaches every open event stream, and a stream that hears of its plan reads the plan again and sends what has changed (D50).
 3. The page, which the api serves at `/`, reads the stream and draws: a dashed line for a route that is still searched for, a solid one when it is stored (D52).
 
+How it is run:
+
+1. `docker compose up --build --scale solver=4`, on a clone with no settings, brings up the database, the api, four solvers and the bot (D54).
+2. The api waits for the database to be healthy and applies the schema. The solvers wait for the schema (D32). The bot waits for the api.
+3. `scripts/demo` shows the two claims about the workers on that stack: more solvers finish a plan sooner, and a solver that dies loses no route (D57).
+
 ## Crates
 
 The workspace has exactly five crates, as the [approved description](description.md) requires.
@@ -100,7 +106,9 @@ Why: it never overloads a courier and needs no knowledge of the stop order. It i
 
 Distances default to Haversine. The Leaflet library is vendored into the repository. Map tiles are optional: without them the routes still draw. The bot idles when its tokens are missing.
 
-Haversine has been the default since Phase 3. The page and its Leaflet are in the binary of the API, and a test fails if the page names any host but the tile server (D52). The bot is Phase 7.
+Haversine has been the default since Phase 3. The page and its Leaflet are in the binary of the API, and a test fails if the page names any host but the tile server (D52). The bot is Phase 7. Until then a stub that idles has its place in the stack (D56).
+
+Building is not part of this. A build asks the registry for its base images, and the first one fetches every crate. Once the images are there, `docker compose up` without `--build` starts them and asks nobody (D54).
 
 ### D9. The bot has no authority of its own (planned)
 
@@ -377,7 +385,7 @@ Why:
 
 The two sides treat a database that is ahead of them differently, and on purpose. A solver takes it as migrated and works. The API refuses to start: sqlx's migrator does not run against migrations it does not know, and the API, which writes to every table, must not write to a schema it has not seen.
 
-Cost: a database gets its schema only when an API has started against it, and on any other a solver waits for ever. The API has no service in compose before Phase 6, so until then it is run on the host for that. `scripts/sqlx-prepare` applies the migrations as well, since it needs them to describe the queries.
+Cost: a database gets its schema only when an API has started against it, and on any other a solver waits for ever. Since Phase 6 the stack has an `api` service, so `docker compose up` brings one (D54). `scripts/sqlx-prepare` applies the migrations as well, since it needs them to describe the queries.
 
 Tried in containers: two solvers started against a database that had just been created said that they were waiting, and began to look for jobs within a second of the API having applied the schema.
 
@@ -458,9 +466,9 @@ Each route job carries the request id of the plan job. That is how one request c
 
 Why: the queue already bounds the damage of a job that takes its worker down with it. Reporting the reason makes the same outcome quicker and readable. And a database that is away for a minute says nothing about any job, so it must not use up the attempts of the jobs that happened to be running.
 
-### D38. One Dockerfile, a target for each service (in place for the solver)
+### D38. One Dockerfile, a target for each service (in place)
 
-The Dockerfile at the root builds every service, and each service is a target: `docker build --target solver .`. Phase 3 has the `solver` target. A later phase adds its package to the build and a target of its own.
+The Dockerfile at the root builds every service, and each service is a target: `docker build --target solver .`. Phase 3 made the `solver` target, and Phase 6 the targets `api` and `bot`.
 
 - **cargo-chef.** The dependencies are built as a layer of their own, from the manifests and the lock file alone. A change to the workspace's crates then rebuilds in seconds. cargo-chef is pinned, like everything else.
 - **Base images.** The Rust image of the pinned compiler to build, Debian slim to run. `rust-toolchain.toml` is kept out of the build context: the tag of the base image is the pin (D10), and with the file there rustup would also fetch the clippy and rustfmt it names.
@@ -469,7 +477,11 @@ The Dockerfile at the root builds every service, and each service is a target: `
 
 Why one file: the services are binaries of one workspace and share almost all their dependencies. With one builder stage they are compiled once, however many targets are built.
 
-CI builds the image in a job of its own, so a dependency that needs a native library fails there and not on the day of the demo.
+The builder stage builds the three packages with one `cargo build`. Cargo then gives a crate they share the features of all three, so in the image the bot is linked against a domain crate that was compiled with `db` and `openapi`, as it is by `cargo test --workspace` on any machine. What the bot's own manifest asks for is unchanged, and `cargo check -p routeforge-bot` in CI is what holds it to that (D3).
+
+The binaries are 16 MB for the API, which has the page and Swagger UI in it, 6 MB for the solver and 1 MB for the stub of the bot. Each links to the C library, `libm` and `libgcc`, and to nothing else. The rest of an image is Debian: the images are 140, 126 and 119 MB.
+
+CI builds the `solver` target in a job of its own, so a dependency that needs a native library fails there and not on the day of the demo. The builder stage is shared, so that job compiles all three services. The targets `api` and `bot` themselves, and the stack, are built and started by hand: `docker compose build`.
 
 ### D39. The HTTP API: one prefix, plain JSON, one shape of error (in place)
 
@@ -629,7 +641,9 @@ Why:
 
 When it starts, the API connects to the database, applies the migrations (D32), makes the first admin if one is asked for (D40), and only then listens. If the database does not answer, or a setting is wrong, the process ends with the reason.
 
-Why: a solver waits for its database for as long as it takes (D37), because a worker that waits harms nobody. An API that listened without a database would accept connections and answer every one with an error. A process that ends says more, and whatever started it can start it again. In compose that will be `depends_on` with the health of the database, which the `solver` service has already.
+Why: a solver waits for its database for as long as it takes (D37), because a worker that waits harms nobody. An API that listened without a database would accept connections and answer every one with an error. A process that ends says more, and whatever started it can start it again. In compose that is `depends_on` with the health of the database (D54).
+
+Good to know, found in Phase 6: "does not answer" takes five seconds. sqlx tries a connection that is refused again and again until the pool's acquire timeout has passed, and only then does the start fail, with "pool timed out while waiting for an open connection". A database that is a moment late is therefore waited for, and one that is not there costs five seconds.
 
 While it migrates, sqlx holds a lock on the database. Two APIs that start together apply each migration once.
 
@@ -773,3 +787,129 @@ Why:
 - Without a day the list would be every plan there ever was.
 
 There is no index on `plans.service_date`. A table of some hundreds of plans is read whole in no time. Should there ever be many thousands, the index is one migration.
+
+### D54. The stack is one command, and needs no settings (in place)
+
+`docker compose up --build --scale solver=4`, on a clone that has no `.env`, brings up four services:
+
+| Service | Waits for | Health check |
+|---|---|---|
+| `db` | nothing | `pg_isready`, over TCP |
+| `api` | `db` to be healthy | the binary asks its own `/readyz` (D55) |
+| `solver` | `db` to be healthy | none |
+| `bot` | `api` to be healthy | none |
+
+- **Every setting has a value to fall back on.** For most that is the default of the binary. Three have none there, and fall back to values written into `docker-compose.yml`: the key that signs the tokens, and the address and password of the first admin, `admin@example.com` and `routeforge`. Decided by the project owner on 2026-10-11. The binary still has no default for the key (D40).
+- **The ports are open to this machine alone.** The API is published on `127.0.0.1:8080`, as the database is on `127.0.0.1:5432`.
+- **No start order beyond the table.** A solver waits for the database, and for the schema by itself (D32), so the API and the solvers start side by side.
+- **No restart policy.** A service that ends stays ended.
+- **The database's health is asked over TCP**, with `pg_isready -h 127.0.0.1`.
+
+Why:
+
+- The claim is "from a fresh clone". A step before the command, a file to copy or a key to think of, is a step that can be got wrong by whoever is looking at the project for the first time.
+- Values that are in the repository protect nothing, so nothing may depend on them: the ports are on the loopback. Whoever opens them to a network sets their own values in `.env`, and `.env.example` says so beside each.
+- The other way to get a key was to make a random one at each start. Every login would then end with every restart, and the admin's password would still be one that everybody can read.
+- A service that ends has said why (D47), and one that is started again by itself says it over and over. `docker compose up` once more is the restart.
+- Nothing waits for a solver, and which solvers are alive is what the registry says (D27) and the page shows. A check of its own would be a query every few seconds from every instance, to tell Docker what the system knows already.
+
+Why TCP for the database: the postgres image sets a new database up with a server that listens on the socket alone, and only then starts the one that listens on the network. Asked over the socket, `pg_isready` says yes to the first. Measured on the development machine, on a new volume: the socket said yes and the port was closed for 0.14 seconds, and for 0.16 seconds more nothing listened at all.
+
+What that costs is less than it sounds, and was measured too. Ten starts on a new volume went well with the old check, and ten with the new one. An API that is let go inside that window finds the port closed, and sqlx tries again for five seconds (D47), by which time the database is there. It bites when setting the database up takes longer than that after the first yes. With a script that keeps the set-up going for twelve seconds, as a slow disk or a script that loads data would, the old check let the API start, and it ended with "pool timed out while waiting for an open connection", and `docker compose up` with "dependency failed to start". With the new check the same stack was up after twenty seconds. So the check is right now, and no longer depends on a retry that is not ours.
+
+A test in the API holds the compose file to this. It reads the `api` service out of `docker-compose.yml`, takes every `${VARIABLE:-fallback}` for its fallback, and starts the API's settings from what it finds: the key is long enough, the admin is an account the API would make, the API listens on every address of its container, and the port is published to `127.0.0.1` alone. A variable without a fallback fails it.
+
+Good to know:
+
+- **About twenty solvers.** A solver holds up to four connections to the database (D49) and the API eleven (D47), and PostgreSQL gives out a hundred. The demo scripts refuse to start more than twenty (D57).
+- **`--build` needs the network, every time.** A build asks the registry for the Dockerfile frontend its first line names and for its base images, even when every layer is cached, and one that has dependencies to compile asks crates.io as well. Seen twice while the phase was tried: for a moment a name could not be resolved inside Docker, and `up --build` failed, the first time with nothing to build at all. The next attempt went through both times. `docker compose up` without `--build` starts the images that are there.
+- **A build from nothing** took a minute and a half on the development machine: every dependency and the three services, with the base images there already.
+- **On Windows, from PowerShell.** Compose 5 refuses to build when the directory it is started in is spelled with a lower-case drive letter, which is how `cmd` and Git Bash have it in a terminal of VS Code. Nothing in the repository can change that. `docs/plan.md` has the message and three ways out among its traps.
+- **A second clone is the same project.** The compose file names the project `routeforge`, so two copies of the repository on one machine share their containers and their volume. `docker compose -p another-name`, or `COMPOSE_PROJECT_NAME`, keeps them apart, together with other ports in `POSTGRES_PORT` and `API_PORT`.
+- **Timings**, on the development machine: the whole stack with four solvers was up 9 seconds after `docker compose up` on a new volume, most of which is waiting for the database's health check and then for the API's. `docker compose down` took 2.8 seconds.
+
+### D55. The API answers for its own health (in place)
+
+`routeforge-api healthcheck` serves nothing. It asks the API that listens on `API_BIND` for `/readyz`, and ends with success if the answer is `200` and with a reason on standard error if it is anything else. That is the health check of the `api` service: `test: ["CMD", "routeforge-api", "healthcheck"]`, every two seconds.
+
+- It is written with the standard library alone: a `TcpStream`, a request of four lines with `Connection: close`, and the first line of the answer.
+- An address that means every address, as `0.0.0.0:8080` in the container does, is asked on the loopback.
+- Connecting, sending and the answer may take two seconds each. Docker gives a check three, and ends one that takes longer.
+- A health check that was answered with success is logged at `debug`, and every other request at `info` as before (D42).
+
+Why:
+
+- The runtime image holds the binary and the C library (D38). `curl` would be a package and its libraries, OpenSSL among them, for one request. A line of shell that writes to `/dev/tcp` would tie the check to bash being in the image, and could not be tested.
+- `/readyz` and not `/healthz`: what waits for the API to be healthy, the bot and whoever runs `docker compose up --wait`, wants an API that can work. That is one with a database that answers and has the schema.
+- A check every two seconds is 43 200 lines a day that say nothing. A check that fails is worth a line: it says that the stack is not well, and why.
+- Every two seconds for good, and not often while starting and seldom afterwards: that is `start_interval`, which needs Docker Engine 25. One query every two seconds is nothing, and the check then reads the same as the database's.
+
+`/healthz` counts as a health check for the log as well, although nothing in the stack asks it.
+
+Tests: the probe against a stand-in that answers `200`, `503`, `404`, a line that is no HTTP, nothing, and against a port nobody listens on; the probe against the application itself over a socket, refused while the database has no schema and passed once it has; what the log holds after a check that went well, one that did not, and a request that is neither; and the binary itself, run with `healthcheck` against a stand-in, and with an argument it does not know.
+
+The last two run the binary because nothing else comes in through `main`. Before they were there, two faults passed every test: the `healthcheck` argument not looked at, and an unknown argument taken for none. Either way the binary serves where it should ask, and the stack is never healthy.
+
+### D56. The bot holds its place in the stack before it is built (in place)
+
+Decided by the project owner on 2026-10-11.
+
+Phase 6 gives the bot its target in the Dockerfile and its service in compose. The binary is still the stub of Phase 0, changed in one thing: it no longer prints its name and exits. It says that the bot is built in Phase 7, and waits to be told to stop.
+
+Why:
+
+- The description counts the bot among what one `docker compose up` brings, and Phase 6 is where that command is made.
+- The image is where a dependency that needs a native library fails (D12). teloxide, and reqwest with rustls and ring, were compiled in the image for the first time here, and not in the week Phase 7 is due.
+- What the stub does is what the bot does without its tokens (D8). Phase 7 puts a bot where the waiting is.
+
+A service is the first process of its container, and the first process is not ended by a signal it does not listen for. So the stub listens for SIGTERM, as the solver and the API do (D35, D51). The whole stack, seven containers with four solvers, is down 2.8 seconds after `docker compose down`. A stub that slept would have made that ten.
+
+What Phase 6 does not give it: tokens, settings, the logging of the other two services, or a line of teloxide.
+
+### D57. The demonstration is a script (in place)
+
+`scripts/demo.ps1` and `scripts/demo.sh` show the two things the project claims about its workers, on the stack as compose runs it:
+
+- **Scaling.** The same day is planned with one solver and then with four, with the same seed and the same budget of moves, and discarded in between (D30).
+- **Failure.** A plan with a budget of time. Two seconds into its searches a solver that holds a route is killed with `docker kill`. The script waits for another worker to hold that route's job, and for the plan to be done.
+
+How:
+
+- **Through the API alone.** The scripts log in, ask for plans, read them and the stats. Nothing is read from the database behind the API's back.
+- **Where the API is, and who the admin is, they ask the stack:** `docker compose port api 8080`, and the environment of the api container. So a `.env` with other values needs no telling.
+- **What a day needs is made if it is missing:** a depot and four vans, as the page's demo city (D52), and orders. The orders are as many as the couriers carry with a tenth to spare, the page's sum turned round. Then every courier gets a route, and every solver has one to search for.
+- **The day is tomorrow.** The page opens on today, and on its day a script cancels a plan in progress and discards a done one.
+- **The time of a plan is the plan's own:** `finished_at` less `created_at`, both from the database's clock (D6). How often the script looks does not enter into it.
+- **The routes of every scaling run are compared with those of the first:** whose route it is, how long, and which stops in which order. Other routes end the script as a failure, because the same seed and the same moves give the same routes (D5).
+- **The solver to kill is found in the stats.** A worker registers under its host name (D27), which under Docker is the id of its container, as much of it as `docker kill` needs.
+- **After each run the script checks what the system is judged by** (D20): every order the plan took is on exactly one route.
+- **Each plan is asked for with a request id of the script's making,** which it prints. `docker compose logs api solver` has it in the lines of the API and of every solver that worked on the plan (D42).
+
+Measured on the development machine, with 16 logical processors and Docker Desktop on WSL2. A new database, 300 orders, four vans, 200 million moves a route:
+
+| Solvers | Seconds | Speed-up | Routes | Kilometres |
+|---|---|---|---|---|
+| 1 | 15.2 | 1.0 | 4 | 123.60 |
+| 2 | 8.1 | 1.9 | 4 | 123.60 |
+| 4 | 4.5 | 3.4 | 4 | 123.60 |
+| 8 | 4.6 | 3.3 | 4 | 123.60 |
+
+The routes were the same in every run, and a second round gave 15.1, 7.9, 4.5 and 4.4 seconds.
+
+- Four solvers are 3.4 times as fast as one and not four times, because the routes are not equally long: 87, 86, 78 and 49 stops. A plan is done when its longest search is. One solver makes the four searches in turn, and four make them side by side.
+- Eight solvers are no faster than four. The day has four routes.
+- The same run made while the machine was still clearing away other containers took 28.6 seconds with one solver. The numbers want a machine that is doing nothing else.
+
+The failure run, twice, with four solvers and ten seconds a route: the route was taken over 27.8 and 28.3 seconds after the kill, and the plan was done 40.2 and 41.0 seconds after it was asked for, with 300 stops on four routes and every order on exactly one. The solver that took the route over logged the job with `attempt=2`. A lease runs for thirty seconds from the last heartbeat (D33), which came up to five seconds before the kill, and a worker with nothing to do looks at the queue every five. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` set in the shell make it quicker: compose passes them on, and the scripts change no setting themselves.
+
+Why:
+
+- A script and not a test: it needs Docker, takes a minute and a half, and kills a container. What it shows is in the tests already, in small: three workers drain a plan, and a worker that is aborted is replaced when its lease has run out (D34). The script shows it on the real thing, to a person.
+- A budget of moves for the scaling run: with a budget of time every route takes what it is given, so the speed-up would be arithmetic. Moves are work, and the same work gives the same routes, which is what lets the script say that four solvers found what one found.
+- A budget of time for the failure run: how long a search goes on is then known, and two seconds in is the middle of it on any machine.
+- Two scripts, because the project is developed on Windows and runs anywhere. The PowerShell one runs in Windows PowerShell 5.1 and in PowerShell 7. The other is POSIX sh, and needs `curl` and `jq`: reading JSON with `sed` would have been a second program. It was run under dash, on Ubuntu, with jq 1.8.1, and printed what the PowerShell one prints.
+
+Two things the scripts guard against, both met while they were written:
+
+- **How many solvers.** From inside PowerShell, `-Solvers 1,2,4,8` is a list. Started any other way, as `pwsh -File scripts/demo.ps1 -Solvers 1,2,4,8`, the script is handed one text, and PowerShell reads that text as the number 1248. Compose was asked for 1248 solvers, and had created every one of those containers and started some four hundred before it was stopped. The counts are now taken as text and read by the script, and anything but 1 to 20 is refused before compose is asked (D54).
+- **No `--build`.** The scripts start the stack with `docker compose up`, which builds an image that is missing and leaves one that is there. With `--build` they would need the registry every time (D54), and the demo is to work without a network (D8).

@@ -25,6 +25,10 @@
 //! | `LOG_FORMAT` | `text` | `json` for one JSON object per line. |
 //! | `RUST_LOG` | `info` | What to log, in the syntax of `tracing`'s `EnvFilter`. |
 //!
+//! Started with no argument, it serves. `routeforge-api healthcheck` serves nothing:
+//! it asks the API that listens on `API_BIND` whether it is ready, and ends with
+//! success if it is. That is the health check of the image (D55).
+//!
 //! The decisions cited as D1, D2, … are in `docs/architecture.md`.
 
 mod app;
@@ -33,6 +37,7 @@ mod config;
 mod error;
 mod events;
 mod page;
+mod probe;
 mod request_id;
 mod routes;
 mod startup;
@@ -44,7 +49,7 @@ mod validate;
 use std::io::IsTerminal;
 
 use actix_web::{HttpServer, web};
-use anyhow::Context;
+use anyhow::{Context, bail};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -58,8 +63,23 @@ use crate::stream::Pace;
 /// `docker stop` waits ten seconds before it kills, and this has to be inside that.
 const STOP_WITHIN_SECS: u64 = 8;
 
+fn main() -> anyhow::Result<()> {
+    let argument = std::env::args_os()
+        .nth(1)
+        .map(|argument| argument.to_string_lossy().into_owned());
+    match argument.as_deref() {
+        None => serve(),
+        // Where the API listens is read from the variable the API reads it from.
+        Some("healthcheck") => probe::probe(Config::from_env()?.bind),
+        Some(other) => bail!(
+            "`{other}` is nothing the API does: it serves when it is given no argument, \
+             and asks a running API whether it is ready when it is given `healthcheck`"
+        ),
+    }
+}
+
 #[actix_web::main]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     init_logging();
     let config = Config::from_env()?;
     let secrets = Secrets::from_env()?;
