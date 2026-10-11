@@ -55,11 +55,14 @@ const MATRIX: &[(&str, &str, Needs)] = &[
     ("get", "/api/users/{id}", Needs::Admin),
     ("put", "/api/users/{id}/role", Needs::Admin),
     ("post", "/api/plans", Needs::Staff),
+    ("get", "/api/plans", Needs::Staff),
     ("get", "/api/plans/{id}", Needs::Staff),
     ("get", "/api/plans/{id}/routes", Needs::Staff),
+    ("get", "/api/plans/{id}/events", Needs::Staff),
     ("post", "/api/plans/{id}/cancel", Needs::Staff),
     ("post", "/api/plans/{id}/discard", Needs::Staff),
     ("get", "/api/system/stats", Needs::Staff),
+    ("get", "/api/system/stats/events", Needs::Staff),
     ("post", "/api/demo/orders", Needs::Admin),
 ];
 
@@ -476,9 +479,34 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
         "Problem",
         "FieldError",
         "LatLon",
+        // What the events of a stream carry. No response has them as its body, so
+        // they are in the document only because they are named for it.
+        "RouteJob",
+        "RouteProgress",
+        "JobProgress",
+        "JobStatus",
     ] {
         assert!(schemas.get(named).is_some(), "no schema for {named}");
     }
+    // A stream says that it is one, and what a caller who is kept out is answered.
+    for path in ["/api/plans/{id}/events", "/api/system/stats/events"] {
+        let responses = &document["paths"][path]["get"]["responses"];
+        let stream = &responses["200"]["content"]["text/event-stream"];
+        assert_eq!(stream["schema"]["type"], "string", "{path}");
+        let refused = &responses["401"]["content"]["application/problem+json"];
+        assert!(refused.is_object(), "{path}");
+    }
+    // The day whose plans are listed has to be said.
+    assert_eq!(
+        document["paths"]["/api/plans"]["get"]["parameters"],
+        json!([{
+            "name": "service_date",
+            "in": "query",
+            "description": "The day the plans are for.",
+            "required": true,
+            "schema": { "type": "string", "format": "date" },
+        }])
+    );
     // The enumerations say their values, the new status among them.
     let statuses = schemas["PlanStatus"]["enum"].as_array().unwrap();
     assert!(statuses.contains(&json!("discarded")), "{statuses:?}");

@@ -14,6 +14,7 @@ actix-web.workspace = true
 anyhow.workspace = true
 argon2.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 jsonwebtoken.workspace = true
 # For the demo orders, from a generator seeded by the request.
 rand.workspace = true

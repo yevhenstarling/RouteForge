@@ -24,6 +24,12 @@ How a plan is made:
 
 A plan that is cancelled, or that loses a job for good, undoes itself: its routes are deleted and its orders are pending again (D20). A plan that is done can be discarded, which undoes it the same way, so that its date can be planned again (D30).
 
+How a plan is watched:
+
+1. Every change to a plan or to one of its jobs is announced in the database, by the function of the queue that makes it and in the transaction that makes it (D48). A solver that is searching for a route also announces, four times a second, how far it has got and which route is the best so far (D49).
+2. One connection of the api listens. What it hears reaches every open event stream, and a stream that hears of its plan reads the plan again and sends what has changed (D50).
+3. The page, which the api serves at `/`, reads the stream and draws: a dashed line for a route that is still searched for, a solid one when it is stored (D52).
+
 ## Crates
 
 The workspace has exactly five crates, as the [approved description](description.md) requires.
@@ -90,9 +96,11 @@ A route is feasible when the sum of its demands, pickups and deliveries together
 
 Why: it never overloads a courier and needs no knowledge of the stop order. It is stricter than necessary, because a courier who delivers before picking up could carry more in total. Tracking the real load along the route is planned for Phase 8.
 
-### D8. The demo works without the internet (planned)
+### D8. The demo works without the internet (in place, but for the bot)
 
 Distances default to Haversine. The Leaflet library is vendored into the repository. Map tiles are optional: without them the routes still draw. The bot idles when its tokens are missing.
+
+Haversine has been the default since Phase 3. The page and its Leaflet are in the binary of the API, and a test fails if the page names any host but the tile server (D52). The bot is Phase 7.
 
 ### D9. The bot has no authority of its own (planned)
 
@@ -148,6 +156,8 @@ Why:
 - Because construction always completes, there is a valid tour to return even when the search is cancelled before its first move.
 
 A `Control` cannot be built without a budget or a deadline. Annealing has no end of its own (D18), so a control without a limit would be a search that never returns.
+
+Since Phase 5 the callback is handed the best tour so far beside the two numbers, and the search reports once more as it returns (D49).
 
 Good to know when choosing a budget: it counts local search moves too, and Or-opt has many. Starting from a nearest-neighbour tour, local search alone takes 30 to 45 thousand iterations at 50 stops, more than a million at 250 and about 25 million at 1000. Annealing gets what is left.
 
@@ -275,6 +285,8 @@ Why: D6 asks for the results to be written in the transaction that marks the job
 A job that becomes due because its retry time has come, or because a lease has expired, announces nothing. That, and a listener that was reconnecting at the wrong moment, is why a worker polls as well.
 
 Why the kind as payload: PostgreSQL folds equal notifications of one transaction into one. A plan that fans out into twenty route jobs wakes every worker once, not twenty times. Once is enough, because a worker that is awake claims again after each job.
+
+This channel is for the workers alone. Whoever shows a plan to a person is told on two channels of their own (D48).
 
 ### D27. The worker registry is not part of the queue (in place)
 
@@ -404,6 +416,8 @@ Why:
 
 The search writes its progress to a `watch` channel every 16 384 moves (D15), and the heartbeat stores what it finds there. So `jobs.progress` is as fresh as the last heartbeat.
 
+Since Phase 5 a third thing is polled beside the search, and for the same reason: the announcer, which tells whoever watches the plan how far the search has got (D49). The event streams of the API follow the rule too: a stream is a value its response owns, with no task behind it (D50).
+
 Tests: a search that is dropped stops, and so does one whose owning task is aborted; a route that takes two and a half times its lease is not taken over while an idle worker looks for work; a cancel frees three workers that each had two minutes of search ahead of them; a job that another worker has claimed is given up.
 
 ### D35. A worker that is told to stop drops its job and gives it back (in place)
@@ -459,7 +473,9 @@ CI builds the image in a job of its own, so a dependency that needs a native lib
 
 ### D39. The HTTP API: one prefix, plain JSON, one shape of error (in place)
 
-Everything the API serves as data is under `/api`. Beside it are `/healthz` and `/readyz`, the OpenAPI document at `/api/openapi.json` and Swagger UI at `/docs/`. The root is left for the page of Phase 5.
+Everything the API serves as data is under `/api`. Beside it are `/healthz` and `/readyz`, the OpenAPI document at `/api/openapi.json` and Swagger UI at `/docs/`. The page is at the root, and what it loads under `/vendor/` (D52).
+
+Two endpoints answer with `text/event-stream` and go on answering: `/api/plans/{id}/events` and `/api/system/stats/events` (D50). A caller they refuse is answered as by any other endpoint, with a problem.
 
 - A thing is read with `GET`, made with `POST`, which answers `201`, replaced with `PUT` and changed in part with `PATCH`. What changes the state of a thing and is no edit of it is a `POST` to a path of its own: `/api/orders/{id}/cancel`, `/api/plans/{id}/cancel`, `/api/plans/{id}/discard`.
 - An id is a UUID in the path.
@@ -513,13 +529,13 @@ A debug build takes about a third of a second over a hash. The tests use the sma
 
 | | Client | Operator | Admin |
 |---|---|---|---|
-| Open an account, log in, health, the document | without a token | | |
+| Open an account, log in, health, the document, the page | without a token | | |
 | Orders: place, list, read, withdraw | their own | all | all |
 | The depot: read | yes | yes | yes |
 | The depot: set | no | no | yes |
 | Couriers | no | yes | yes |
-| Plans, their routes, cancel, discard | no | yes | yes |
-| The stats | no | yes | yes |
+| Plans: ask, list, read, watch, their routes, cancel, discard | no | yes | yes |
+| The stats, read and watched | no | yes | yes |
 | Users, roles, demo orders | no | no | yes |
 
 A handler says who may call it by the type of its first argument: `AuthUser` for anybody with a token, `Staff` for an operator or an admin, `Admin`. actix-web takes the arguments of a handler in their order, so with this one first the gate is checked before the body is read.
@@ -617,4 +633,143 @@ Why: a solver waits for its database for as long as it takes (D37), because a wo
 
 While it migrates, sqlx holds a lock on the database. Two APIs that start together apply each migration once.
 
-The pool has ten connections. A request that gets none within five seconds is answered `500`.
+The pool has ten connections for requests, and one more that only listens (D50). A request that gets none within five seconds is answered `500`.
+
+How the API stops is D51.
+
+### D48. A change to a plan is announced where it is made (in place)
+
+Beside `routeforge_jobs`, which wakes the workers (D26), the queue notifies two channels for whoever shows a plan to a person:
+
+- **`routeforge_plans`** says that a plan has changed, or one of its jobs has. Its payload is the plan's id. Every function of `db::queue` that changes either notifies it: `enqueue`, `claim`, the commit of a completion, `fail`, `release`, and what ends a plan or discards it. It does so in the statement of the change, or in its transaction.
+- **`routeforge_progress`** says how far the search for a route has got (D49). Its payload is a `RouteProgress` as JSON, sent by `queue::announce_progress` and stored nowhere.
+
+What has changed is not said. Whoever hears of a plan reads it again.
+
+Why:
+
+- A notification is delivered when its transaction commits. Sent with the change, it is heard when the change can be read, and never for one that was rolled back.
+- With nothing but the id in it, the notifications of one transaction are equal, and PostgreSQL folds equal ones into one. A `plan` job that completes enqueues a route job for each courier, moves its plan on and ends itself, and all of that is one notification. The id is turned into text by PostgreSQL in every statement that notifies, so the payloads are equal to the letter.
+- A hint cannot be out of step. The read gives the plan as it is, however many hints came or were lost, and nothing has to fit into a payload, which PostgreSQL limits to 7999 bytes.
+- The workers keep a channel to themselves because every worker wakes for what is said on it. On theirs, each claim and each stored route would send all of them to look at a queue they have just looked at.
+- Every change goes through one module, so there is one place to keep right. `plans::start_routing` and `plans::route_finished` announce nothing themselves: they change a plan only inside a completion, and its commit announces it.
+
+A claim is still one statement (D22). Its update moved into a CTE so that the statement can notify as well.
+
+Tests: a watcher hears of every change once, at the commit and not before, and nothing of a rollback or a heartbeat; twenty route jobs, their plan and its job are one notification; a plan that fails, a job buried by an idle worker and a discard are heard; and none of it reaches the workers' channel.
+
+### D49. A search hands out its best route, and its worker announces it (in place)
+
+Decided with the project owner on 2026-10-11: a route is to be seen improving on the map while it is searched for, and not only by a number.
+
+- **In `routeforge-tsp`** the progress callback of a `Control` is handed the best tour beside the two numbers. It looks on and nothing more, so D5 holds: a search takes the same course with a callback as without one. A search reports once more as it returns, so its last report is of the tour it returns.
+- **In the solver** a report carries the route as the positions of its stops in the job's list of orders. The list is made anew only when the route got shorter, which is the only way the best route changes. A test in `routeforge-tsp` holds the search to that.
+- **Announcing.** Beside the search and the heartbeat a third future is polled, the announcer (D34). Whenever the search has said something new, and at most every `SOLVER_PROGRESS_MS`, 250 by default, it sends the latest report through `queue::announce_progress`.
+- **The announcement** names the plan, the job and the attempt, and carries the moves, the best length and the route. The route is left out when the payload would reach the 8000 bytes at which PostgreSQL refuses a notification, which is beyond some 1780 stops. The numbers are sent all the same.
+
+Why:
+
+- The search is where the route is. Without the tour in the callback a route could only be shown once it was stored, and the map would stand still for the whole of the budget.
+- Positions and not the ids of the orders: a position is a number of up to four digits where an id is 36 characters. A route of 300 stops is 1.1 kB as positions, and as ids it would not fit.
+- Nothing stores what is announced. The next announcement replaces it a quarter of a second later, and writing it to the job would be a new version of the row four times a second for every route. What a job has stored is what its heartbeat says, as before (D34). A page that is opened in the middle of a search shows that until the next announcement comes.
+- The attempt is in it because an announcement is not fenced (D6). A worker that has lost its job goes on announcing until its next heartbeat tells it so, and a watcher that knows the attempt of the job can tell the two apart.
+- An announcement that does not get through is logged at `debug` and forgotten. Nobody waits for it, and the next one says more.
+
+A worker can now make three calls at one moment: its heartbeat, an announcement, and marking itself as seen. So a solver process takes one connection that listens and three for each worker.
+
+What the callback costs: nothing that can be measured. The benchmarks of the old code and the new were run back to back, twice. 2-opt at 50 stops took 11.97 and 12.25 µs before and 12.15 and 12.18 after. Annealing 100 000 moves at 200 stops took 1.98 and 2.00 ms before and 2.01 and 1.99 after.
+
+What there is to see, measured with four solvers in containers on the development machine:
+
+- Routes of about a hundred stops, as 300 demo orders give, are at the length they end with by the second announcement, a quarter of a second in. From the first tour to a local optimum takes the search a few milliseconds, and annealing then finds little or nothing. The line appears, jumps once, and stands.
+- Routes of about 350 stops, from 1200 orders, went from some 85 km to some 68 km in that first quarter of a second, and then lost between half a percent and two and a half percent more over ten seconds, a few edges at a time.
+
+So for a line that is seen to move, a day has to give its routes several hundred stops.
+
+### D50. One connection listens, and the event streams read (in place)
+
+The API has one connection that listens on the two channels of D48. What it hears goes into a `tokio::sync::broadcast` channel, and every open stream holds a receiver of it. Two endpoints stream, as `text/event-stream`:
+
+| Endpoint | Events |
+|---|---|
+| `GET /api/plans/{id}/events` | `plan`: the plan. `jobs`: its route jobs, each a `RouteJob`. `progress`: a `RouteProgress`. |
+| `GET /api/system/stats/events` | `stats`: what `GET /api/system/stats` gives. |
+
+A stream opens with everything it shows. After that:
+
+- It reads again when it is given a reason: a notification for its plan, or for any plan in the case of the stats. It sends what differs from what it last sent, and nothing if nothing does.
+- It reads at most every 200 ms, so a burst of changes is one read.
+- It reads without a reason too, every ten seconds for a plan and every two for the stats, as a worker polls (D33). A notification can be lost, and a worker comes and falls silent without one (D27).
+- When the listener has had to reconnect, and when a stream has fallen more than 1024 signals behind, the stream is told that it may have missed something, and reads.
+- Progress is passed on as it comes, with no read.
+- A comment line every 15 seconds keeps a quiet stream from being taken for a dead one.
+
+A stream ends when its reader has gone, when the token it was opened with expires, when the API is told to stop (D51), and when a read fails.
+
+Why:
+
+- One connection for all streams: what is announced means the same to every stream, and a connection for each would let a dozen open pages take the whole pool.
+- The stream reads, and the notification only says when. So a stream can be opened at any moment and shows the plan as it is, a lost notification costs ten seconds at the worst, and nothing has to be replayed. A page whose stream broke opens it again and is up to date.
+- A token is checked when a request arrives (D40), and a stream answers for as long as it is read. Ended with its token, a stream gives nobody more than the token did. A token is accepted through the second it expires in, so the stream ends as the next second begins: whoever opens it again is answered `401`, and the page shows the login.
+- No task stands behind a stream. It is a value that the response owns, made with `futures_util::stream::unfold` and polled when the server wants the next piece. When the response is dropped, because the reader has gone or the server stops, the stream and its receiver go with it. This is the rule of D34 kept in the API: nothing has to be stopped, so nothing can be left running. It also bounds what a slow reader costs. A stream that is not read is not polled, takes nothing from the channel, falls behind, and reads again when it is read.
+- The first read is made before the response starts. So a plan that does not exist is a `404` with a problem for a body, and not a stream that breaks off.
+- Server-sent events are written by hand: an event is two lines of text. `actix-web-lab` has a type for them and would bring a crate of experiments with it. `futures-util`, for `unfold`, is the one direct dependency this adds, and actix-web has it in the build anyway.
+- The page reads a stream with `fetch`. `EventSource` cannot send an `Authorization` header, and a token in the query string would end up in logs.
+
+Good to know:
+
+- The line that says a request was handled is logged when its response starts (D42). A stream logs a second line when it ends, in the span of its request, with the reason and how long it was open.
+- The schemas of `RouteJob` and `RouteProgress` are named for the document by hand. No response has them as its body, so utoipa would not find them (D43).
+- The stats hold when each worker was last seen, which changes with every heartbeat of a worker. So with a solver running, the stats stream sends about every two seconds.
+- A stream reads its plan and then the plan's jobs, one after the other and not in one snapshot. A job can finish between the two, so for a moment a stream may show a job as done that its plan has not counted yet. The next read, a fifth of a second later, puts that right.
+
+Tests: the hub passes on what the database announces, passes over what it cannot read, and says that it may have missed something after its connection was ended under it; a plan's stream opens with the plan and its jobs and follows a stand-in for the solver from queued to done to discarded; it passes on the searches of its own plan and of no other; it reads again when it may have missed something and when it fell behind, and now and then without being told; it sends nothing twice; it ends with its token, to the second, and when the hub is closed; and the stats stream does the same for the queue.
+
+### D51. The API stops at once with streams open (in place)
+
+Told to stop, actix-web lets the requests it has finish first, and an event stream never finishes. So the API listens for Ctrl-C and SIGTERM itself, as the solver does, and hands the server that as its `shutdown_signal`. Before the server hears of it the hub is closed, which ends every stream. The requests in hand then get eight seconds.
+
+Why: `docker stop` sends SIGTERM and kills after ten seconds. Without this the API would be killed every time a page was open, in the middle of whatever else it was doing.
+
+It also makes Ctrl-C a graceful stop. Left to itself, actix-server stops at once on an interrupt and gracefully only on SIGTERM.
+
+Tried on the development machine with a page open and both its streams running: the API had stopped a third of a second after Ctrl-C. Its log said that it was told to stop, that each stream ended because the API was stopping, and that it had stopped.
+
+Tried the other way as well, in a build that left the hub open: the API took 8.4 seconds to stop, which is all the time it gives the requests in hand.
+
+Not looked into: in those eight seconds the stream that was still open could not read. After five seconds the pool refused it a connection. By then the workers with nothing to do had stopped, and the connections of the pool had been opened on their threads, which may be why. If it is, a request that is still running when the API is told to stop can fail for want of a connection. With the streams ended first nothing is left running that long, but a slow request could be.
+
+### D52. The page is one file, inside the binary (in place)
+
+`web/index.html` is the whole page: its style, its script, and no build step. It loads Leaflet from `web/vendor/leaflet`. Both are compiled into the API with `include_bytes!`, through a table in `page.rs`, and served at `/` and under `/vendor/`.
+
+- **Inside the binary**, as Swagger UI is (D43). The API is one file wherever it runs, the image of Phase 6 needs nothing copied beside it, and what is served is what was built. The price is a rebuild to see a change to the page. The files are sent with `Cache-Control: no-cache`.
+- **The table** is written out, a row for each file. A test walks `web/` and fails for a file that is not in it.
+- **Leaflet 1.9.4**, the release npm tags `latest`; 2.0 is an alpha. It was taken from the registry's tarball, which was checked against the integrity the registry gives for it, and the SHA-256 of every file is in the commit that added them. `.gitattributes` keeps `web/vendor` byte for byte: `leaflet.css` and `LICENSE` come with CRLF line ends, which git would otherwise turn into LF.
+- **Nothing from another host but map tiles** (D8). A test reads the page and fails if it names any other address. The tiles are OpenStreetMap's and a switch turns them off. Without them the map is paper with a grid, and everything else is drawn on it.
+- **The login** is kept in `sessionStorage`, so it survives a reload and ends with the tab. Any `401` clears it and shows the login.
+- **Text from the API goes into the page as text**, never as HTML. An address or the name of a courier is typed by somebody.
+- **On the map** the stops are dots on a canvas and the routes are lines in SVG above it. Leaflet draws a canvas in the order things were added to it. On one canvas a route would be hidden under dots that were drawn again after it, as they are when a plan takes its orders.
+- **A client** who logs in sees the depot and their own orders, and no planning. That is what the API lets a client read (D41).
+
+What the page can do beyond the list in the plan was decided by the project owner on 2026-10-11:
+
+- **Discard** a plan that is done, beside Cancel.
+- **Budget and seed** for a plan: seconds or millions of moves for each route, and a seed. Left empty, the API gives its own (D45).
+- **Set up a demo city**, for an admin, on a database with no depot or no courier: a depot in Kyiv and four vans, through the endpoints an admin would use by hand. The vans are sized for the number of orders in the field beside the button. A demo order has a demand of 1 to 3 (D46), so a day asks for twice its number, and each van takes a quarter of that and a tenth more. So the day that is generated next gives every van a route, whether it has 300 orders or 2000.
+
+What the page does not do: it draws every route from the depot as it is now, so a plan made for an earlier depot (D21) would be drawn from the wrong place; and it learns of an order that somebody else placed only when Refresh is pressed, since nothing announces an order.
+
+The page has no tests of its own. The API's tests check that it is served and what it loads. What it does was tried in a browser: `docs/plan.md` says how.
+
+### D53. The plans of a day are listed whole (in place)
+
+`GET /api/plans?service_date=` gives the plans of one day, newest first. The day has to be said.
+
+Why:
+
+- The page has to find the plan of the day it shows. Whoever asked for a plan has its id from the answer, and nobody else has it.
+- A day has one plan in progress at most, and beside it the ones that were done, discarded, cancelled or failed before. That is a handful, so the list is not paged (D44).
+- Without a day the list would be every plan there ever was.
+
+There is no index on `plans.service_date`. A table of some hundreds of plans is read whole in no time. Should there ever be many thousands, the index is one migration.

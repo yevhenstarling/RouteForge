@@ -29,7 +29,7 @@ pub fn two_opt(matrix: &DistanceMatrix, tour: &mut Tour, control: &mut Control<'
     loop {
         let mut improved_in_this_pass = false;
         for first in 1..nodes - 1 {
-            if !control.spend((nodes - 1 - first) as u64, tour.cost) {
+            if !control.spend((nodes - 1 - first) as u64, tour) {
                 return improved || improved_in_this_pass;
             }
             for last in first + 1..nodes {
@@ -73,7 +73,7 @@ pub fn or_opt(matrix: &DistanceMatrix, tour: &mut Tour, control: &mut Control<'_
                 let anchors = (0..start - 1).chain(start + len..nodes);
                 // Turning a single stop round changes nothing.
                 let ways_round = if len == 1 { 1 } else { 2 };
-                if !control.spend((ways_round * (nodes - len - 1)) as u64, tour.cost) {
+                if !control.spend((ways_round * (nodes - len - 1)) as u64, tour) {
                     return improved || improved_in_this_pass;
                 }
                 let shifts = anchors.flat_map(|anchor| {

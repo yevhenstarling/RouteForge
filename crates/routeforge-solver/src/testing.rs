@@ -49,6 +49,7 @@ pub(crate) fn config() -> Config {
         lease: Duration::from_secs(2),
         heartbeat: Duration::from_millis(100),
         poll: Duration::from_millis(100),
+        progress: Duration::from_millis(50),
     }
 }
 

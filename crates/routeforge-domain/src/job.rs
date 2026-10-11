@@ -68,11 +68,35 @@ impl JobPayload {
 
 /// How far a running job has got, as its worker last reported with a heartbeat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobProgress {
     /// Candidate moves evaluated so far.
     pub iterations: u64,
     /// The length of the best route so far, in metres.
     pub best_cost_m: u64,
+}
+
+/// How far the search for one route has got, as its worker announces it a few times a
+/// second while it searches (D48, D49).
+///
+/// Nothing stores it. The next one replaces it, and one that is lost is not missed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RouteProgress {
+    pub plan_id: PlanId,
+    pub job_id: JobId,
+    /// Which claim of the job this comes from (D22). A worker that has lost the job may
+    /// go on announcing until its next heartbeat tells it so. What it says then has a
+    /// lower number than the job has.
+    pub attempt: u32,
+    /// Candidate moves evaluated so far.
+    pub iterations: u64,
+    /// The length of the best route so far, in metres.
+    pub best_cost_m: u64,
+    /// The best route so far: its stops in calling order, each as its position in the
+    /// `order_ids` of the job. Left out when it would not fit a notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<u32>>,
 }
 
 /// A job as the queue stores it.
@@ -101,6 +125,49 @@ pub struct Job {
     pub created_at: DateTime<Utc>,
     /// When the job was done, failed or cancelled.
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// A route job as someone watching its plan sees it: whose route it is, which stops it
+/// has to put in order, and how the search for that order stands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RouteJob {
+    pub job_id: JobId,
+    pub courier_id: CourierId,
+    /// The courier's orders, as clustering left them. The `order` of a `RouteProgress`
+    /// counts into this list.
+    pub order_ids: Vec<OrderId>,
+    pub status: JobStatus,
+    /// How many times the job has been claimed.
+    pub attempt: u32,
+    /// The worker of the latest claim.
+    pub worker_id: Option<WorkerId>,
+    /// How far the search has got, as the last heartbeat stored it. That is a few
+    /// seconds old at most, and what is announced in between is fresher.
+    pub progress: Option<JobProgress>,
+}
+
+impl RouteJob {
+    /// What a watcher sees of `job`. `None` if it is the `plan` job, which has no route.
+    pub fn of(job: Job) -> Option<Self> {
+        let JobPayload::Route {
+            courier_id,
+            order_ids,
+            ..
+        } = job.payload
+        else {
+            return None;
+        };
+        Some(Self {
+            job_id: job.id,
+            courier_id,
+            order_ids,
+            status: job.status,
+            attempt: job.attempt,
+            worker_id: job.claimed_by,
+            progress: job.progress,
+        })
+    }
 }
 
 /// How many jobs stand in each status.
@@ -195,5 +262,117 @@ mod tests {
     fn a_payload_of_an_unknown_kind_is_refused() {
         let json = json!({ "kind": "teleport", "plan_id": PlanId::generate() });
         assert!(serde_json::from_value::<JobPayload>(json).is_err());
+    }
+
+    fn job(payload: JobPayload) -> Job {
+        Job {
+            id: JobId::generate(),
+            plan_id: payload.plan_id(),
+            payload,
+            status: JobStatus::Running,
+            attempt: 2,
+            max_attempts: 3,
+            run_at: Utc::now(),
+            claimed_by: Some(WorkerId::generate()),
+            lease_expires_at: Some(Utc::now()),
+            progress: Some(JobProgress {
+                iterations: 16_384,
+                best_cost_m: 4_200,
+            }),
+            error: Some("the first attempt ran out of memory".to_owned()),
+            request_id: Some("req-1".to_owned()),
+            created_at: Utc::now(),
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn a_watcher_sees_a_route_job_as_whose_route_it_is_and_how_it_stands() {
+        let plan_id = PlanId::generate();
+        let courier_id = CourierId::generate();
+        let order_ids = vec![OrderId::generate(), OrderId::generate()];
+        let route = job(JobPayload::Route {
+            plan_id,
+            courier_id,
+            order_ids: order_ids.clone(),
+            seed: 7,
+        });
+
+        let seen = RouteJob::of(route.clone()).unwrap();
+        assert_eq!(
+            seen,
+            RouteJob {
+                job_id: route.id,
+                courier_id,
+                order_ids,
+                status: JobStatus::Running,
+                attempt: 2,
+                worker_id: route.claimed_by,
+                progress: route.progress,
+            }
+        );
+        // The seed, the lease and the errors of earlier attempts are the queue's business.
+        let json = serde_json::to_value(&seen).unwrap();
+        let mut fields: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "attempt",
+                "courier_id",
+                "job_id",
+                "order_ids",
+                "progress",
+                "status",
+                "worker_id"
+            ]
+        );
+
+        // The `plan` job has no route to show.
+        assert_eq!(RouteJob::of(job(JobPayload::Plan { plan_id })), None);
+    }
+
+    #[test]
+    fn progress_names_its_route_only_when_it_has_one_to_name() {
+        let (plan_id, job_id) = (PlanId::generate(), JobId::generate());
+        let numbers = RouteProgress {
+            plan_id,
+            job_id,
+            attempt: 2,
+            iterations: 32_768,
+            best_cost_m: 4_200,
+            order: None,
+        };
+        let json = serde_json::to_value(&numbers).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "plan_id": plan_id,
+                "job_id": job_id,
+                "attempt": 2,
+                "iterations": 32_768,
+                "best_cost_m": 4_200,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RouteProgress>(json).unwrap(),
+            numbers
+        );
+
+        let with_route = RouteProgress {
+            order: Some(vec![2, 0, 1]),
+            ..numbers
+        };
+        let json = serde_json::to_value(&with_route).unwrap();
+        assert_eq!(json["order"], json!([2, 0, 1]));
+        assert_eq!(
+            serde_json::from_value::<RouteProgress>(json).unwrap(),
+            with_route
+        );
     }
 }

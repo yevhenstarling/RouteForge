@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::{DbError, on_violation, parsed, queue, unsigned};
 use crate::ids::PlanId;
 use crate::job::JobPayload;
-use crate::model::{NewPlan, Plan, PlanCounts, PlanStatus, RouteBudget};
+use crate::model::{NewPlan, Plan, PlanCounts, PlanFilter, PlanStatus, RouteBudget};
 
 struct PlanRow {
     id: Uuid,
@@ -151,6 +151,31 @@ pub async fn get(executor: impl PgExecutor<'_>, id: PlanId) -> Result<Option<Pla
     .await?
     .map(Plan::try_from)
     .transpose()
+}
+
+/// The plans of a service date, newest first.
+///
+/// At most one of them is in progress. The others are those the date had before:
+/// done, discarded, failed or cancelled.
+pub async fn list(
+    executor: impl PgExecutor<'_>,
+    filter: &PlanFilter,
+) -> Result<Vec<Plan>, DbError> {
+    sqlx::query_as!(
+        PlanRow,
+        "SELECT id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,
+                created_by, orders_total, orders_unassigned, routes_total, routes_done, error,
+                created_at, finished_at
+         FROM plans
+         WHERE service_date = $1
+         ORDER BY id DESC",
+        filter.service_date,
+    )
+    .fetch_all(executor)
+    .await?
+    .into_iter()
+    .map(Plan::try_from)
+    .collect()
 }
 
 /// Records what clustering found and moves a queued plan on.
@@ -365,6 +390,42 @@ mod tests {
             Some(PlanStatus::Done)
         );
         submit(&pool, &new, None).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn the_plans_of_a_date_are_listed_newest_first(pool: PgPool) {
+        let new = testing::new_plan(&pool, date(12)).await;
+        let on = async |day: u32| {
+            let filter = PlanFilter {
+                service_date: date(day),
+            };
+            list(&pool, &filter).await.unwrap()
+        };
+        assert!(on(12).await.is_empty());
+
+        // A date has one plan in progress, so the first has to be over for a second.
+        let first = create(&pool, &new).await.unwrap();
+        assert!(queue::cancel_plan(&pool, first.id).await.unwrap());
+        let second = create(&pool, &new).await.unwrap();
+        let other_day = NewPlan {
+            service_date: date(13),
+            ..new
+        };
+        let elsewhere = create(&pool, &other_day).await.unwrap();
+
+        let listed = on(12).await;
+        let ids: Vec<PlanId> = listed.iter().map(|plan| plan.id).collect();
+        assert_eq!(ids, [second.id, first.id]);
+        // Each is the plan as it is read by its id.
+        assert_eq!(listed[0], second);
+        assert_eq!(listed[1].status, PlanStatus::Cancelled);
+        assert_eq!(
+            Some(&listed[1]),
+            get(&pool, first.id).await.unwrap().as_ref()
+        );
+
+        assert_eq!(on(13).await, [elsewhere]);
+        assert!(on(14).await.is_empty());
     }
 
     #[sqlx::test]

@@ -67,10 +67,10 @@ pub use tour::Tour;
 /// using up its budget or waiting for its deadline.
 pub fn optimize_route(matrix: &DistanceMatrix, seed: u64, control: &mut Control<'_>) -> Tour {
     let mut tour = nearest_neighbour(matrix);
-    control.report(tour.cost);
+    control.report(&tour);
     local_search(matrix, &mut tour, control);
     anneal(matrix, &mut tour, seed, control);
-    control.report(tour.cost);
+    control.report(&tour);
     tour
 }
 
@@ -124,8 +124,8 @@ mod tests {
         ) {
             let run = || {
                 let mut reports = Vec::new();
-                let mut control =
-                    Control::max_iterations(budget).with_progress(|progress| reports.push(progress));
+                let mut control = Control::max_iterations(budget)
+                    .with_progress(|progress, best| reports.push((progress, best.clone())));
                 let tour = optimize_route(&matrix, seed, &mut control);
                 let iterations = control.iterations();
                 drop(control);
@@ -191,24 +191,63 @@ mod tests {
     fn progress_tells_the_story_of_the_search() {
         let matrix = scattered(40, 5);
         let mut reports = Vec::new();
-        let mut control =
-            Control::max_iterations(300_000).with_progress(|progress| reports.push(progress));
+        let mut control = Control::max_iterations(300_000)
+            .with_progress(|progress, best| reports.push((progress, best.clone())));
         let tour = optimize_route(&matrix, 5, &mut control);
         drop(control);
 
         assert!(reports.len() > 10);
-        assert!(reports.is_sorted_by_key(|report| report.iterations));
+        assert!(reports.is_sorted_by_key(|(progress, _)| progress.iterations));
         assert!(
             reports
                 .windows(2)
-                .all(|pair| pair[1].best_cost <= pair[0].best_cost)
+                .all(|pair| pair[1].0.best_cost <= pair[0].0.best_cost)
         );
-        assert_eq!(
-            reports.first().unwrap().best_cost,
-            nearest_neighbour(&matrix).cost()
-        );
-        assert_eq!(reports.last().unwrap().best_cost, tour.cost());
         assert!(tour.cost() < nearest_neighbour(&matrix).cost());
+
+        // Each report comes with the tour it speaks of: a whole tour, of that length.
+        for (progress, best) in &reports {
+            assert!(testing::is_tour(&matrix, &best.order));
+            assert_eq!(best.cost(), cycle_cost(&matrix, &best.order));
+            assert_eq!(best.cost(), progress.best_cost);
+        }
+        // The first is the tour the search starts from and the last is the one it returns.
+        assert_eq!(reports.first().unwrap().1, nearest_neighbour(&matrix));
+        assert_eq!(reports.last().unwrap().1, tour);
+        // In between the tour changes only by getting shorter. A caller may rely on
+        // that: a report with the same length as the one before has the same tour.
+        for pair in reports.windows(2) {
+            let same_tour = pair[1].1 == pair[0].1;
+            let same_length = pair[1].0.best_cost == pair[0].0.best_cost;
+            assert_eq!(same_tour, same_length);
+        }
+    }
+
+    /// A search is looked in on once per poll interval, and it ends between two looks.
+    /// So it reports once more as it returns: whoever shows the search then shows its
+    /// result, and not the tour of a moment before.
+    #[test]
+    fn the_last_report_is_of_the_tour_that_is_returned() {
+        // Two hundred stops keep local search busy for a million moves. This budget
+        // ends it half an interval after the second look, while it still improves.
+        let matrix = scattered(200, 5);
+        let budget = POLL_INTERVAL + POLL_INTERVAL / 2;
+        let mut reports = Vec::new();
+        let mut control = Control::max_iterations(budget)
+            .with_progress(|progress, best| reports.push((progress, best.clone())));
+        let tour = optimize_route(&matrix, 5, &mut control);
+        drop(control);
+
+        let (last, best) = reports.last().unwrap();
+        assert_eq!(best, &tour);
+        assert_eq!(last.best_cost, tour.cost());
+        // It says what no report before it could. The look before it came one poll
+        // interval in, give or take the row local search was at, and the search went
+        // on shortening the tour after that.
+        let (before, _) = &reports[reports.len() - 2];
+        assert!((POLL_INTERVAL..budget).contains(&before.iterations));
+        assert!(last.iterations > before.iterations);
+        assert!(before.best_cost > tour.cost());
     }
 
     #[test]
@@ -230,7 +269,7 @@ mod tests {
         let mut flagged_at = None;
         let mut control = Control::max_iterations(u64::MAX)
             .with_cancel(&flag)
-            .with_progress(|progress| {
+            .with_progress(|progress, _| {
                 if progress.iterations >= 100_000 && flagged_at.is_none() {
                     flag.store(true, Ordering::Relaxed);
                     flagged_at = Some(progress.iterations);

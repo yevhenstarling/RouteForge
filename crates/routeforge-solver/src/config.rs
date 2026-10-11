@@ -9,8 +9,13 @@ use anyhow::{Context, bail, ensure};
 const LONGEST_SECS: u64 = 24 * 60 * 60;
 
 /// Workers in one process are a convenience for running without Docker. Scaling is by
-/// instances, and each worker takes up to two database connections.
+/// instances, and each worker takes up to three database connections.
 const MOST_WORKERS: u32 = 64;
+
+/// How often the progress of a search may be announced, in milliseconds. More often
+/// than twenty times a second nobody could tell, and less often than once a minute is
+/// not progress any more.
+const PROGRESS_MS: std::ops::RangeInclusive<u64> = 50..=60_000;
 
 /// How the workers of a solver process behave. Every span is measured by whoever it is
 /// handed to: the lease by the database (D6), the others by this process.
@@ -28,6 +33,9 @@ pub(crate) struct Config {
     /// How often an idle worker looks at the queue without having been notified, give
     /// or take a quarter.
     pub(crate) poll: Duration,
+    /// How often, at most, a route search under way announces how far it has got and
+    /// with which route, to whoever watches its plan (D49).
+    pub(crate) progress: Duration,
 }
 
 impl Config {
@@ -65,11 +73,19 @@ impl Config {
         else {
             bail!("SOLVER_CONCURRENCY must be between 1 and {MOST_WORKERS}, got {concurrency}");
         };
+        let progress = number("SOLVER_PROGRESS_MS", 250)?;
+        ensure!(
+            PROGRESS_MS.contains(&progress),
+            "SOLVER_PROGRESS_MS must be between {} and {} milliseconds, got {progress}",
+            PROGRESS_MS.start(),
+            PROGRESS_MS.end()
+        );
         let config = Self {
             concurrency,
             lease: seconds("SOLVER_LEASE_SECS", 30)?,
             heartbeat: seconds("SOLVER_HEARTBEAT_SECS", 5)?,
             poll: seconds("SOLVER_POLL_SECS", 5)?,
+            progress: Duration::from_millis(progress),
         };
         // One heartbeat that does not get through must not cost the job.
         ensure!(
@@ -81,10 +97,11 @@ impl Config {
         Ok(config)
     }
 
-    /// Database connections the process needs: one that listens, and two for each
-    /// worker, since marking itself as seen can coincide with any of its other calls.
+    /// Database connections the process needs: one that listens, and three for each
+    /// worker. While it searches for a route, its heartbeat, an announcement of its
+    /// progress and marking itself as seen can all fall on the same moment.
     pub(crate) fn connections(&self) -> u32 {
-        1 + 2 * self.concurrency
+        1 + 3 * self.concurrency
     }
 }
 
@@ -116,9 +133,10 @@ mod tests {
                 lease: Duration::from_secs(30),
                 heartbeat: Duration::from_secs(5),
                 poll: Duration::from_secs(5),
+                progress: Duration::from_millis(250),
             }
         );
-        assert_eq!(config.connections(), 3);
+        assert_eq!(config.connections(), 4);
     }
 
     #[test]
@@ -128,6 +146,7 @@ mod tests {
             ("SOLVER_LEASE_SECS", "10"),
             ("SOLVER_HEARTBEAT_SECS", " 2 "),
             ("SOLVER_POLL_SECS", "1"),
+            ("SOLVER_PROGRESS_MS", "1000"),
         ])
         .unwrap();
         assert_eq!(
@@ -137,9 +156,10 @@ mod tests {
                 lease: Duration::from_secs(10),
                 heartbeat: Duration::from_secs(2),
                 poll: Duration::from_secs(1),
+                progress: Duration::from_secs(1),
             }
         );
-        assert_eq!(config.connections(), 7);
+        assert_eq!(config.connections(), 10);
     }
 
     /// Docker Compose passes a variable that is not set as an empty one.
@@ -161,6 +181,10 @@ mod tests {
             ("SOLVER_HEARTBEAT_SECS", "2.5"),
             ("SOLVER_POLL_SECS", "0"),
             ("SOLVER_POLL_SECS", "18446744073709551616"),
+            ("SOLVER_PROGRESS_MS", "0"),
+            ("SOLVER_PROGRESS_MS", "49"),
+            ("SOLVER_PROGRESS_MS", "60001"),
+            ("SOLVER_PROGRESS_MS", "often"),
         ] {
             let error = from(&[(name, value)]).unwrap_err();
             assert!(error.to_string().contains(name), "{name}={value}: {error}");

@@ -5,23 +5,32 @@
 //! A plan in progress can be cancelled; one that is done can be discarded, which gives
 //! its orders back so that the day can be planned again (D30).
 
+use std::time::Duration;
+
+use actix_web::web::Bytes;
 use actix_web::{HttpResponse, get, post, web};
 use routeforge_domain::db::{depots, plans, queue, routes};
-use routeforge_domain::{NewPlan, Plan, PlanId, PlanRequest, PlanStatus, Route, RouteBudget};
+use routeforge_domain::{
+    NewPlan, Plan, PlanFilter, PlanId, PlanRequest, PlanStatus, Route, RouteBudget, RouteJob,
+};
 use utoipa_actix_web::service_config::ServiceConfig;
 use uuid::Uuid;
 
 use crate::app::{AppState, NotAcceptable, NotAllowed, NotLoggedIn, NotNow, NotThere};
 use crate::auth::Staff;
 use crate::error::ApiError;
+use crate::events::Signal;
 use crate::request_id::RequestId;
+use crate::stream::{self, Heard, Pace, Watch};
 use crate::validate;
 
 pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
     config
         .service(create_plan)
+        .service(list_plans)
         .service(get_plan)
         .service(list_plan_routes)
+        .service(watch_plan)
         .service(cancel_plan)
         .service(discard_plan);
 }
@@ -86,6 +95,31 @@ fn any_seed() -> u32 {
     u32::from_be_bytes([a, b, c, d])
 }
 
+/// List the plans of a day
+///
+/// Newest first. A day has one plan in progress at most. The others are the ones it
+/// had before: done, discarded, failed or cancelled.
+#[utoipa::path(
+    tag = "plans",
+    security(("bearer" = [])),
+    // Named here as well as in the arguments: utoipa describes a query it finds
+    // there only if it is listed.
+    params(PlanFilter),
+    responses(
+        (status = 200, description = "The plans of the day, newest first", body = [Plan]),
+        NotLoggedIn,
+        NotAllowed,
+    )
+)]
+#[get("/api/plans")]
+async fn list_plans(
+    _: Staff,
+    state: web::Data<AppState>,
+    query: web::Query<PlanFilter>,
+) -> Result<web::Json<Vec<Plan>>, ApiError> {
+    Ok(web::Json(plans::list(&state.pool, &query).await?))
+}
+
 /// Read a plan
 ///
 /// With how far it has got: the orders it found, the routes it was split into and
@@ -133,6 +167,99 @@ async fn list_plan_routes(
     Ok(web::Json(
         routes::list_for_plan(&state.pool, plan.id).await?,
     ))
+}
+
+/// Watch a plan
+///
+/// An event stream (`text/event-stream`) that stays open, for showing a plan while
+/// the solvers are at it. It opens with the plan as it is, and then sends what
+/// changes:
+///
+/// - `plan`: the plan, as `GET /api/plans/{id}` gives it, whenever its status or its
+///   counts have changed. When `routes_done` has grown, one route more can be read
+///   from `/api/plans/{id}/routes`.
+/// - `jobs`: the plan's route jobs, an array of `RouteJob`, whenever one of them was
+///   claimed, stored, retried or stopped.
+/// - `progress`: a `RouteProgress`, a few times a second for each route that is being
+///   searched for. It says how far the search has got and which route is the best so
+///   far.
+///
+/// A line that starts with a colon is a comment, sent to keep the connection open.
+/// The stream ends when the token it was opened with expires. Opened again, it starts
+/// with the plan as it is then.
+///
+/// `EventSource` in a browser cannot send the token. The page reads the stream with
+/// `fetch`.
+#[utoipa::path(
+    tag = "plans",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The events, for as long as the stream is read",
+            body = String, content_type = "text/event-stream"),
+        NotLoggedIn,
+        NotAllowed,
+        NotThere,
+    )
+)]
+#[get("/api/plans/{id}/events")]
+async fn watch_plan(
+    Staff(user): Staff,
+    state: web::Data<AppState>,
+    path: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let watch = PlanWatch {
+        plan_id: path.into_inner().into(),
+        sent: None,
+    };
+    stream::open(state, user, watch).await
+}
+
+/// What the stream of one plan shows: the plan, its route jobs, and their searches.
+struct PlanWatch {
+    plan_id: PlanId,
+    /// What was last sent, so that only what has changed since is sent again.
+    sent: Option<(Plan, Vec<RouteJob>)>,
+}
+
+impl Watch for PlanWatch {
+    fn hears(&self, signal: &Signal) -> Heard {
+        match signal {
+            Signal::Plan(plan_id) if *plan_id == self.plan_id => Heard::Changed,
+            Signal::Progress(progress) if progress.plan_id == self.plan_id => {
+                stream::frame("progress", progress.as_ref()).map_or(Heard::Nothing, Heard::Frame)
+            }
+            Signal::Missed => Heard::Changed,
+            // Of another plan.
+            Signal::Plan(_) | Signal::Progress(_) => Heard::Nothing,
+        }
+    }
+
+    async fn read(&mut self, state: &AppState) -> Result<Vec<Bytes>, ApiError> {
+        let plan = existing(state, self.plan_id).await?;
+        let jobs: Vec<RouteJob> = queue::list_for_plan(&state.pool, self.plan_id)
+            .await?
+            .into_iter()
+            .filter_map(RouteJob::of)
+            .collect();
+
+        let (sent_plan, sent_jobs) = match &self.sent {
+            Some((plan, jobs)) => (Some(plan), Some(jobs)),
+            None => (None, None),
+        };
+        let mut events = Vec::new();
+        if sent_plan != Some(&plan) {
+            events.push(stream::frame("plan", &plan)?);
+        }
+        if sent_jobs != Some(&jobs) {
+            events.push(stream::frame("jobs", &jobs)?);
+        }
+        self.sent = Some((plan, jobs));
+        Ok(events)
+    }
+
+    fn unprompted(&self, pace: &Pace) -> Duration {
+        pace.plan_every
+    }
 }
 
 /// Cancel a plan that is in progress
@@ -215,18 +342,22 @@ async fn existing(state: &AppState, id: PlanId) -> Result<Plan, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use actix_web::http::StatusCode;
+    use actix_web::http::{StatusCode, header};
     use routeforge_domain::db::queue::JOBS_CHANNEL;
-    use routeforge_domain::{JobPayload, JobStatus, OrderStatus, Role};
+    use routeforge_domain::{JobId, JobPayload, JobStatus, OrderStatus, Role, RouteProgress};
     use serde_json::{Value, json};
     use sqlx::PgPool;
     use sqlx::postgres::PgListener;
 
     use super::*;
+    use crate::error::PROBLEM_JSON;
+    use crate::events::BACKLOG;
     use crate::request_id::X_REQUEST_ID;
-    use crate::testing::{self, Actor, Api, date};
+    use crate::stream::EVENT_STREAM;
+    use crate::testing::{self, Actor, Api, Stream, date, soon};
 
     /// How many plans and how many jobs there are.
     async fn plans_and_jobs(pool: &PgPool) -> (i64, i64) {
@@ -583,9 +714,16 @@ mod tests {
         let operator = api.actor(Role::Operator).await;
         let nothing = format!("/api/plans/{}", PlanId::generate());
 
-        for path in [nothing.clone(), format!("{nothing}/routes")] {
+        // A stream of it is refused like the rest, and is no stream that says so.
+        let paths = [
+            nothing.clone(),
+            format!("{nothing}/routes"),
+            format!("{nothing}/events"),
+        ];
+        for path in paths {
             let reply = api.get(Some(&operator), &path).await;
             assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(reply.content_type.as_deref(), Some(PROBLEM_JSON), "{path}");
         }
         for action in ["cancel", "discard"] {
             let reply = api
@@ -593,5 +731,327 @@ mod tests {
                 .await;
             assert_eq!(reply.status, StatusCode::NOT_FOUND, "{action}");
         }
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_plans_of_a_day_are_listed_newest_first(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let listed = async |query: &str| {
+            api.get(Some(&operator), &format!("/api/plans{query}"))
+                .await
+        };
+
+        let none = listed("?service_date=2026-10-12").await;
+        assert_eq!(none.status, StatusCode::OK);
+        assert_eq!(none.body, json!([]));
+
+        // A day has one plan in progress, so the first has to be over for a second.
+        let first = api.post(Some(&operator), "/api/plans", plan_for(12)).await;
+        let cancel = format!("/api/plans/{}/cancel", id_of(&first));
+        let cancelled = api.post(Some(&operator), &cancel, Value::Null).await;
+        assert_eq!(cancelled.status, StatusCode::OK);
+        let second = api.post(Some(&operator), "/api/plans", plan_for(12)).await;
+        let elsewhere = api.post(Some(&operator), "/api/plans", plan_for(13)).await;
+
+        let monday = listed("?service_date=2026-10-12").await;
+        assert_eq!(monday.status, StatusCode::OK);
+        // The newest first, each as it is read by its id.
+        assert_eq!(monday.body, json!([second.body, cancelled.body]));
+        let tuesday = listed("?service_date=2026-10-13").await;
+        assert_eq!(tuesday.body, json!([elsewhere.body]));
+
+        // Which day is not left open: the plans of every day would be a list without end.
+        for unreadable in ["", "?service_date=monday", "?day=2026-10-12"] {
+            let refused = listed(unreadable).await;
+            assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{unreadable}");
+            assert_eq!(refused.content_type.as_deref(), Some(PROBLEM_JSON));
+        }
+    }
+
+    /// How long a stream is listened to before it is taken to have nothing to say.
+    const QUIET: Duration = Duration::from_millis(300);
+
+    fn events_of(plan_id: PlanId) -> String {
+        format!("/api/plans/{plan_id}/events")
+    }
+
+    /// Opens the stream of a plan and reads what it opens with: the plan and its jobs.
+    async fn watching(api: &Api, who: &Actor, plan_id: PlanId) -> (Stream, Value, Value) {
+        let mut stream = api.open(who, &events_of(plan_id)).await;
+        let plan = stream.next_of("plan").await;
+        let jobs = stream.next_of("jobs").await;
+        (stream, plan, jobs)
+    }
+
+    /// A plan that has just been asked for, and nothing else.
+    async fn queued_plan(api: &Api, operator: &Actor, day: u32) -> PlanId {
+        let asked = api.post(Some(operator), "/api/plans", plan_for(day)).await;
+        assert_eq!(asked.status, StatusCode::CREATED, "{}", asked.text);
+        id_of(&asked)
+    }
+
+    /// What the page is fed with while a plan is made, with the stand-in for the solver.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_plan_is_watched_from_the_queue_to_its_routes(pool: PgPool) {
+        let api = testing::api(&pool);
+        let _listening = api.listen().await;
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let courier = api.courier(10).await;
+        let (plan_id, placed) = planned_day(&api, &operator, 12).await;
+        let path = format!("/api/plans/{plan_id}");
+
+        // It opens with the plan as it is: queued, and split into nothing yet.
+        let (mut stream, plan, jobs) = watching(&api, &operator, plan_id).await;
+        assert_eq!(plan, api.get(Some(&operator), &path).await.body);
+        assert_eq!(plan["status"], "queued");
+        assert_eq!(jobs, json!([]));
+        assert!(stream.is_quiet_for(QUIET).await, "nothing has changed");
+
+        // Clustered: the plan has moved on, and has a route job.
+        assert!(testing::work_one(&pool).await);
+        let plan = stream
+            .until("plan", |plan| plan["status"] == "routing")
+            .await;
+        assert_eq!(plan, api.get(Some(&operator), &path).await.body);
+        assert_eq!(
+            (&plan["routes_total"], &plan["routes_done"]),
+            (&json!(1), &json!(0))
+        );
+        let jobs = stream.next_of("jobs").await;
+        assert_eq!(jobs.as_array().unwrap().len(), 1, "{jobs}");
+        let job = &jobs[0];
+        assert_eq!(job["courier_id"], json!(courier.id));
+        // The orders as the job has them, which is what a search counts its stops by.
+        assert_eq!(job["order_ids"], json!(placed));
+        assert_eq!(
+            (
+                &job["status"],
+                &job["attempt"],
+                &job["worker_id"],
+                &job["progress"]
+            ),
+            (&json!("queued"), &json!(0), &Value::Null, &Value::Null)
+        );
+
+        // Its one route found and stored: the plan is done, and so is the job.
+        assert!(testing::work_one(&pool).await);
+        let plan = stream.until("plan", |plan| plan["status"] == "done").await;
+        assert_eq!(plan["routes_done"], 1);
+        let jobs = stream.next_of("jobs").await;
+        assert_eq!(
+            (&jobs[0]["status"], &jobs[0]["attempt"]),
+            (&json!("done"), &json!(1))
+        );
+        assert!(jobs[0]["worker_id"].is_string(), "{jobs}");
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        // Discarded, through the API. The plan has changed, and its jobs have not.
+        let discard = format!("{path}/discard");
+        let discarded = api.post(Some(&operator), &discard, Value::Null).await;
+        assert_eq!(discarded.status, StatusCode::OK);
+        assert_eq!(stream.next_of("plan").await, discarded.body);
+        assert!(stream.is_quiet_for(QUIET).await);
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_stream_passes_on_the_searches_of_its_own_plan_and_of_no_other(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let ours = queued_plan(&api, &operator, 12).await;
+        let theirs = queued_plan(&api, &operator, 13).await;
+        let (mut stream, ..) = watching(&api, &operator, ours).await;
+        let search_of = |plan_id: PlanId| RouteProgress {
+            plan_id,
+            job_id: JobId::generate(),
+            attempt: 1,
+            iterations: 16_384,
+            best_cost_m: 4_200,
+            order: Some(vec![1, 0, 2]),
+        };
+
+        // Nothing listens to the database in this test. What the listener would pass
+        // on is said by hand.
+        api.events()
+            .send(Signal::Progress(Arc::new(search_of(theirs))));
+        api.events().send(Signal::Plan(theirs));
+        assert!(
+            stream.is_quiet_for(QUIET).await,
+            "another plan is none of its business"
+        );
+
+        let search = search_of(ours);
+        api.events()
+            .send(Signal::Progress(Arc::new(search.clone())));
+        assert_eq!(stream.next_of("progress").await, json!(search));
+
+        // A route too long to be announced comes as its numbers alone.
+        let numbers = RouteProgress {
+            order: None,
+            ..search_of(ours)
+        };
+        api.events()
+            .send(Signal::Progress(Arc::new(numbers.clone())));
+        let sent = stream.next_of("progress").await;
+        assert_eq!(sent, json!(numbers));
+        assert!(sent.get("order").is_none(), "{sent}");
+    }
+
+    /// A notification is a hint and can be lost (D26). A stream that may have missed
+    /// one reads again.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_stream_that_may_have_missed_something_reads_again(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+
+        // The listener was away while the plan was cancelled, and says so when it is
+        // back. Here there is none, so nobody tells the stream of the cancel either.
+        let plan_id = queued_plan(&api, &operator, 12).await;
+        let (mut stream, ..) = watching(&api, &operator, plan_id).await;
+        assert!(queue::cancel_plan(&pool, plan_id).await.unwrap());
+        assert!(stream.is_quiet_for(QUIET).await, "nobody told it");
+        api.events().send(Signal::Missed);
+        assert_eq!(stream.next_of("plan").await["status"], "cancelled");
+        assert!(
+            stream.is_quiet_for(QUIET).await,
+            "its jobs are as they were"
+        );
+
+        // A reader too slow for all that is said: the channel drops the oldest of
+        // what it has not read, and tells it that it did.
+        let plan_id = queued_plan(&api, &operator, 13).await;
+        let (mut stream, ..) = watching(&api, &operator, plan_id).await;
+        assert!(queue::cancel_plan(&pool, plan_id).await.unwrap());
+        let another = PlanId::generate();
+        for _ in 0..=BACKLOG {
+            api.events().send(Signal::Plan(another));
+        }
+        assert_eq!(stream.next_of("plan").await["status"], "cancelled");
+    }
+
+    /// And a stream that is told nothing looks all the same, now and then.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_stream_reads_now_and_then_without_being_told(pool: PgPool) {
+        let pace = Pace {
+            plan_every: Duration::from_millis(100),
+            ..testing::PACE
+        };
+        let api = testing::api_at(&pool, pace);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let plan_id = queued_plan(&api, &operator, 12).await;
+        let (mut stream, ..) = watching(&api, &operator, plan_id).await;
+
+        // What it finds unchanged it does not send again.
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        assert!(queue::cancel_plan(&pool, plan_id).await.unwrap());
+        assert_eq!(stream.next_of("plan").await["status"], "cancelled");
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_quiet_stream_sends_a_comment_now_and_then(pool: PgPool) {
+        let pace = Pace {
+            keep_alive: Duration::from_millis(100),
+            ..testing::PACE
+        };
+        let api = testing::api_at(&pool, pace);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let plan_id = queued_plan(&api, &operator, 12).await;
+
+        let mut stream = api.open(&operator, &events_of(plan_id)).await;
+        let mut blocks = Vec::new();
+        for _ in 0..4 {
+            blocks.push(soon(stream.block()).await.expect("the stream goes on"));
+        }
+        assert!(blocks[0].starts_with("event: plan\ndata: {"), "{blocks:?}");
+        assert!(blocks[1].starts_with("event: jobs\ndata: ["), "{blocks:?}");
+        assert_eq!(blocks[2..], [": keep-alive", ": keep-alive"]);
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_stream_is_sent_as_one_and_is_not_to_be_kept(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let plan_id = queued_plan(&api, &operator, 12).await;
+
+        let opened = api.get(Some(&operator), &events_of(plan_id)).await;
+        assert_eq!(opened.status, StatusCode::OK);
+        assert_eq!(opened.content_type.as_deref(), Some(EVENT_STREAM));
+        assert_eq!(
+            opened.headers.get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert!(opened.headers.get(X_REQUEST_ID).is_some());
+        assert!(
+            opened.text.starts_with("event: plan\ndata: {"),
+            "{}",
+            opened.text
+        );
+    }
+
+    /// A token is checked when a request arrives, and a stream answers for long after
+    /// that. It ends when its token does (D50).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_stream_ends_when_the_token_it_was_opened_with_expires(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let plan_id = queued_plan(&api, &operator, 12).await;
+        // Good for this second and the next one.
+        let leaving = api.expiring_in(&operator, 1);
+
+        let opened = Instant::now();
+        let (mut stream, ..) = watching(&api, &leaving, plan_id).await;
+        // One with an hour to go, opened beside it.
+        let (mut staying, ..) = watching(&api, &operator, plan_id).await;
+        stream.ended().await;
+        let open_for = opened.elapsed();
+        assert!(
+            (Duration::from_secs(1)..Duration::from_secs(5)).contains(&open_for),
+            "{open_for:?}"
+        );
+
+        // Whoever opens it again with that token is told to log in.
+        let refused = api.get(Some(&leaving), &events_of(plan_id)).await;
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(refused.content_type.as_deref(), Some(PROBLEM_JSON));
+
+        // The other stream is still there, and still listening.
+        assert!(queue::cancel_plan(&pool, plan_id).await.unwrap());
+        api.events().send(Signal::Plan(plan_id));
+        assert_eq!(staying.next_of("plan").await["status"], "cancelled");
+    }
+
+    /// The server lets a response finish before it stops, and a stream never does. So
+    /// the streams are ended when the API is told to stop.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_streams_end_when_the_api_is_told_to_stop(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let plan_id = queued_plan(&api, &operator, 12).await;
+        let (mut stream, ..) = watching(&api, &operator, plan_id).await;
+        let mut stats = api.open(&operator, "/api/system/stats/events").await;
+        stats.next_of("stats").await;
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        let told = Instant::now();
+        api.events().close();
+        stream.ended().await;
+        stats.ended().await;
+        let took = told.elapsed();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+
+        // One that is opened while the API is stopping says what there is, and ends.
+        let (mut late, plan, _) = watching(&api, &operator, plan_id).await;
+        assert_eq!(plan["status"], "queued");
+        late.ended().await;
     }
 }

@@ -317,6 +317,18 @@ pub struct Plan {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// Which plans to list: those of one day, newest first.
+///
+/// A day has one plan in progress at most, and beside it the ones that came before. So
+/// they are listed whole, like the couriers (D44).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
+pub struct PlanFilter {
+    /// The day the plans are for.
+    pub service_date: NaiveDate,
+}
+
 /// What creating a plan needs. A new plan is queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewPlan {

@@ -1,11 +1,13 @@
 //! The `route` job: finds the order in which one courier calls at its stops (D2, D34).
 //!
 //! It has three parts. The first reads what the search needs and builds the distance
-//! matrix. The second runs the search on a blocking thread, with a heartbeat beside it
-//! that keeps the lease and stores the progress. The third writes the route in the
-//! transaction that marks the job done.
+//! matrix. The second runs the search on a blocking thread. Beside it a heartbeat keeps
+//! the lease and stores the progress, and an announcer tells whoever watches the plan
+//! how far the search has got and with which route (D49). The third writes the route
+//! in the transaction that marks the job done.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::iter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +25,7 @@ use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::worker::{Context, Outcome};
@@ -123,6 +125,15 @@ struct Found {
     stopped_by: Option<StopReason>,
 }
 
+/// What a search last said: how far it has got, and the best route it has found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Report {
+    progress: JobProgress,
+    /// The stops of that route in calling order, each as its position in the job's
+    /// list of orders. `None` if a stop has no such position, which the search rules out.
+    order: Option<Arc<[u32]>>,
+}
+
 /// A search under way on a blocking thread.
 ///
 /// It ends when its budget is used up, when it is told to [`stop`](Self::stop), and
@@ -133,7 +144,7 @@ struct Found {
 struct Search {
     found: JoinHandle<Found>,
     /// How far the search has got, as it last said.
-    progress: watch::Receiver<Option<JobProgress>>,
+    progress: watch::Receiver<Option<Report>>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -177,13 +188,16 @@ async fn solve(
     budget: RouteBudget,
 ) -> anyhow::Result<Option<Found>> {
     let mut search = Search::start(matrix, seed, budget);
-    // Beside the search and not in a task of its own: the lease is kept for exactly
-    // as long as this future lives, so a job that is dropped cannot go on holding it.
+    // Beside the search and not in tasks of their own: the lease is kept, and the
+    // search is announced, for exactly as long as this future lives. A job that is
+    // dropped can go on doing neither.
     let heartbeats = heartbeats(pool, config, lease, search.progress.clone());
-    tokio::pin!(heartbeats);
+    let announcing = announce(pool, config, lease, search.progress.clone());
+    tokio::pin!(heartbeats, announcing);
 
     tokio::select! {
         found = &mut search.found => Ok(Some(found.context("the route search panicked")?)),
+        never = &mut announcing => match never {},
         answer = &mut heartbeats => {
             match answer {
                 Heartbeat::Cancelled => info!("the plan has ended; stopping the search"),
@@ -203,16 +217,27 @@ fn search(
     seed: u64,
     budget: RouteBudget,
     cancel: &AtomicBool,
-    progress: &watch::Sender<Option<JobProgress>>,
+    progress: &watch::Sender<Option<Report>>,
 ) -> Found {
+    // The route last reported, with its length. The best tour changes only by getting
+    // shorter, so a report of the same length is of the same route.
+    let mut reported: Option<(u64, Option<Arc<[u32]>>)> = None;
     // A control borrows the flag and owns the callback, so it is built here, on the
     // thread that runs the search, and not handed over to it.
     let mut control = Control::max_iterations(budget.iterations().unwrap_or(u64::MAX))
         .with_cancel(cancel)
-        .with_progress(|at| {
-            progress.send_replace(Some(JobProgress {
-                iterations: at.iterations,
-                best_cost_m: at.best_cost,
+        .with_progress(|at, best| {
+            let order = match &reported {
+                Some((cost, order)) if *cost == at.best_cost => order.clone(),
+                _ => positions_of(best),
+            };
+            reported = Some((at.best_cost, order.clone()));
+            progress.send_replace(Some(Report {
+                progress: JobProgress {
+                    iterations: at.iterations,
+                    best_cost_m: at.best_cost,
+                },
+                order,
             }));
         });
     // The budget is a span, measured from the moment the search starts.
@@ -231,6 +256,43 @@ fn search(
     }
 }
 
+/// The stops of a tour in calling order, each as its position in the job's list of
+/// orders: node `n` of the search is stop `n - 1` (D14).
+fn positions_of(tour: &Tour) -> Option<Arc<[u32]>> {
+    let position = |&node: &usize| u32::try_from(node.checked_sub(1)?).ok();
+    tour.stops().iter().map(position).collect()
+}
+
+/// Tells whoever watches the plan how far the search has got and with which route:
+/// whenever the search has said something new, and at most every `config.progress`.
+///
+/// Never returns. It is polled beside the search, as the heartbeat is and for the
+/// reason the heartbeat is (D34). It ends with the job's future, however that ends.
+async fn announce(
+    pool: &PgPool,
+    config: &Config,
+    lease: &Lease,
+    mut reports: watch::Receiver<Option<Report>>,
+) -> Infallible {
+    loop {
+        // The other end is on the thread of the search. Once that has returned there
+        // is no more to say, and the search's own result ends the job.
+        if reports.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        let report = reports.borrow_and_update().clone();
+        if let Some(report) = report {
+            let said =
+                queue::announce_progress(pool, lease, report.progress, report.order.as_deref());
+            // Nobody waits for it, and the next one says more.
+            if let Err(error) = said.await {
+                debug!(%error, "could not announce the progress of the search");
+            }
+        }
+        tokio::time::sleep(config.progress).await;
+    }
+}
+
 /// Extends the lease every heartbeat interval and stores how far the search has got.
 ///
 /// Returns when the job is no longer this worker's, with the answer that said so.
@@ -238,14 +300,14 @@ async fn heartbeats(
     pool: &PgPool,
     config: &Config,
     lease: &Lease,
-    progress: watch::Receiver<Option<JobProgress>>,
+    progress: watch::Receiver<Option<Report>>,
 ) -> Heartbeat {
     let first = tokio::time::Instant::now() + config.heartbeat;
     let mut every = tokio::time::interval_at(first, config.heartbeat);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         every.tick().await;
-        let latest = *progress.borrow();
+        let latest = progress.borrow().as_ref().map(|report| report.progress);
         match queue::heartbeat(pool, lease, config.lease, latest).await {
             Ok(Heartbeat::Extended) => {}
             Ok(ended) => return ended,
@@ -304,11 +366,13 @@ fn calling_order(tour: &Tour, order_ids: &[OrderId]) -> anyhow::Result<Vec<Order
 mod tests {
     use std::time::Duration;
 
-    use routeforge_domain::Haversine;
+    use routeforge_domain::db::queue::PROGRESS_CHANNEL;
+    use routeforge_domain::{Haversine, JobPayload, RouteProgress, WorkerId};
     use routeforge_tsp::Point;
+    use sqlx::postgres::PgListener;
 
     use super::*;
-    use crate::testing::{self, date, moves, soon};
+    use crate::testing::{self, LONG, date, moves, one_at_a_time, soon};
 
     /// The depot and `stops` stops on a line, 100 metres apart.
     fn line(stops: usize) -> DistanceMatrix {
@@ -379,9 +443,28 @@ mod tests {
         let found = search(&matrix, 7, moves(50_000), &cancel, &progress);
         assert_eq!(found.stopped_by, Some(StopReason::Budget));
         assert!(found.iterations <= 50_000);
-        let reported = (*latest.borrow()).unwrap();
-        assert_eq!(reported.best_cost_m, found.tour.cost());
-        assert!(reported.iterations <= found.iterations);
+        let reported = latest.borrow().clone().unwrap();
+        assert_eq!(reported.progress.best_cost_m, found.tour.cost());
+        assert!(reported.progress.iterations <= found.iterations);
+
+        // With the numbers comes the route they are of: every stop once, by its place
+        // in the job's list, which is one less than its node in the search.
+        let order = reported.order.unwrap();
+        let mut places = order.to_vec();
+        places.sort_unstable();
+        assert!(places.into_iter().eq(0..12));
+        let nodes: Vec<usize> = order.iter().map(|&place| place as usize + 1).collect();
+        assert_eq!(
+            nodes,
+            found.tour.stops(),
+            "the last report is of the result"
+        );
+        let round_trip: Vec<usize> = iter::once(0).chain(nodes).chain([0]).collect();
+        let length: u64 = round_trip
+            .windows(2)
+            .map(|leg| u64::from(matrix.get(leg[0], leg[1])))
+            .sum();
+        assert_eq!(length, reported.progress.best_cost_m);
 
         // The same seed and budget give the same route, as the plan promises (D5).
         let again = search(&matrix, 7, moves(50_000), &cancel, &progress);
@@ -412,7 +495,7 @@ mod tests {
 
     /// Waits until the search's thread has returned. The sending side of the progress
     /// lives on that thread, and is gone when the thread is.
-    async fn returned(mut progress: watch::Receiver<Option<JobProgress>>) {
+    async fn returned(mut progress: watch::Receiver<Option<Report>>) {
         soon(async { while progress.changed().await.is_ok() {} }).await;
     }
 
@@ -508,5 +591,118 @@ mod tests {
 
         let error = prepare(&context, &route).await.unwrap_err();
         assert!(error.to_string().contains(&missing.to_string()), "{error}");
+    }
+
+    /// A route job of `stops` stops, claimed, for the lease a search is kept under.
+    async fn claimed_route(pool: &PgPool, stops: usize) -> Lease {
+        let city = testing::city(pool, &[100]).await;
+        let placed = city.orders(pool, date(12), stops, 1).await;
+        let plan = plans::create(pool, &city.new_plan(date(12), moves(1)))
+            .await
+            .unwrap();
+        let route = JobPayload::Route {
+            plan_id: plan.id,
+            courier_id: city.couriers[0].id,
+            order_ids: placed.iter().map(|order| order.id).collect(),
+            seed: 7,
+        };
+        queue::enqueue(pool, &route, None).await.unwrap();
+        let job = queue::claim(pool, WorkerId::generate(), LONG)
+            .await
+            .unwrap();
+        job.expect("the job was enqueued a moment ago").lease
+    }
+
+    async fn listening_for_progress(pool: &PgPool) -> PgListener {
+        let mut listener = PgListener::connect_with(pool).await.unwrap();
+        listener.listen(PROGRESS_CHANNEL).await.unwrap();
+        listener
+    }
+
+    /// What is announced within `span` from now.
+    async fn announced_within(listener: &mut PgListener, span: Duration) -> Vec<RouteProgress> {
+        let until = tokio::time::Instant::now() + span;
+        let mut said = Vec::new();
+        while let Ok(notification) = tokio::time::timeout_at(until, listener.recv()).await {
+            said.push(serde_json::from_str(notification.unwrap().payload()).unwrap());
+        }
+        said
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_search_under_way_is_announced_and_no_more_often_than_it_is_set_to(pool: PgPool) {
+        let _turn = one_at_a_time().await;
+        let lease = claimed_route(&pool, 12).await;
+        let config = Config {
+            progress: Duration::from_millis(100),
+            ..testing::config()
+        };
+        let mut listener = listening_for_progress(&pool).await;
+
+        let started = Instant::now();
+        let budget = testing::millis(1_000);
+        let found = solve(&pool, &config, &lease, scattered(12), 7, budget)
+            .await
+            .unwrap()
+            .expect("the job is this worker's throughout");
+        let took = started.elapsed();
+        let said = announced_within(&mut listener, Duration::from_millis(300)).await;
+
+        // One as soon as the search has a tour, and then one every 100 ms at most.
+        let most = 1 + took.as_millis() / 100;
+        assert!(
+            said.len() as u128 <= most,
+            "{} announcements in {took:?}",
+            said.len()
+        );
+        assert!(said.len() >= 3, "{} announcements in {took:?}", said.len());
+        for progress in &said {
+            assert_eq!(
+                (progress.plan_id, progress.job_id, progress.attempt),
+                (lease.plan_id, lease.job_id, lease.attempt)
+            );
+            let order = progress.order.clone();
+            let mut places = order.expect("a route of twelve stops fits a notification");
+            places.sort_unstable();
+            assert!(places.into_iter().eq(0..12));
+        }
+        assert!(said.is_sorted_by_key(|progress| progress.iterations));
+        assert!(
+            said.windows(2)
+                .all(|pair| pair[1].best_cost_m <= pair[0].best_cost_m)
+        );
+        // The search came back with a route no longer than the last one announced.
+        assert!(said.last().unwrap().best_cost_m >= found.tour.cost());
+    }
+
+    /// The announcer is a part of the job's future, and goes when the job goes.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_job_that_is_dropped_is_no_longer_announced(pool: PgPool) {
+        let _turn = one_at_a_time().await;
+        let lease = claimed_route(&pool, 12).await;
+        let config = Config {
+            progress: Duration::from_millis(50),
+            ..testing::config()
+        };
+        let mut listener = listening_for_progress(&pool).await;
+        // A minute is longer than this test waits for anything.
+        let job = tokio::spawn({
+            let pool = pool.clone();
+            let budget = testing::millis(60_000);
+            async move { solve(&pool, &config, &lease, scattered(12), 7, budget).await }
+        });
+        soon(listener.recv()).await.unwrap();
+
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+
+        // What was on its way may still arrive. After that there is nothing.
+        announced_within(&mut listener, Duration::from_millis(300)).await;
+        let late = announced_within(&mut listener, Duration::from_millis(500)).await;
+        assert!(
+            late.is_empty(),
+            "{} announcements with nobody searching",
+            late.len()
+        );
     }
 }

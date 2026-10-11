@@ -25,6 +25,9 @@ routeforge-tsp = { path = "crates/routeforge-tsp" }
 
 # Runtime, web, OpenAPI
 actix-web = { version = "4.15", default-features = false, features = ["macros"] }
+# For `stream::unfold`, which the event streams of the API are made with. actix-web
+# brings the crate in anyway.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 utoipa = { version = "6.0", features = ["chrono", "uuid"] }
 utoipa-actix-web = "0.2"

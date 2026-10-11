@@ -15,6 +15,7 @@
 //! | `SOLVER_LEASE_SECS` | 30 | How long a claim holds without a heartbeat. |
 //! | `SOLVER_HEARTBEAT_SECS` | 5 | How often a running job extends its lease. |
 //! | `SOLVER_POLL_SECS` | 5 | How often an idle worker looks at the queue unprompted. |
+//! | `SOLVER_PROGRESS_MS` | 250 | How often, at most, a search announces how far it has got. |
 //! | `LOG_FORMAT` | `text` | `json` for one JSON object per line. |
 //! | `RUST_LOG` | `info` | What to log, in the syntax of `tracing`'s `EnvFilter`. |
 //!

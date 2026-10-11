@@ -181,7 +181,15 @@ impl Tokens {
         Some(AuthUser {
             id: token.claims.sub,
             role: token.claims.role,
+            expires_at: token.claims.exp,
         })
+    }
+
+    /// A token for `user` as it would have been issued at `issued_at`, so that a test
+    /// can hold one that is about to expire.
+    #[cfg(test)]
+    pub(crate) fn issued_at(&self, user: &User, issued_at: u64) -> String {
+        self.sign(user.id, user.role, issued_at).unwrap()
     }
 }
 
@@ -190,6 +198,10 @@ impl Tokens {
 pub(crate) struct AuthUser {
     pub(crate) id: UserId,
     pub(crate) role: Role,
+    /// When the token stops being accepted, in seconds since 1970. A request is
+    /// checked once, as it arrives. What answers for longer than that, an event
+    /// stream, ends itself at this moment (D50).
+    pub(crate) expires_at: u64,
 }
 
 impl AuthUser {
@@ -298,9 +310,14 @@ mod tests {
             let session = tokens.issue(user.clone()).unwrap();
             assert_eq!(session.expires_in, 3_600);
             assert_eq!(session.user, user);
-            assert_eq!(
-                tokens.read(&session.token),
-                Some(AuthUser { id: user.id, role })
+            let read = tokens.read(&session.token).unwrap();
+            assert_eq!((read.id, read.role), (user.id, role));
+            // And until when: an hour from now, less the moment this test took.
+            let now = jsonwebtoken::get_current_timestamp();
+            assert!(
+                (now + 3_590..=now + 3_600).contains(&read.expires_at),
+                "{} from {now}",
+                read.expires_at
             );
         }
     }
