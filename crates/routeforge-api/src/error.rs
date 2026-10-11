@@ -186,8 +186,11 @@ pub(crate) fn query_config() -> web::QueryConfig {
 }
 
 /// What a path that nothing serves is answered with.
+pub(crate) const NOTHING_HERE: ApiError = ApiError::NotFound("nothing is served at this path");
+
+/// The answer to whatever matches no route.
 pub(crate) async fn not_found() -> Result<HttpResponse, ApiError> {
-    Err(ApiError::NotFound("nothing is served at this path"))
+    Err(NOTHING_HERE)
 }
 
 #[cfg(test)]

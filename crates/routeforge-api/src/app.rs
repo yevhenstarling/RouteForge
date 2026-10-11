@@ -10,7 +10,7 @@ use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::middleware::from_fn;
 use actix_web::{App, web};
-use routeforge_domain::Problem;
+use routeforge_domain::{Problem, RouteJob, RouteProgress};
 use sqlx::PgPool;
 use tracing_actix_web::TracingLogger;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -22,8 +22,10 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::{Passwords, Tokens};
 use crate::config::Limits;
 use crate::error::{self, PROBLEM_JSON};
+use crate::events::Events;
 use crate::request_id::{self, RequestSpan};
-use crate::routes;
+use crate::stream::Pace;
+use crate::{page, routes};
 
 /// Where the OpenAPI document is served.
 pub(crate) const OPENAPI_PATH: &str = "/api/openapi.json";
@@ -39,13 +41,17 @@ pub(crate) struct AppState {
     pub(crate) limits: Limits,
     /// A worker seen within this span counts as alive.
     pub(crate) worker_alive: Duration,
+    /// What the database announces, for the event streams (D50).
+    pub(crate) events: Events,
+    /// How the event streams pace themselves.
+    pub(crate) pace: Pace,
 }
 
 /// The application.
 ///
 /// From the outside in, a request passes the middleware that gives it its id, the one
-/// that opens its span, and then the routes. Swagger UI is at `/docs/`, and everything
-/// that matches no route is a `404` like any other error.
+/// that opens its span, and then the routes. The page is at `/`, Swagger UI is at
+/// `/docs/`, and everything that matches no route is a `404` like any other error.
 pub(crate) fn app(
     state: web::Data<AppState>,
 ) -> App<
@@ -69,6 +75,7 @@ pub(crate) fn app(
 
     app.service(SwaggerUi::new("/docs/{_:.*}").url(OPENAPI_PATH, openapi))
         .service(web::redirect("/docs", "/docs/"))
+        .configure(page::configure)
         .default_service(web::to(error::not_found))
         // The last one wrapped is the first a request meets.
         .wrap(TracingLogger::<RequestSpan>::new())
@@ -82,9 +89,12 @@ pub(crate) fn app(
         title = "RouteForge",
         description = "Turns a day's parcel orders into courier routes.\n\n\
             To try it here: `POST /api/auth/login`, copy the `token` of the answer, \
-            press **Authorize** and paste it."
+            press **Authorize** and paste it.\n\n\
+            The same API is behind the map at `/`."
     ),
-    components(schemas(Problem)),
+    // `Problem` is what the refusals name, and the other two are what the events of a
+    // stream carry. None of them is the body of a response, where utoipa would find it.
+    components(schemas(Problem, RouteJob, RouteProgress)),
     modifiers(&BearerToken),
     tags(
         (name = "health", description = "Whether the API is up, and ready"),

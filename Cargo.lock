@@ -2675,6 +2675,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "chrono",
+ "futures-util",
  "jsonwebtoken",
  "rand 0.10.3",
  "rand_chacha 0.10.0",

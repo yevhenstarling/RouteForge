@@ -3,7 +3,8 @@
 //!
 //! It serves JSON under `/api`, describes itself at `/api/openapi.json`, and shows
 //! that description as Swagger UI at `/docs/`. `/healthz` and `/readyz` say whether it
-//! is up and whether it can work.
+//! is up and whether it can work. At `/` is the page with the map, which shows a plan
+//! while the solvers are at it, through two event streams (D50).
 //!
 //! When it starts it brings the database's schema up to what this build knows. The
 //! solvers apply none and wait for it (D32).
@@ -30,9 +31,12 @@ mod app;
 mod auth;
 mod config;
 mod error;
+mod events;
+mod page;
 mod request_id;
 mod routes;
 mod startup;
+mod stream;
 #[cfg(test)]
 mod testing;
 mod validate;
@@ -41,12 +45,18 @@ use std::io::IsTerminal;
 
 use actix_web::{HttpServer, web};
 use anyhow::Context;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{AppState, app};
 use crate::auth::{Passwords, Tokens};
 use crate::config::{Config, Secrets};
+use crate::events::Events;
+use crate::stream::Pace;
+
+/// How long the requests in hand are given to finish once the API is told to stop.
+/// `docker stop` waits ten seconds before it kills, and this has to be inside that.
+const STOP_WITHIN_SECS: u64 = 8;
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,17 +83,65 @@ async fn main() -> anyhow::Result<()> {
         passwords,
         limits: config.limits,
         worker_alive: config.worker_alive,
+        events: Events::new(),
+        pace: Pace::default(),
     });
+    let listening = state.events.listen(pool.clone());
+
+    // Told to stop, the server lets the requests it has finish first. An event stream
+    // has no end of its own, so the streams are ended before the server is told.
+    let stopping = {
+        let state = state.clone();
+        async move {
+            told_to_stop().await;
+            info!("told to stop");
+            state.events.close();
+        }
+    };
     let server = HttpServer::new(move || app(state.clone()))
+        .shutdown_signal(stopping)
+        .shutdown_timeout(STOP_WITHIN_SECS)
         .bind(config.bind)
         .with_context(|| format!("could not listen on {}", config.bind))?;
-    info!(address = %config.bind, "listening; Swagger UI is at /docs/");
+    info!(address = %config.bind, "listening; the page is at / and Swagger UI at /docs/");
 
-    // Ctrl-C and SIGTERM end this: the server lets the requests it has finish first.
     server.run().await.context("the server failed")?;
+    listening.abort();
     pool.close().await;
     info!("the API has stopped");
     Ok(())
+}
+
+/// Returns when the process is asked to stop: Ctrl-C anywhere, and SIGTERM where
+/// there is one, which is what `docker stop` sends. The solver listens the same way.
+async fn told_to_stop() {
+    let interrupted = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            // Without a handler only a kill ends the process, and that needs no help.
+            warn!(%error, "cannot hear Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminated) => {
+                tokio::select! {
+                    () = interrupted => {}
+                    _ = terminated.recv() => {}
+                }
+            }
+            Err(error) => {
+                warn!(%error, "cannot hear SIGTERM");
+                interrupted.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    interrupted.await;
 }
 
 /// Logs to standard output: lines for people by default, JSON with `LOG_FORMAT=json`.

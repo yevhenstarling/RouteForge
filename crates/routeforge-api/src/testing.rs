@@ -1,12 +1,14 @@
 //! Shared by the tests: the application inside a test, people with tokens, a small
-//! JSON client, and a stand-in for the solver.
+//! JSON client, a reader of event streams, and a stand-in for the solver.
 
+use std::pin::Pin;
 use std::time::Duration;
 
+use actix_web::body::{BoxBody, MessageBody};
 use actix_web::http::header::{self, HeaderMap};
 use actix_web::http::{Method, StatusCode};
 use actix_web::test::{self, TestRequest};
-use actix_web::web;
+use actix_web::web::{self, Bytes};
 use chrono::NaiveDate;
 use routeforge_domain::db::queue;
 use routeforge_domain::db::{couriers, depots, orders, plans, routes, users};
@@ -16,10 +18,13 @@ use routeforge_domain::{
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::task::JoinHandle;
 
 use crate::app::{AppState, app};
 use crate::auth::{Passwords, Tokens};
 use crate::config::Limits;
+use crate::events::{Events, Signal};
+use crate::stream::{EVENT_STREAM, Pace};
 
 /// The limits the application has in a test. Small, so that a test can step over them.
 pub(crate) const LIMITS: Limits = Limits {
@@ -29,6 +34,33 @@ pub(crate) const LIMITS: Limits = Limits {
 };
 
 const SECRET: &[u8] = b"the key of the tests, 32 bytes..";
+
+/// How long a login is good for in a test.
+pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(3_600);
+
+/// A lease no test outlives.
+pub(crate) const LONG: Duration = Duration::from_secs(600);
+
+/// Longer than any test runs: for what must not happen by itself.
+const NEVER: Duration = Duration::from_secs(3_600);
+
+/// The pace of the event streams in a test. A stream reads again at once when it is
+/// given a reason, and does nothing without one. So a test that waits for an event
+/// knows what brought it, and one that is not due is not sent behind its back.
+pub(crate) const PACE: Pace = Pace {
+    settle: Duration::from_millis(20),
+    plan_every: NEVER,
+    stats_every: NEVER,
+    keep_alive: NEVER,
+};
+
+/// Waits for something that must not take long, so that a test fails instead of
+/// hanging.
+pub(crate) async fn soon<F: Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(30), future)
+        .await
+        .expect("this should not have taken so long")
+}
 
 /// A day in October 2026.
 pub(crate) fn date(day: u32) -> NaiveDate {
@@ -42,17 +74,35 @@ pub(crate) struct Api {
 }
 
 /// The application on `pool`, with passwords that are cheap to hash.
+///
+/// Nothing listens to the database for it: see [`Api::listen`].
 pub(crate) fn api(pool: &PgPool) -> Api {
+    api_at(pool, PACE)
+}
+
+/// The application with event streams that pace themselves as said.
+pub(crate) fn api_at(pool: &PgPool, pace: Pace) -> Api {
     let state = web::Data::new(AppState {
         pool: pool.clone(),
-        tokens: Tokens::new(SECRET, Duration::from_secs(3_600)),
+        tokens: Tokens::new(SECRET, TOKEN_TTL),
         passwords: Passwords::cheap(),
         limits: LIMITS,
         worker_alive: Duration::from_secs(15),
+        events: Events::new(),
+        pace,
     });
     Api {
         pool: pool.clone(),
         state,
+    }
+}
+
+/// The API listening to the database, for as long as this is held.
+pub(crate) struct Listening(JoinHandle<()>);
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -80,10 +130,107 @@ pub(crate) struct Reply {
     pub(crate) status: StatusCode,
     pub(crate) headers: HeaderMap,
     pub(crate) content_type: Option<String>,
-    /// The body as it was sent.
+    /// The body as it was sent. Of an event stream, what it opened with.
+    pub(crate) bytes: Bytes,
+    /// The body as text.
     pub(crate) text: String,
     /// The body as JSON, or null if it is none.
     pub(crate) body: Value,
+}
+
+/// The next chunk of a body, or `None` at its end.
+async fn next_chunk(body: &mut BoxBody) -> Option<Bytes> {
+    let chunk = std::future::poll_fn(|context| Pin::new(&mut *body).poll_next(context)).await;
+    chunk.map(|chunk| chunk.expect("a body of the API does not fail half way"))
+}
+
+/// An event stream that a test has opened.
+pub(crate) struct Stream {
+    body: BoxBody,
+    /// What has arrived and has not been read as an event yet.
+    arrived: String,
+}
+
+/// One event of a stream.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Event {
+    pub(crate) name: String,
+    pub(crate) data: Value,
+}
+
+impl Stream {
+    /// The next block of the stream as it was sent, be it an event or a comment.
+    /// `None` when the stream has ended.
+    pub(crate) async fn block(&mut self) -> Option<String> {
+        loop {
+            if let Some((block, rest)) = self.arrived.split_once("\n\n") {
+                let block = block.to_owned();
+                self.arrived = rest.to_owned();
+                return Some(block);
+            }
+            let chunk = next_chunk(&mut self.body).await?;
+            let text = std::str::from_utf8(&chunk).expect("a stream is text");
+            self.arrived.push_str(text);
+        }
+    }
+
+    /// The next event, or `None` when the stream has ended. Comments are passed over.
+    async fn event(&mut self) -> Option<Event> {
+        loop {
+            let block = self.block().await?;
+            if block.starts_with(':') {
+                continue;
+            }
+            let (mut name, mut data) = (None, None);
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    name = Some(value.to_owned());
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data = Some(serde_json::from_str(value).expect("the data of an event is JSON"));
+                } else {
+                    panic!("a line of an event that is neither its name nor its data: {line:?}");
+                }
+            }
+            return Some(Event {
+                name: name.expect("an event has a name"),
+                data: data.expect("an event has data"),
+            });
+        }
+    }
+
+    /// The next event. It is a failure if none comes, or if the stream ends.
+    pub(crate) async fn next(&mut self) -> Event {
+        soon(self.event()).await.expect("the stream has ended")
+    }
+
+    /// The data of the next event, which has to be one of this name.
+    pub(crate) async fn next_of(&mut self, name: &str) -> Value {
+        let event = self.next().await;
+        assert_eq!(event.name, name, "{}", event.data);
+        event.data
+    }
+
+    /// Reads on until an event is the one `wanted`, and gives its data. What comes
+    /// before it is passed over: a stream may say in two events what it could have
+    /// said in one, depending on how its reads fall.
+    pub(crate) async fn until(&mut self, name: &str, wanted: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            let event = self.next().await;
+            if event.name == name && wanted(&event.data) {
+                return event.data;
+            }
+        }
+    }
+
+    /// Whether the stream sends no event for `span`.
+    pub(crate) async fn is_quiet_for(&mut self, span: Duration) -> bool {
+        tokio::time::timeout(span, self.event()).await.is_err()
+    }
+
+    /// Waits for the stream to end, passing over what it still sends.
+    pub(crate) async fn ended(&mut self) {
+        soon(async { while self.event().await.is_some() {} }).await;
+    }
 }
 
 impl Api {
@@ -100,15 +247,61 @@ impl Api {
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let bytes = test::read_body(response).await;
+        let bytes = if content_type.as_deref() == Some(EVENT_STREAM) {
+            // An event stream has no end to read to. What it opens with is taken, and
+            // the stream is dropped with the rest of the response.
+            let mut body = response.into_body().boxed();
+            next_chunk(&mut body).await.unwrap_or_default()
+        } else {
+            test::read_body(response).await
+        };
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let body = serde_json::from_str(&text).unwrap_or(Value::Null);
         Reply {
             status,
             headers,
             content_type,
+            bytes,
             text,
             body,
+        }
+    }
+
+    /// Opens an event stream as `who`. It is a failure if the answer is anything else.
+    pub(crate) async fn open(&self, who: &Actor, path: &str) -> Stream {
+        let service = test::init_service(app(self.state.clone())).await;
+        let request = request("GET", path, Some(who)).to_request();
+        let response = test::call_service(&service, request).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let content_type = response.headers().get(header::CONTENT_TYPE);
+        assert_eq!(content_type.expect("a content type"), EVENT_STREAM);
+        Stream {
+            body: response.into_body().boxed(),
+            arrived: String::new(),
+        }
+    }
+
+    /// The hub of the application, for a test that feeds it by hand.
+    pub(crate) fn events(&self) -> &Events {
+        &self.state.events
+    }
+
+    /// Starts the one connection that listens to the database, as `main` does, and
+    /// returns once it listens.
+    pub(crate) async fn listen(&self) -> Listening {
+        let mut subscription = self.state.events.subscribe();
+        let listening = Listening(self.state.events.listen(self.pool.clone()));
+        // Its first word, which it says when it has begun to listen.
+        assert_eq!(soon(subscription.signals.recv()).await, Ok(Signal::Missed));
+        listening
+    }
+
+    /// A token for `who` that expires in `seconds` from now.
+    pub(crate) fn expiring_in(&self, who: &Actor, seconds: u64) -> Actor {
+        let issued_at = jsonwebtoken::get_current_timestamp() + seconds - TOKEN_TTL.as_secs();
+        Actor {
+            user: who.user.clone(),
+            token: self.state.tokens.issued_at(&who.user, issued_at),
         }
     }
 
@@ -201,12 +394,9 @@ pub(crate) fn new_order(client_id: UserId, day: u32) -> NewOrder {
     }
 }
 
-/// Gives orders to a plan of that day, as clustering does: they are planned afterwards.
-pub(crate) async fn take_into_a_plan(
-    pool: &PgPool,
-    day: u32,
-    order_ids: &[impl AsRef<str>],
-) -> Plan {
+/// What a plan for that day needs, with an operator and a depot of its own, to store
+/// without the API.
+pub(crate) async fn new_plan(pool: &PgPool, day: u32) -> NewPlan {
     let operator = NewUser {
         email: format!("{}@example.com", UserId::generate()),
         password_hash: "$argon2id$not-a-real-hash".to_owned(),
@@ -216,13 +406,22 @@ pub(crate) async fn take_into_a_plan(
         name: "Depot".to_owned(),
         location: LatLon::new(50.45, 30.52).unwrap(),
     };
-    let new = NewPlan {
+    NewPlan {
         service_date: date(day),
         depot_id: depots::set(pool, &depot).await.unwrap().id,
         seed: 2026,
         budget: RouteBudget::new(None, Some(1_000)).unwrap(),
         created_by: users::create(pool, &operator).await.unwrap().id,
-    };
+    }
+}
+
+/// Gives orders to a plan of that day, as clustering does: they are planned afterwards.
+pub(crate) async fn take_into_a_plan(
+    pool: &PgPool,
+    day: u32,
+    order_ids: &[impl AsRef<str>],
+) -> Plan {
+    let new = new_plan(pool, day).await;
     let plan = plans::create(pool, &new).await.unwrap();
 
     let ids: Vec<OrderId> = order_ids

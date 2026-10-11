@@ -18,8 +18,11 @@ use crate::config::AdminSeed;
 use crate::error::ApiError;
 use crate::validate;
 
-/// Connections the API keeps to the database, at most.
+/// Connections the API keeps to the database for its requests, at most.
 const CONNECTIONS: u32 = 10;
+
+/// One connection more does nothing but listen, for the event streams (D50).
+const LISTENING: u32 = 1;
 
 /// A request that gets no connection within this long is answered with an error.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,7 +37,7 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) async fn connect(url: &str) -> anyhow::Result<PgPool> {
     let database = PgConnectOptions::from_str(url).context("DATABASE_URL is not a URL")?;
     PgPoolOptions::new()
-        .max_connections(CONNECTIONS)
+        .max_connections(CONNECTIONS + LISTENING)
         .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(database)
         .await

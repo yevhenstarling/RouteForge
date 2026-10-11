@@ -162,6 +162,39 @@
         "format": "uuid",
         "type": "string"
       },
+      "JobProgress": {
+        "description": "How far a running job has got, as its worker last reported with a heartbeat.",
+        "properties": {
+          "best_cost_m": {
+            "description": "The length of the best route so far, in metres.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "iterations": {
+            "description": "Candidate moves evaluated so far.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "iterations",
+          "best_cost_m"
+        ],
+        "type": "object"
+      },
+      "JobStatus": {
+        "description": "Where a job stands.",
+        "enum": [
+          "queued",
+          "running",
+          "done",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
       "LatLon": {
         "description": "A position on Earth in degrees.\n\nThe latitude is between -90 and 90 and the longitude between -180 and 180. A value\nof this type holds nothing else, NaN included: [`LatLon::new`] and deserialization\nboth check.",
         "properties": {
@@ -660,6 +693,112 @@
         "format": "uuid",
         "type": "string"
       },
+      "RouteJob": {
+        "description": "A route job as someone watching its plan sees it: whose route it is, which stops it\nhas to put in order, and how the search for that order stands.",
+        "properties": {
+          "attempt": {
+            "description": "How many times the job has been claimed.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "courier_id": {
+            "$ref": "#/components/schemas/CourierId"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "order_ids": {
+            "description": "The courier's orders, as clustering left them. The `order` of a `RouteProgress`\ncounts into this list.",
+            "items": {
+              "$ref": "#/components/schemas/OrderId"
+            },
+            "type": "array"
+          },
+          "progress": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/JobProgress",
+                "description": "How far the search has got, as the last heartbeat stored it. That is a few\nseconds old at most, and what is announced in between is fresher."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "worker_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkerId",
+                "description": "The worker of the latest claim."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "job_id",
+          "courier_id",
+          "order_ids",
+          "status",
+          "attempt"
+        ],
+        "type": "object"
+      },
+      "RouteProgress": {
+        "description": "How far the search for one route has got, as its worker announces it a few times a\nsecond while it searches (D48, D49).\n\nNothing stores it. The next one replaces it, and one that is lost is not missed.",
+        "properties": {
+          "attempt": {
+            "description": "Which claim of the job this comes from (D22). A worker that has lost the job may\ngo on announcing until its next heartbeat tells it so. What it says then has a\nlower number than the job has.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "best_cost_m": {
+            "description": "The length of the best route so far, in metres.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "iterations": {
+            "description": "Candidate moves evaluated so far.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "order": {
+            "description": "The best route so far: its stops in calling order, each as its position in the\n`order_ids` of the job. Left out when it would not fit a notification.",
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "plan_id": {
+            "$ref": "#/components/schemas/PlanId"
+          }
+        },
+        "required": [
+          "plan_id",
+          "job_id",
+          "attempt",
+          "iterations",
+          "best_cost_m"
+        ],
+        "type": "object"
+      },
       "RouteStop": {
         "description": "One call on a route, with what a map needs to draw it.",
         "properties": {
@@ -828,7 +967,7 @@
     }
   },
   "info": {
-    "description": "Turns a day's parcel orders into courier routes.\n\nTo try it here: `POST /api/auth/login`, copy the `token` of the answer, press **Authorize** and paste it.",
+    "description": "Turns a day's parcel orders into courier routes.\n\nTo try it here: `POST /api/auth/login`, copy the `token` of the answer, press **Authorize** and paste it.\n\nThe same API is behind the map at `/`.",
     "license": {
       "name": ""
     },
@@ -1667,6 +1806,66 @@
       }
     },
     "/api/plans": {
+      "get": {
+        "description": "Newest first. A day has one plan in progress at most. The others are the ones it\nhad before: done, discarded, failed or cancelled.",
+        "operationId": "list_plans",
+        "parameters": [
+          {
+            "description": "The day the plans are for.",
+            "in": "query",
+            "name": "service_date",
+            "required": true,
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Plan"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The plans of the day, newest first"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No token was sent, or the one sent is not valid or has expired"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller's role does not allow this"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "List the plans of a day",
+        "tags": [
+          "plans"
+        ]
+      },
       "post": {
         "description": "Stores the plan and hands it to the solvers. They take the orders of the day that\nare pending, give each active courier the ones that fit it, and search for the\norder to call in. Read the plan again to see it go from `queued` to `routing` to\n`done`.\n\nA day has one plan in progress at a time. The `X-Request-Id` of this request is\nkept on the plan's jobs, so the solvers' logs can be searched for it.",
         "operationId": "create_plan",
@@ -1967,6 +2166,74 @@
         ]
       }
     },
+    "/api/plans/{id}/events": {
+      "get": {
+        "description": "An event stream (`text/event-stream`) that stays open, for showing a plan while\nthe solvers are at it. It opens with the plan as it is, and then sends what\nchanges:\n\n- `plan`: the plan, as `GET /api/plans/{id}` gives it, whenever its status or its\n  counts have changed. When `routes_done` has grown, one route more can be read\n  from `/api/plans/{id}/routes`.\n- `jobs`: the plan's route jobs, an array of `RouteJob`, whenever one of them was\n  claimed, stored, retried or stopped.\n- `progress`: a `RouteProgress`, a few times a second for each route that is being\n  searched for. It says how far the search has got and which route is the best so\n  far.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires. Opened again, it starts\nwith the plan as it is then.\n\n`EventSource` in a browser cannot send the token. The page reads the stream with\n`fetch`.",
+        "operationId": "watch_plan",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The events, for as long as the stream is read"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No token was sent, or the one sent is not valid or has expired"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller's role does not allow this"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "There is no such thing, or none the caller may know of"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Watch a plan",
+        "tags": [
+          "plans"
+        ]
+      }
+    },
     "/api/plans/{id}/routes": {
       "get": {
         "description": "Those that are stored so far, each with its stops in the order the courier calls.\nA plan that failed, was cancelled or was discarded has none.",
@@ -2080,6 +2347,53 @@
           }
         ],
         "summary": "Read the state of the queue and its workers",
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/api/system/stats/events": {
+      "get": {
+        "description": "An event stream (`text/event-stream`) that stays open. It opens with a `stats`\nevent, which is what `GET /api/system/stats` gives, and sends another whenever that\nhas changed: at once when a job is queued, claimed or finished, and within a couple\nof seconds when a worker has come or has fallen silent.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
+        "operationId": "watch_system_stats",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The events, for as long as the stream is read"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No token was sent, or the one sent is not valid or has expired"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller's role does not allow this"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Watch the queue and its workers",
         "tags": [
           "system"
         ]

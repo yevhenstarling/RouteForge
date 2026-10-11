@@ -134,8 +134,8 @@ pub struct Job {
 pub struct RouteJob {
     pub job_id: JobId,
     pub courier_id: CourierId,
-    /// The courier's orders, as clustering left them. The `order` of a
-    /// [`RouteProgress`] counts into this list.
+    /// The courier's orders, as clustering left them. The `order` of a `RouteProgress`
+    /// counts into this list.
     pub order_ids: Vec<OrderId>,
     pub status: JobStatus,
     /// How many times the job has been claimed.
