@@ -11,18 +11,23 @@ pub struct UnknownVariant {
 
 /// Declares an enumeration together with the text of each value.
 ///
-/// The same text is used in JSON, in the database and by `Display` and `FromStr`, so
-/// the four cannot drift apart. The schema repeats it in a `CHECK`, and a test in
-/// `db` inserts every value to keep the two in step.
+/// The same text is used in JSON, in the database, in the OpenAPI document and by
+/// `Display` and `FromStr`, so they cannot drift apart. The schema repeats it in a
+/// `CHECK`, and a test in `db` inserts every value to keep the two in step.
+///
+/// The text is taken as a token and not as a `literal`. A literal is handed on wrapped
+/// in an invisible group, which serde looks into and utoipa does not: the document
+/// would name the values `Queued` and `Routing`, as the variants are spelled.
 macro_rules! text_enum {
     (
         $(#[$doc:meta])*
         $name:ident {
-            $($(#[$variant_doc:meta])* $variant:ident => $text:literal),+ $(,)?
+            $($(#[$variant_doc:meta])* $variant:ident => $text:tt),+ $(,)?
         }
     ) => {
         $(#[$doc])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(::utoipa::ToSchema))]
         pub enum $name {
             $(
                 $(#[$variant_doc])*

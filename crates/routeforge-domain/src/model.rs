@@ -60,6 +60,9 @@ text_enum! {
         Failed => "failed",
         /// Stopped by an operator. The plan's orders are pending again.
         Cancelled => "cancelled",
+        /// Was done, and an operator took it back (D30). Its routes are deleted and
+        /// its orders are pending again.
+        Discarded => "discarded",
     }
 }
 
@@ -73,6 +76,7 @@ impl PlanStatus {
 
 /// Someone who can log in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct User {
     pub id: UserId,
     /// In lower case.
@@ -121,6 +125,7 @@ impl fmt::Debug for Credentials {
 /// A depot row is never changed. Moving the depot adds a row, and the newest row is
 /// the current depot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Depot {
     pub id: DepotId,
     pub name: String,
@@ -130,12 +135,14 @@ pub struct Depot {
 
 /// What setting the depot needs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NewDepot {
     pub name: String,
     pub location: LatLon,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Courier {
     pub id: CourierId,
     pub name: String,
@@ -148,14 +155,17 @@ pub struct Courier {
 
 /// What creating a courier needs. A new courier is active.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NewCourier {
     pub name: String,
     /// At least 1.
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
     pub capacity: u32,
 }
 
 /// One parcel to deliver or to pick up: one stop on a route (D1).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Order {
     pub id: OrderId,
     pub client_id: UserId,
@@ -186,11 +196,27 @@ pub struct NewOrder {
 }
 
 /// Which orders to list. Every field that is set narrows the list.
+///
+/// Orders are listed oldest first, which is the order of their ids (D11). So a list is
+/// read in pages by asking for at most `limit` orders `after` the last one of the page
+/// before.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
 pub struct OrderFilter {
+    /// Only the orders of this client.
+    #[cfg_attr(feature = "openapi", param(value_type = Option<Uuid>))]
     pub client_id: Option<UserId>,
+    /// Only the orders for this day.
     pub service_date: Option<NaiveDate>,
+    /// Only the orders that stand like this.
+    #[cfg_attr(feature = "openapi", param(inline))]
     pub status: Option<OrderStatus>,
+    /// Only the orders created after the one with this id.
+    #[cfg_attr(feature = "openapi", param(value_type = Option<Uuid>))]
+    pub after: Option<OrderId>,
+    /// At most this many orders.
+    pub limit: Option<u32>,
 }
 
 /// How long the search for each route of a plan may go on (D31).
@@ -203,9 +229,13 @@ pub struct OrderFilter {
 /// With moves alone, the same seed gives the same route (D5). A span of time cuts the
 /// search wherever the machine has got to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(try_from = "UncheckedBudget")]
 pub struct RouteBudget {
+    /// Wall-clock time for one route, in milliseconds.
     time_ms: Option<u32>,
+    /// Candidate moves for one route. With this limit alone, the same seed gives the
+    /// same route.
     iterations: Option<u64>,
 }
 
@@ -259,6 +289,7 @@ impl RouteBudget {
 
 /// One planning run: the orders of a service date turned into courier routes (D2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Plan {
     pub id: PlanId,
     pub service_date: NaiveDate,
@@ -281,7 +312,8 @@ pub struct Plan {
     /// Why the plan failed.
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
-    /// When the plan was done, failed or cancelled.
+    /// When the plan was done, failed or cancelled. A discarded plan keeps the time
+    /// it was done.
     pub finished_at: Option<DateTime<Utc>>,
 }
 
@@ -305,6 +337,7 @@ pub struct PlanCounts {
 
 /// One courier's round trip from the depot through its stops.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Route {
     pub id: RouteId,
     pub plan_id: PlanId,
@@ -317,6 +350,7 @@ pub struct Route {
 
 /// One call on a route, with what a map needs to draw it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RouteStop {
     pub order_id: OrderId,
     pub kind: OrderKind,

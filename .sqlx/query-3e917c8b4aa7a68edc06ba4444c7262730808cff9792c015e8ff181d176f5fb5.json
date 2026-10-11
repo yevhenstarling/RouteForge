@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE plans SET status = 'discarded' WHERE id = $1 AND status = 'done'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e917c8b4aa7a68edc06ba4444c7262730808cff9792c015e8ff181d176f5fb5"
+}

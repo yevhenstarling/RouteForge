@@ -5,7 +5,8 @@
 //! steps, [`start_routing`] and [`route_finished`], are made inside the transaction
 //! that completes the job, through [`Completion::conn`](super::queue::Completion::conn).
 //! The other ways out, failed and cancelled, are taken by the queue: see
-//! [`queue::fail`] and [`queue::cancel_plan`].
+//! [`queue::fail`] and [`queue::cancel_plan`]. So is the one way on from done,
+//! [`queue::discard_plan`].
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgExecutor, PgPool};

@@ -11,6 +11,9 @@ publish.workspace = true
 # PostgreSQL repositories, migrations and the job queue.
 # Enabled by routeforge-api and routeforge-solver, never by routeforge-bot.
 db = ["dep:sqlx"]
+# OpenAPI schemas for the types the HTTP API sends and receives.
+# Enabled by routeforge-api, which serves the document.
+openapi = ["dep:utoipa"]
 
 [dependencies]
 chrono.workspace = true
@@ -18,13 +21,15 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, optional = true }
 thiserror.workspace = true
+utoipa = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-# The crate's own tests always get the `db` feature, so `cargo test -p routeforge-domain`
-# cannot skip the database tests by leaving it out. Dev-dependencies do not reach the bot.
-routeforge-domain = { workspace = true, features = ["db"] }
+# The crate's own tests always get both features, so `cargo test -p routeforge-domain`
+# cannot skip the database tests, or the schemas, by leaving one out. Dev-dependencies
+# do not reach the bot.
+routeforge-domain = { workspace = true, features = ["db", "openapi"] }
 tokio.workspace = true
 
 [lints]

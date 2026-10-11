@@ -91,6 +91,9 @@ pub async fn get(executor: impl PgExecutor<'_>, id: OrderId) -> Result<Option<Or
 }
 
 /// The orders that pass the filter, oldest first.
+///
+/// With a `limit` it is one page of them, and the id of its last order is the `after`
+/// that asks for the next page. Without one it is all of them.
 pub async fn list(
     executor: impl PgExecutor<'_>,
     filter: &OrderFilter,
@@ -103,10 +106,15 @@ pub async fn list(
          WHERE ($1::uuid IS NULL OR client_id = $1)
            AND ($2::date IS NULL OR service_date = $2)
            AND ($3::text IS NULL OR status = $3)
-         ORDER BY id",
+           AND ($4::uuid IS NULL OR id > $4)
+         ORDER BY id
+         LIMIT $5",
         filter.client_id.map(|id| id.0),
         filter.service_date,
         filter.status.map(OrderStatus::as_str),
+        filter.after.map(|id| id.0),
+        // No limit is a NULL, which PostgreSQL takes as all of them.
+        filter.limit.map(i64::from),
     )
     .fetch_all(executor)
     .await?;
@@ -325,6 +333,7 @@ mod tests {
                 client_id: Some(bob.id),
                 service_date: Some(date(12)),
                 status: Some(OrderStatus::Cancelled),
+                ..OrderFilter::default()
             })
             .await,
             [bob_withdrawn.id]
@@ -337,6 +346,40 @@ mod tests {
             .await
             .is_empty()
         );
+    }
+
+    #[sqlx::test]
+    async fn a_list_is_read_in_pages_by_the_id_of_the_last_order(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let mut placed = Vec::new();
+        for _ in 0..5 {
+            placed.push(testing::order(&pool, client.id, date(12)).await.id);
+        }
+        // Newer than all of them, and kept out by the filter.
+        testing::order(&pool, client.id, date(13)).await;
+
+        let page = async |after: Option<OrderId>, limit: Option<u32>| -> Vec<OrderId> {
+            let filter = OrderFilter {
+                service_date: Some(date(12)),
+                after,
+                limit,
+                ..OrderFilter::default()
+            };
+            let listed = list(&pool, &filter).await.unwrap();
+            listed.into_iter().map(|order| order.id).collect()
+        };
+
+        assert_eq!(page(None, Some(2)).await, placed[..2]);
+        assert_eq!(page(Some(placed[1]), Some(2)).await, placed[2..4]);
+        assert_eq!(page(Some(placed[3]), Some(2)).await, placed[4..]);
+        assert!(page(Some(placed[4]), Some(2)).await.is_empty());
+
+        // Without a limit it is everything that follows, and a limit can be anything.
+        assert_eq!(page(Some(placed[0]), None).await, placed[1..]);
+        assert_eq!(page(None, Some(u32::MAX)).await, placed);
+        assert!(page(None, Some(0)).await.is_empty());
+        // An id that names no order is still a place in the order of ids.
+        assert!(page(Some(OrderId::generate()), None).await.is_empty());
     }
 
     #[sqlx::test]
