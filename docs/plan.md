@@ -15,6 +15,7 @@ Confirmed with the project owner:
 - **Order model.** One order is one stop: a delivery from the depot or a pickup back to it. Couriers start and end at the depot. This is capacitated vehicle routing, which is what sweep + 2-opt/Or-opt/SA solves.
 - **Job unit.** A plan request enqueues one `plan` job. A worker runs sweep clustering and, in the same transaction, enqueues one `route` job per cluster. Each worker then optimizes one courier's route with its own time budget, so more workers finish a plan sooner.
 - **Docker.** Docker Desktop with the WSL2 backend.
+- **Planning a date again.** A plan that is done can be discarded: its routes are deleted, its orders are pending again, and the date is planned afresh. Without a discard, a later plan for the date takes only the orders that are still pending (D30).
 
 Derived from the description:
 
@@ -130,7 +131,7 @@ What later phases need from it:
 - Phases 3 and 4: database tests in other crates use `#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]`. A test pool has five connections, so a test must not hold more than that at once.
 - Phase 4: `plans::submit` is the whole "create a plan" step. `DbError::ActivePlanExists` and `DbError::EmailTaken` are the two conflicts to turn into `409`. `orders::cancel` returns `false` for an order that is no longer pending.
 - Phase 4: the DTOs have no OpenAPI derives yet. Add `utoipa` to the domain crate behind a feature. `orders::list` has no paging, and the queue has no depth statistics.
-- Phase 4: decide whether a plan that is done may be replaced (D20).
+- Phase 4: discarding a plan that is done is decided (D30) and not built. The undo exists as `end_plan` in `db::queue`, for plans in progress only. Discarding needs a `discarded` plan status, so a new migration for the two `CHECK`s on `plans` that list the statuses, and a `queue::discard_plan` beside `cancel_plan`.
 
 ## Phase 3: solver worker (`routeforge-solver`)
 
@@ -148,7 +149,7 @@ What later phases need from it:
 - Skeleton: config from env, pool, migrations at startup, request-id middleware (accept or generate `X-Request-Id`, echo it, put it in the span), problem+json errors, `/healthz`, `/readyz`.
 - Auth: register and login, argon2id hashing off the async threads, JWT with a role claim, an `AuthUser` extractor, role and ownership checks. Admin seeded from env.
 - Resources: orders (clients see their own; operators and admins see all), couriers, depot, users.
-- Plans: create (plan row, `plan` job and `NOTIFY` in one transaction; `409` when the date already has an active plan; the request id is stored on the job), get, list routes with ordered stops, cancel.
+- Plans: create (plan row, `plan` job and `NOTIFY` in one transaction; `409` when the date already has an active plan; the request id is stored on the job), get, list routes with ordered stops, cancel, discard (D30: a plan that is done only; its routes are deleted and its orders are pending again).
 - System stats: queue depth by status, workers alive and busy.
 - OpenAPI through utoipa on every DTO and handler; Swagger UI at `/docs` with vendored assets.
 - Demo data: an admin endpoint that generates N random orders around the depot from a seed. This lives in the API so no sixth crate is needed.
@@ -166,7 +167,7 @@ What later phases need from it:
 ## Phase 6: one-command stack, scaling and failure demo
 
 - Compose: `db`, `api`, `solver` (no fixed name or ports, so it scales), `bot`; healthchecks and `depends_on: service_healthy`.
-- Scaling run: the same seeded plan with 1 and with 4 solvers, time to completion recorded.
+- Scaling run: the same seeded plan with 1 and with 4 solvers, time to completion recorded. The plan is discarded between the two runs (D30).
 - Failure run: `docker kill` a solver mid-solve; the lease expires and another worker finishes. Scripted in `scripts/demo.ps1` and `scripts/demo.sh`.
 - **Done when:** a fresh clone needs only `docker compose up --build --scale solver=4`.
 
@@ -210,8 +211,8 @@ What later phases need from it:
 
 1. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` with the compose `db` up, and `cargo bench -p routeforge-tsp`.
 2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, generate 300 orders, press Plan. Routes appear and improve live; `/docs` lists every endpoint.
-3. Determinism: run the same plan twice with the same seed and an iteration budget; the routes are identical.
-4. Scaling: the same plan with 1 solver and with 4; completion time drops until workers outnumber routes.
+3. Determinism: run a plan, discard it (D30), and run it again with the same seed and an iteration budget; the routes are identical.
+4. Scaling: the same plan with 1 solver and with 4, discarded in between; completion time drops until workers outnumber routes.
 5. Failure: `docker kill` one solver mid-solve; within the lease time another worker takes over and every order is still routed exactly once.
 6. Tracing: take the `X-Request-Id` of the plan request and find it in the logs of the API and of every solver that worked on that plan.
 7. Offline: disconnect the network and repeat step 2. Routes draw without map tiles and the bot idles.

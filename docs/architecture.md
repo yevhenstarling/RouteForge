@@ -208,7 +208,7 @@ Why:
 - A plan takes its orders under a row lock (`orders::lock_pending`). Without it a client could cancel an order between the moment it was counted into a cluster and the moment it was marked. With it one of the two is first and the other sees that.
 - After a plan that undid itself the date looks as it did before, and can simply be planned again. Half a plan would need rules of its own: which of its routes count, and which orders are free.
 
-Left open for Phase 4: whether an operator may replace a plan that is done. The schema allows both answers. As it stands, a second plan for a date takes the orders that are still pending.
+A plan that is done keeps its orders. A later plan for the same date takes the orders that are still pending and adds its routes to those that are there. Getting the orders of a done plan back is D30.
 
 ### D21. The depot has versions (in place)
 
@@ -307,3 +307,23 @@ Why:
 - The table is directed because road distances are (D14). The domain crate may not use `routeforge-tsp` (see Crates), so it cannot return a `DistanceMatrix`. The solver builds one, and symmetrizes first when it has to.
 - The sweep needs the direction of each stop from the depot and a rough distance. On an equirectangular map round the depot, distances are within 2 % of the globe for stops up to 0.3 degrees from the depot each way, which is 33 km to the north and south, at latitudes up to 60 degrees. A property test checks that. A real map projection would be a dependency for nothing.
 - A sphere is within about 0.5 % of the ellipsoid. A straight line differs from a road by far more.
+
+### D30. A plan that is done can be discarded, and its date planned again (planned)
+
+Decided by the project owner on 2026-10-11. Phase 4 builds it.
+
+Discarding undoes a plan that is done, the way a plan that fails or is cancelled undoes itself (D20): its routes are deleted and its orders are pending again. The plan row stays, with the status `discarded`. The operator then plans the date again, and the new plan takes every pending order of the date. Only a plan that is done can be discarded. One that is still in progress is cancelled instead.
+
+A date whose plan is not discarded is planned as before: a later plan takes the orders that are still pending.
+
+Why:
+
+- Without it a plan could never be corrected. After a courier is added, or after a run that was given too little time, the date could not be planned afresh, and an order that a plan holds could never be withdrawn.
+- The verification steps in `docs/plan.md` plan the same orders twice: a second time with the same seed, and once with one solver and once with four. The second run needs the orders back.
+- Keeping the old routes until the new plan is done would leave no moment without routes. It would also put an order on two routes at once, an old one and a new one, which is what the unique constraint of D20 rules out. The price of a discard is that the date has no routes until the new plan is done.
+- Discarding and planning stay two steps, so each does one thing. A discard made by mistake costs the routes and nothing else: the orders are all there, pending.
+
+What it needs:
+
+- A `discarded` value for `plans.status`. The two `CHECK`s that list the statuses, `plans_status_check` and `plans_finished_check`, are in a migration that is merged, so this is a new migration.
+- `queue::discard_plan` beside `queue::cancel_plan`. The undo exists as `end_plan` in `db::queue`, where it is limited to plans that are queued or routing. Like every operation on a plan, it locks the plan row first (D24).
