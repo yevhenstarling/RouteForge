@@ -13,11 +13,27 @@ cargo test --workspace --locked
 
 From Phase 2 on, tests need Postgres: `docker compose up -d db`, with `.env` copied from `.env.example`.
 
-From Phase 3 on there is an image too. After a change to the dependencies or to the `Dockerfile`, build it: `docker compose build solver`.
+From Phase 3 on there are images too. After a change to the dependencies or to the `Dockerfile`, build them: `docker compose build`. Run that from PowerShell. From Git Bash or `cmd` it can end with `additional privileges requested: pass "--allow=fs.read=Dockerfile"`, which means that the shell's working directory is spelled with a lower-case drive letter; `BUILDX_BAKE_ENTITLEMENTS_FS=0` in the environment gets round it (see the traps in `docs/plan.md`).
 
-## Running the API
+## Running it
 
-The API applies the schema when it starts, and a solver started against a database without it waits (D32). The API has no image and no compose service before Phase 6, so it runs on the host, with its settings in the shell:
+The whole stack, as somebody who has just cloned the repository gets it (D54):
+
+```sh
+docker compose up --build --scale solver=4
+```
+
+The page with the map is then at `http://127.0.0.1:8080/` and Swagger UI at `http://127.0.0.1:8080/docs/`. The admin is `admin@example.com` with the password `routeforge`, unless `.env` says otherwise. On a database with no depot and no courier, an admin gets a button on the page that sets up a demo city.
+
+`scripts/demo.ps1` (or `.sh`, which needs `curl` and `jq`) makes the scaling run and the failure run on that stack (D57). It plans tomorrow, and on that day it cancels and discards the plans that are in its way.
+
+An image holds what was in the working tree when it was built. After a change, `--build` again.
+
+The compose file names its project `routeforge`, so `docker compose` and the scripts act on the development stack wherever they are run from, and `docker compose down -v` there deletes the development database. To try something on a database of its own, set `COMPOSE_PROJECT_NAME`, `POSTGRES_PORT` and `API_PORT` in the shell first, for example to `routeforge-try`, `5433` and `8081`.
+
+### The API on the host
+
+For work on the API it is quicker to run it outside Docker, beside the database and the solvers of the stack. Both want port 8080, so stop the one in the stack first, and the bot that waits for it: `docker compose stop api bot`. The API applies the schema when it starts, and a solver started against a database without it waits (D32). Its settings come from the shell:
 
 ```powershell
 $env:DATABASE_URL = 'postgres://routeforge:routeforge@127.0.0.1:5432/routeforge'
@@ -26,11 +42,9 @@ $env:ADMIN_EMAIL = 'admin@example.com'; $env:ADMIN_PASSWORD = 'a password of you
 cargo run -p routeforge-api
 ```
 
-In bash it is `export NAME=value` for each. The API does not read `.env`.
+In bash it is `export NAME=value` for each. The API does not read `.env`. The settings are listed at the top of `crates/routeforge-api/src/main.rs` and in `.env.example`.
 
-The page with the map is then at `http://127.0.0.1:8080/` and Swagger UI at `http://127.0.0.1:8080/docs/`. The settings are listed at the top of `crates/routeforge-api/src/main.rs` and in `.env.example`. The solvers run beside it with `docker compose up -d solver`.
-
-The page is compiled into the API (D52), so a change to `web/index.html` shows after the API has been built and started again. On a database with no depot and no courier, an admin gets a button on the page that sets up a demo city.
+The page is compiled into the API (D52), so a change to `web/index.html` shows after the API has been built and started again.
 
 ## Rules that are easy to break
 
@@ -51,6 +65,9 @@ The page is compiled into the API (D52), so a change to `web/index.html` shows a
 - A file added under `web/` needs a row in `FILES` in `crates/routeforge-api/src/page.rs`. Files under `web/vendor/` are kept as they were released: do not edit them (D52).
 - The page asks no other host for anything but map tiles, and puts text from the API into the document as text, never as HTML (D52). After changing `web/index.html`, try it in a browser: the tests check that the page is served and what it loads, not what it does.
 - `rust-toolchain.toml` and the base image in the `Dockerfile` name the same compiler. Change them together (D10).
+- `docker compose up` has to work on a clone with no `.env`. A variable the compose file hands to a service needs a fallback there when the binary has no default for it. A test in `crates/routeforge-api/src/config.rs` holds the fallbacks of the `api` service to what the API starts with (D54).
+- A service is the first process in its container, and the first process is not ended by a signal it does not listen for. A binary has to hear SIGTERM itself, or stopping the stack waits ten seconds for it (D35, D51, D56).
+- The runtime image gets no tools. What a health check needs to ask is asked by the binary itself, as `routeforge-api healthcheck` does (D55).
 
 ## Dependencies
 
