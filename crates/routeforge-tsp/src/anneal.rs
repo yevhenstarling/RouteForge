@@ -59,7 +59,7 @@ pub fn anneal(matrix: &DistanceMatrix, tour: &mut Tour, seed: u64, control: &mut
         let mut temperature = start_temperature;
         for _ in 0..LEVELS {
             for _ in 0..moves_per_level {
-                if !control.spend(1, tour.cost) {
+                if !control.spend(1, tour) {
                     return;
                 }
                 let change = draw(&mut rng, nodes);

@@ -209,7 +209,7 @@ fn search(
     // thread that runs the search, and not handed over to it.
     let mut control = Control::max_iterations(budget.iterations().unwrap_or(u64::MAX))
         .with_cancel(cancel)
-        .with_progress(|at| {
+        .with_progress(|at, _| {
             progress.send_replace(Some(JobProgress {
                 iterations: at.iterations,
                 best_cost_m: at.best_cost,

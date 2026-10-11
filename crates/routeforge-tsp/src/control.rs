@@ -4,6 +4,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::tour::Tour;
+
 /// How many iterations pass between two looks at the cancel flag and the clock.
 pub(crate) const POLL_INTERVAL: u64 = 1 << 14;
 
@@ -18,7 +20,8 @@ pub enum StopReason {
     Cancelled,
 }
 
-/// A snapshot of a running search, handed to the progress callback.
+/// How far a running search has got. The progress callback is handed this together
+/// with the best tour so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Progress {
     /// Candidate moves evaluated so far.
@@ -26,6 +29,9 @@ pub struct Progress {
     /// The length of the best tour so far, in metres.
     pub best_cost: u64,
 }
+
+/// What a search calls to say how far it has got, and with which tour.
+type Report<'a> = Box<dyn FnMut(Progress, &Tour) + 'a>;
 
 /// The limits of one search and its bookkeeping, shared by all stages (D15).
 ///
@@ -40,7 +46,7 @@ pub struct Control<'a> {
     max_iterations: u64,
     deadline: Option<Instant>,
     cancel: Option<&'a AtomicBool>,
-    report: Option<Box<dyn FnMut(Progress) + 'a>>,
+    report: Option<Report<'a>>,
     iterations: u64,
     next_poll: u64,
     stop_reason: Option<StopReason>,
@@ -86,8 +92,12 @@ impl<'a> Control<'a> {
         self
     }
 
-    /// Calls `report` every 16 384 iterations while the search runs.
-    pub fn with_progress(mut self, report: impl FnMut(Progress) + 'a) -> Self {
+    /// Calls `report` every 16 384 iterations while the search runs, with how far the
+    /// search has got and the best tour it has found so far.
+    ///
+    /// The callback looks on and nothing more: the search takes the same course with it
+    /// as without it (D5).
+    pub fn with_progress(mut self, report: impl FnMut(Progress, &Tour) + 'a) -> Self {
         self.report = Some(Box::new(report));
         self
     }
@@ -102,16 +112,17 @@ impl<'a> Control<'a> {
         self.stop_reason
     }
 
-    /// Asks for `moves` more iterations.
+    /// Asks for `moves` more iterations. `best` is the best tour so far, for the
+    /// progress callback.
     ///
     /// Returns `false` when the search has to stop. Nothing is charged then, and the
     /// caller must not evaluate the moves.
     #[inline]
-    pub(crate) fn spend(&mut self, moves: u64, best_cost: u64) -> bool {
+    pub(crate) fn spend(&mut self, moves: u64, best: &Tour) -> bool {
         if self.stop_reason.is_some() {
             return false;
         }
-        if self.iterations >= self.next_poll && !self.poll(best_cost) {
+        if self.iterations >= self.next_poll && !self.poll(best) {
             return false;
         }
         if moves > self.max_iterations.saturating_sub(self.iterations) {
@@ -124,7 +135,7 @@ impl<'a> Control<'a> {
 
     /// The slow part of [`spend`](Self::spend): the cancel flag, the clock and the callback.
     #[cold]
-    fn poll(&mut self, best_cost: u64) -> bool {
+    fn poll(&mut self, best: &Tour) -> bool {
         self.next_poll = self.iterations.saturating_add(POLL_INTERVAL);
         if self.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             self.stop_reason = Some(StopReason::Cancelled);
@@ -134,17 +145,21 @@ impl<'a> Control<'a> {
         {
             self.stop_reason = Some(StopReason::Deadline);
         } else {
-            self.report(best_cost);
+            self.report(best);
         }
         self.stop_reason.is_none()
     }
 
-    pub(crate) fn report(&mut self, best_cost: u64) {
+    /// Hands the callback the best tour so far, which the tour is throughout: local
+    /// search only ever shortens the tour it is given, and annealing keeps its best
+    /// tour apart from the one it moves about.
+    pub(crate) fn report(&mut self, best: &Tour) {
         if let Some(report) = self.report.as_mut() {
-            report(Progress {
+            let progress = Progress {
                 iterations: self.iterations,
-                best_cost,
-            });
+                best_cost: best.cost,
+            };
+            report(progress, best);
         }
     }
 }
@@ -166,12 +181,21 @@ mod tests {
 
     use super::*;
 
+    /// A tour of the depot alone that claims to be `cost` metres long. A control only
+    /// passes its tour on, so what the tour looks like does not matter here.
+    fn tour(cost: u64) -> Tour {
+        Tour {
+            order: vec![0],
+            cost,
+        }
+    }
+
     #[test]
     fn the_budget_is_never_exceeded() {
         let mut control = Control::max_iterations(10);
-        assert!(control.spend(4, 0));
-        assert!(control.spend(6, 0));
-        assert!(!control.spend(1, 0));
+        assert!(control.spend(4, &tour(0)));
+        assert!(control.spend(6, &tour(0)));
+        assert!(!control.spend(1, &tour(0)));
         assert_eq!(control.iterations(), 10);
         assert_eq!(control.stop_reason(), Some(StopReason::Budget));
     }
@@ -179,16 +203,16 @@ mod tests {
     #[test]
     fn a_step_the_budget_cannot_cover_is_not_charged() {
         let mut control = Control::max_iterations(10);
-        assert!(control.spend(7, 0));
-        assert!(!control.spend(4, 0));
+        assert!(control.spend(7, &tour(0)));
+        assert!(!control.spend(4, &tour(0)));
         assert_eq!(control.iterations(), 7);
     }
 
     #[test]
     fn a_stop_is_final() {
         let mut control = Control::max_iterations(1);
-        assert!(!control.spend(2, 0));
-        assert!(!control.spend(1, 0));
+        assert!(!control.spend(2, &tour(0)));
+        assert!(!control.spend(1, &tour(0)));
         assert_eq!(control.iterations(), 0);
     }
 
@@ -196,7 +220,7 @@ mod tests {
     fn a_flag_set_beforehand_stops_the_first_step() {
         let flag = AtomicBool::new(true);
         let mut control = Control::max_iterations(u64::MAX).with_cancel(&flag);
-        assert!(!control.spend(1, 0));
+        assert!(!control.spend(1, &tour(0)));
         assert_eq!(control.iterations(), 0);
         assert_eq!(control.stop_reason(), Some(StopReason::Cancelled));
     }
@@ -205,9 +229,9 @@ mod tests {
     fn a_flag_is_noticed_within_one_poll_interval() {
         let flag = AtomicBool::new(false);
         let mut control = Control::max_iterations(u64::MAX).with_cancel(&flag);
-        assert!(control.spend(1, 0));
+        assert!(control.spend(1, &tour(0)));
         flag.store(true, Ordering::Relaxed);
-        while control.spend(1, 0) {}
+        while control.spend(1, &tour(0)) {}
         assert_eq!(control.iterations(), POLL_INTERVAL);
         assert_eq!(control.stop_reason(), Some(StopReason::Cancelled));
     }
@@ -215,7 +239,7 @@ mod tests {
     #[test]
     fn a_deadline_in_the_past_stops_the_first_step() {
         let mut control = Control::until(Instant::now());
-        assert!(!control.spend(1, 0));
+        assert!(!control.spend(1, &tour(0)));
         assert_eq!(control.iterations(), 0);
         assert_eq!(control.stop_reason(), Some(StopReason::Deadline));
     }
@@ -223,7 +247,7 @@ mod tests {
     #[test]
     fn a_deadline_ahead_lets_the_search_run() {
         let mut control = Control::until(Instant::now() + Duration::from_secs(3600));
-        assert!(control.spend(1, 0));
+        assert!(control.spend(1, &tour(0)));
         assert_eq!(control.stop_reason(), None);
     }
 
@@ -231,15 +255,19 @@ mod tests {
     fn progress_is_reported_once_per_poll_interval() {
         let mut reports = Vec::new();
         let mut control = Control::max_iterations(3 * POLL_INTERVAL)
-            .with_progress(|progress| reports.push(progress));
-        let mut best_cost = 1_000;
-        while control.spend(1, best_cost) {
-            best_cost -= u64::from(control.iterations() == POLL_INTERVAL);
+            .with_progress(|progress, best| reports.push((progress, best.clone())));
+        let mut best = tour(1_000);
+        while control.spend(1, &best) {
+            best.cost -= u64::from(control.iterations() == POLL_INTERVAL);
         }
         drop(control);
-        let report = |iterations, best_cost| Progress {
-            iterations,
-            best_cost,
+        // Each report comes with the tour that was the best at that moment.
+        let report = |iterations, best_cost| {
+            let progress = Progress {
+                iterations,
+                best_cost,
+            };
+            (progress, tour(best_cost))
         };
         assert_eq!(
             reports,
