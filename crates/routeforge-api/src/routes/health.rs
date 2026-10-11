@@ -10,8 +10,20 @@ use utoipa_actix_web::service_config::ServiceConfig;
 use crate::app::AppState;
 use crate::error::ApiError;
 
+/// Where the API says whether it can do its work. The health check of the image asks
+/// here (D55).
+pub(crate) const READYZ: &str = "/readyz";
+
 pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
     config.service(healthz).service(readyz);
+}
+
+/// Whether a request for `path` is a health check.
+///
+/// The stack sends one every two seconds for as long as it is up, so one that went
+/// well is not logged like other requests (D55).
+pub(crate) fn is_check(path: &str) -> bool {
+    matches!(path, "/healthz" | READYZ)
 }
 
 /// The answer of a health check that went well.

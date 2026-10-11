@@ -613,6 +613,13 @@ fn captured_log() -> &'static Log {
     })
 }
 
+/// A field of the span a line was logged in: a line names its spans, and a span has
+/// the fields.
+fn span(line: &Value, name: &str) -> Option<Value> {
+    let spans = line["spans"].as_array()?;
+    spans.iter().find_map(|span| span.get(name)).cloned()
+}
+
 /// Verification step 6 of the plan follows one request through the logs of every
 /// service. This is the API's part of it.
 #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
@@ -651,11 +658,6 @@ async fn what_a_request_logs_carries_its_id_and_who_asked(pool: PgPool) {
     assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
 
     let lines = log.lines();
-    // A line names the span it was logged in, and the span has the fields.
-    let span = |line: &Value, name: &str| -> Option<Value> {
-        let spans = line["spans"].as_array()?;
-        spans.iter().find_map(|span| span.get(name)).cloned()
-    };
     let of = |request_id: &str| -> Vec<&Value> {
         let wanted = json!(request_id);
         let lines = lines.iter();
@@ -695,4 +697,42 @@ async fn what_a_request_logs_carries_its_id_and_who_asked(pool: PgPool) {
         .expect("the failure was logged as an error");
     assert!(cause.to_string().contains("nothing_gets_in"), "{cause}");
     assert!(!failed.text.contains("nothing_gets_in"), "{}", failed.text);
+}
+
+/// The stack asks `/readyz` every two seconds for as long as it is up (D55). An answer
+/// that all is well is not worth a line each time. Any other answer is.
+#[sqlx::test(migrations = false)]
+async fn a_health_check_that_goes_well_is_not_logged(pool: PgPool) {
+    let log = captured_log();
+    let api = testing::api(&pool);
+    let run = Uuid::now_v7();
+    let asked = async |path: &str, name: &str| {
+        let request = testing::request("GET", path, None)
+            .insert_header((X_REQUEST_ID, format!("{run}.{name}")));
+        api.send(request).await.status
+    };
+
+    // Without a schema the API is up, and cannot work.
+    assert_eq!(asked("/healthz", "up").await, StatusCode::OK);
+    assert_eq!(
+        asked("/readyz", "unready").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    crate::startup::migrate(&pool).await.unwrap();
+    assert_eq!(asked("/readyz", "ready").await, StatusCode::OK);
+    // And a request that is no health check, to tell them from.
+    assert_eq!(asked(OPENAPI_PATH, "other").await, StatusCode::OK);
+
+    let lines = log.lines();
+    let logged = |name: &str| {
+        let request_id = json!(format!("{run}.{name}"));
+        lines.iter().any(|line| {
+            span(line, "request_id").as_ref() == Some(&request_id)
+                && line["fields"]["message"] == "handled the request"
+        })
+    };
+    assert!(!logged("up"));
+    assert!(logged("unready"), "the stack is not ready, and says so");
+    assert!(!logged("ready"));
+    assert!(logged("other"));
 }

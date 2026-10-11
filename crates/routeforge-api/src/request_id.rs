@@ -20,11 +20,12 @@ use actix_web::http::header::{HeaderName, HeaderValue};
 use actix_web::middleware::Next;
 use actix_web::{Error, FromRequest, HttpMessage, HttpRequest};
 use tracing::field::Empty;
-use tracing::{Span, info, info_span};
+use tracing::{Span, debug, info, info_span};
 use tracing_actix_web::RootSpanBuilder;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::routes::health;
 
 /// The header the id arrives in and leaves in.
 pub(crate) const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -118,8 +119,16 @@ impl RootSpanBuilder for RequestSpan {
             Err(error) => error.as_response_error().status_code(),
         };
         span.record("status", status.as_u16());
+        // A health check comes every two seconds for as long as the stack is up (D55).
+        // One that went well says nothing new. One that did not is logged like the rest.
+        let routine = status.is_success()
+            && matches!(outcome, Ok(response) if health::is_check(response.request().path()));
         // Called inside the span, so the line carries the id.
-        info!("handled the request");
+        if routine {
+            debug!("handled the request");
+        } else {
+            info!("handled the request");
+        }
     }
 }
 
