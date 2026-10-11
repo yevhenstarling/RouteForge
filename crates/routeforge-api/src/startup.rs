@@ -243,6 +243,23 @@ mod tests {
         assert_eq!(ready.body, json!({ "status": "ready" }));
     }
 
+    /// A solver takes such a database as migrated and works (D32). The API writes to
+    /// every table, and does not start on a schema it has not seen.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_database_that_a_newer_build_has_migrated_is_refused(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+             VALUES (9999, 'from a newer build', true, ''::bytea, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(db::is_migrated(&pool).await.unwrap());
+
+        let error = migrate(&pool).await.unwrap_err();
+        assert!(format!("{error:#}").contains("9999"), "{error:#}");
+    }
+
     #[tokio::test]
     async fn a_database_that_is_not_there_ends_the_start_with_the_reason() {
         let error = connect("the database").await.unwrap_err();
