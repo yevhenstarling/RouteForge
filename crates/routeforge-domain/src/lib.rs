@@ -31,10 +31,13 @@ pub use geo::{
     Projection, haversine_m,
 };
 pub use ids::{CourierId, DepotId, JobId, OrderId, PlanId, RouteId, UserId, WorkerId};
-pub use job::{Job, JobKind, JobPayload, JobProgress, JobStatus, QueueDepth, WorkerInfo};
+pub use job::{
+    Job, JobKind, JobPayload, JobProgress, JobStatus, QueueDepth, RouteJob, RouteProgress,
+    WorkerInfo,
+};
 pub use model::{
     Courier, Credentials, Depot, NewCourier, NewDepot, NewOrder, NewPlan, NewRoute, NewUser, Order,
-    OrderFilter, OrderKind, OrderStatus, Plan, PlanCounts, PlanStatus, Role, Route, RouteBudget,
-    RouteStop, UnlimitedBudget, User,
+    OrderFilter, OrderKind, OrderStatus, Plan, PlanCounts, PlanFilter, PlanStatus, Role, Route,
+    RouteBudget, RouteStop, UnlimitedBudget, User,
 };
 pub use text::UnknownVariant;

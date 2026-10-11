@@ -41,6 +41,17 @@
 //! A plan that is done has no job left. [`discard_plan`] takes such a plan back: the
 //! same undo, for a plan that got to its end (D30).
 //!
+//! # Watchers
+//!
+//! Whoever shows a plan to a person, which is the API with its event streams, learns of
+//! a change the way a worker learns of a job. Every function here that changes a plan
+//! or one of its jobs notifies [`PLANS_CHANNEL`] with the plan's id, in the statement
+//! or the transaction of the change. So the change is heard when it can be read, and
+//! not before. What changed is not said: a watcher reads the plan again (D48).
+//!
+//! [`announce_progress`] is the one thing that is sent and not stored: how far the
+//! search for a route has got, a few times a second, on [`PROGRESS_CHANNEL`].
+//!
 //! # Lock order
 //!
 //! Those three lock the plan row before any job row. With the job first, a completing
@@ -58,7 +69,7 @@ use uuid::Uuid;
 
 use super::{DbError, millis, parsed, unsigned};
 use crate::ids::{JobId, PlanId, WorkerId};
-use crate::job::{Job, JobPayload, JobProgress, JobStatus, QueueDepth};
+use crate::job::{Job, JobPayload, JobProgress, JobStatus, QueueDepth, RouteProgress};
 use crate::model::PlanStatus;
 
 /// The channel a worker listens on to learn that a job may be waiting.
@@ -67,6 +78,25 @@ use crate::model::PlanStatus;
 /// be missed while a listener reconnects, and a job that becomes due because its retry
 /// time has come or its lease has expired sends none. Workers poll as well.
 pub const JOBS_CHANNEL: &str = "routeforge_jobs";
+
+/// The channel that says a plan has changed: the plan itself, or one of its jobs (D48).
+///
+/// The payload is the plan's id and nothing more, so the notifications of one
+/// transaction are equal and PostgreSQL folds them into one (D26). Like a notification
+/// on [`JOBS_CHANNEL`] it is a hint. Whoever hears it reads the plan again, and whoever
+/// may have missed one reads again anyway.
+///
+/// It is a channel of its own because the workers listen on the other. On theirs,
+/// every change to a plan would wake every worker.
+pub const PLANS_CHANNEL: &str = "routeforge_plans";
+
+/// The channel a worker announces the progress of a route search on (D48).
+///
+/// The payload is a [`RouteProgress`] as JSON, sent by [`announce_progress`].
+pub const PROGRESS_CHANNEL: &str = "routeforge_progress";
+
+/// PostgreSQL refuses a notification whose payload is 8000 bytes or longer.
+const LONGEST_PAYLOAD: usize = 7_999;
 
 /// How many times a job may be claimed before a failure is final.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -125,9 +155,9 @@ pub enum Heartbeat {
     Lost,
 }
 
-/// Puts a job on the queue, due at once, and notifies the workers.
+/// Puts a job on the queue, due at once, and notifies the workers and the watchers.
 ///
-/// It is one statement, and the notification is sent when the transaction it runs in
+/// It is one statement, and the notifications are sent when the transaction it runs in
 /// commits. Inside a caller's transaction the job appears, and the workers hear of it,
 /// exactly when the caller's other changes do.
 pub async fn enqueue(
@@ -140,9 +170,10 @@ pub async fn enqueue(
         "WITH inserted AS (
              INSERT INTO jobs (id, plan_id, kind, payload, max_attempts, request_id)
              VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING kind
+             RETURNING kind, plan_id
          )
-         SELECT pg_notify($7, kind) FROM inserted",
+         SELECT pg_notify($7, kind) AS workers, pg_notify($8, plan_id::text) AS watchers
+         FROM inserted",
         id.0,
         payload.plan_id().0,
         payload.kind().as_str(),
@@ -150,6 +181,7 @@ pub async fn enqueue(
         i64::from(MAX_ATTEMPTS),
         request_id,
         JOBS_CHANNEL,
+        PLANS_CHANNEL,
     )
     .execute(executor)
     .await?;
@@ -163,6 +195,8 @@ pub async fn enqueue(
 ///
 /// Concurrent claims never return the same job and never wait for each other: a job
 /// that another transaction has locked is skipped.
+///
+/// It is one statement, the word to the watchers included.
 pub async fn claim(
     pool: &PgPool,
     worker: WorkerId,
@@ -177,19 +211,26 @@ pub async fn claim(
                ORDER BY run_at, id
                LIMIT 1
                FOR UPDATE SKIP LOCKED
+           ),
+           claimed AS (
+               UPDATE jobs
+               SET status = 'running',
+                   attempt = jobs.attempt + 1,
+                   claimed_by = $1,
+                   lease_expires_at = now() + $2::bigint * interval '1 millisecond',
+                   progress = NULL
+               FROM next
+               WHERE jobs.id = next.id
+               RETURNING jobs.id, jobs.plan_id, jobs.payload, jobs.attempt, jobs.max_attempts,
+                         jobs.request_id
            )
-           UPDATE jobs
-           SET status = 'running',
-               attempt = jobs.attempt + 1,
-               claimed_by = $1,
-               lease_expires_at = now() + $2::bigint * interval '1 millisecond',
-               progress = NULL
-           FROM next
-           WHERE jobs.id = next.id
-           RETURNING jobs.id, jobs.plan_id, jobs.payload, jobs.attempt, jobs.max_attempts,
-                     jobs.request_id"#,
+           SELECT id AS "id!", plan_id AS "plan_id!", payload AS "payload!",
+                  attempt AS "attempt!", max_attempts AS "max_attempts!", request_id,
+                  pg_notify($3, plan_id::text) AS watchers
+           FROM claimed"#,
         worker.0,
         millis(lease),
+        PLANS_CHANNEL,
     )
     .fetch_optional(pool)
     .await?;
@@ -273,6 +314,7 @@ pub async fn heartbeat(
 pub struct Completion {
     tx: Transaction<'static, Postgres>,
     job_id: JobId,
+    plan_id: PlanId,
 }
 
 impl Completion {
@@ -291,6 +333,8 @@ impl Completion {
         )
         .execute(&mut *self.tx)
         .await?;
+        // One word for the job and for everything the caller wrote with it.
+        announce(&mut self.tx, self.plan_id).await?;
         self.tx.commit().await?;
         Ok(())
     }
@@ -321,6 +365,7 @@ pub async fn begin_complete(pool: &PgPool, lease: &Lease) -> Result<Option<Compl
     Ok(held.map(|_| Completion {
         tx,
         job_id: lease.job_id,
+        plan_id: lease.plan_id,
     }))
 }
 
@@ -334,18 +379,23 @@ pub async fn begin_complete(pool: &PgPool, lease: &Lease) -> Result<Option<Compl
 pub async fn fail(pool: &PgPool, lease: &Lease, error: &str) -> Result<bool, DbError> {
     if !lease.is_last_attempt() {
         let retried = sqlx::query!(
-            "UPDATE jobs
-             SET status = 'queued',
-                 run_at = now() + $4::bigint * interval '1 millisecond',
-                 claimed_by = NULL,
-                 lease_expires_at = NULL,
-                 error = $5
-             WHERE id = $1 AND status = 'running' AND claimed_by = $2 AND attempt = $3",
+            "WITH retried AS (
+                 UPDATE jobs
+                 SET status = 'queued',
+                     run_at = now() + $4::bigint * interval '1 millisecond',
+                     claimed_by = NULL,
+                     lease_expires_at = NULL,
+                     error = $5
+                 WHERE id = $1 AND status = 'running' AND claimed_by = $2 AND attempt = $3
+                 RETURNING plan_id
+             )
+             SELECT pg_notify($6, plan_id::text) FROM retried",
             lease.job_id.0,
             lease.worker_id.0,
             i64::from(lease.attempt),
             millis(retry_delay(lease.attempt)),
             error,
+            PLANS_CHANNEL,
         )
         .execute(pool)
         .await?;
@@ -376,7 +426,7 @@ pub async fn fail(pool: &PgPool, lease: &Lease, error: &str) -> Result<bool, DbE
 /// Hands a job back, for a worker that is shutting down.
 ///
 /// The job is due at once, keeps its place in the queue, and the attempt is not
-/// counted. The workers are notified.
+/// counted. The workers are notified, and so are the watchers.
 ///
 /// Returns `false`, and changes nothing, if the job is no longer this worker's.
 pub async fn release(executor: impl PgExecutor<'_>, lease: &Lease) -> Result<bool, DbError> {
@@ -385,13 +435,15 @@ pub async fn release(executor: impl PgExecutor<'_>, lease: &Lease) -> Result<boo
              UPDATE jobs
              SET status = 'queued', attempt = attempt - 1, claimed_by = NULL, lease_expires_at = NULL
              WHERE id = $1 AND status = 'running' AND claimed_by = $2 AND attempt = $3
-             RETURNING kind
+             RETURNING kind, plan_id
          )
-         SELECT pg_notify($4, kind) FROM released",
+         SELECT pg_notify($4, kind) AS workers, pg_notify($5, plan_id::text) AS watchers
+         FROM released",
         lease.job_id.0,
         lease.worker_id.0,
         i64::from(lease.attempt),
         JOBS_CHANNEL,
+        PLANS_CHANNEL,
     )
     .execute(executor)
     .await?;
@@ -436,8 +488,50 @@ pub async fn discard_plan(pool: &PgPool, plan_id: PlanId) -> Result<bool, DbErro
         return Ok(false);
     }
     undo_plan(&mut tx, plan_id).await?;
+    announce(&mut tx, plan_id).await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Announces how far the search for a route has got, to whoever watches its plan.
+///
+/// `order` is the best route so far: its stops in calling order, each as its position
+/// in the job's list of orders. It is left out when the notification would be longer
+/// than PostgreSQL takes, which a route of well over a thousand stops is. The numbers
+/// are announced all the same.
+///
+/// Nothing is stored and nothing is checked, so a worker that has lost the job can
+/// still announce. What is announced says which attempt it comes from, and a watcher
+/// tells by that (D49).
+pub async fn announce_progress(
+    executor: impl PgExecutor<'_>,
+    lease: &Lease,
+    progress: JobProgress,
+    order: Option<&[u32]>,
+) -> Result<(), DbError> {
+    let mut announced = RouteProgress {
+        plan_id: lease.plan_id,
+        job_id: lease.job_id,
+        attempt: lease.attempt,
+        iterations: progress.iterations,
+        best_cost_m: progress.best_cost_m,
+        order: order.map(<[u32]>::to_vec),
+    };
+    let mut payload = notification(&announced)?;
+    if payload.len() > LONGEST_PAYLOAD {
+        announced.order = None;
+        payload = notification(&announced)?;
+    }
+    sqlx::query!("SELECT pg_notify($1, $2)", PROGRESS_CHANNEL, payload)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// A progress report as the text of a notification.
+fn notification(progress: &RouteProgress) -> Result<String, DbError> {
+    serde_json::to_string(progress)
+        .map_err(|error| DbError::Sqlx(sqlx::Error::Encode(error.into())))
 }
 
 struct JobRow {
@@ -600,8 +694,25 @@ async fn end_plan(
     )
     .execute(&mut *conn)
     .await?;
-    undo_plan(conn, plan_id).await?;
+    undo_plan(&mut *conn, plan_id).await?;
+    announce(conn, plan_id).await?;
     Ok(true)
+}
+
+/// Tells whoever watches the plan that it, or one of its jobs, has changed (D48).
+///
+/// The id is turned into text by PostgreSQL, here as in the statements that notify by
+/// themselves. So the notifications of one transaction are equal to the letter, and
+/// fold into one.
+async fn announce(conn: &mut PgConnection, plan_id: PlanId) -> Result<(), DbError> {
+    sqlx::query!(
+        "SELECT pg_notify($1, $2::uuid::text)",
+        PLANS_CHANNEL,
+        plan_id.0,
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Takes back what a plan has done: deletes the routes it has stored and makes its

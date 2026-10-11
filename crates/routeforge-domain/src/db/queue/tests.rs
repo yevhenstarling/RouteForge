@@ -14,7 +14,7 @@ use crate::db::testing::{self, LONG, Routing, complete_route, date, soon};
 use crate::db::{orders, plans, routes};
 use crate::ids::{CourierId, OrderId};
 use crate::job::JobKind;
-use crate::model::{NewRoute, OrderStatus};
+use crate::model::{NewRoute, OrderStatus, PlanCounts};
 
 /// The database's clock, which is the only one the queue uses.
 async fn db_now(pool: &PgPool) -> DateTime<Utc> {
@@ -1417,4 +1417,290 @@ async fn the_depth_of_the_queue_counts_the_jobs_of_each_status(pool: PgPool) {
             cancelled: 3,
         }
     );
+}
+
+/// Someone who watches plans, as the API does for its event streams (D48).
+async fn watching(pool: &PgPool) -> PgListener {
+    let mut watcher = PgListener::connect_with(pool).await.unwrap();
+    watcher.listen(PLANS_CHANNEL).await.unwrap();
+    watcher
+}
+
+/// The plans a watcher was told of since it last looked. It waits until nothing more
+/// has come for a while, so that one word too many shows up as well.
+async fn told_of(watcher: &mut PgListener) -> Vec<PlanId> {
+    let silence = Duration::from_millis(300);
+    let mut plans = Vec::new();
+    while let Ok(notification) = tokio::time::timeout(silence, watcher.recv()).await {
+        let notification = notification.unwrap();
+        assert_eq!(notification.channel(), PLANS_CHANNEL);
+        plans.push(notification.payload().parse().unwrap());
+    }
+    plans
+}
+
+/// Every change to a plan or to one of its jobs is announced, once, and when it can be
+/// read: at the commit of the transaction it was made in.
+#[sqlx::test]
+async fn a_watcher_hears_of_every_change_to_a_plan_once_it_is_made(pool: PgPool) {
+    let new = testing::new_plan(&pool, date(12)).await;
+    let mut watcher = watching(&pool).await;
+    let worker = WorkerId::generate();
+
+    // Submitted. The plan and its job are one transaction, and one word.
+    let plan = plans::submit(&pool, &new, None).await.unwrap();
+    assert_eq!(told_of(&mut watcher).await, [plan.id]);
+
+    let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!(told_of(&mut watcher).await, [plan.id], "claimed");
+
+    // A heartbeat changes nothing that a watcher shows.
+    heartbeat(&pool, &job.lease, LONG, None).await.unwrap();
+    assert!(told_of(&mut watcher).await.is_empty(), "a heartbeat");
+
+    // Clustered: twenty route jobs, the plan moved on and its job done. Nothing of it
+    // is said before the commit, and afterwards it is said once.
+    let mut completion = begin_complete(&pool, &job.lease).await.unwrap().unwrap();
+    for seed in 0..20 {
+        let route = JobPayload::Route {
+            plan_id: plan.id,
+            courier_id: CourierId::generate(),
+            order_ids: Vec::new(),
+            seed,
+        };
+        enqueue(completion.conn(), &route, None).await.unwrap();
+    }
+    let counts = PlanCounts {
+        orders_total: 0,
+        orders_unassigned: 0,
+        routes_total: 20,
+    };
+    plans::start_routing(completion.conn(), plan.id, counts)
+        .await
+        .unwrap();
+    assert!(told_of(&mut watcher).await.is_empty(), "before the commit");
+    completion.commit().await.unwrap();
+    assert_eq!(told_of(&mut watcher).await, [plan.id], "clustered");
+
+    // A completion that is dropped has changed nothing, and says nothing.
+    let route = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!(told_of(&mut watcher).await, [plan.id]);
+    let mut completion = begin_complete(&pool, &route.lease).await.unwrap().unwrap();
+    plans::route_finished(completion.conn(), plan.id)
+        .await
+        .unwrap();
+    drop(completion);
+    assert!(told_of(&mut watcher).await.is_empty(), "rolled back");
+
+    // An attempt that failed and will be tried again.
+    assert!(fail(&pool, &route.lease, "out of memory").await.unwrap());
+    assert_eq!(told_of(&mut watcher).await, [plan.id], "retried");
+    // What changes nothing says nothing: the job is no longer that worker's.
+    assert!(!fail(&pool, &route.lease, "once more").await.unwrap());
+    assert!(!release(&pool, &route.lease).await.unwrap());
+    assert!(told_of(&mut watcher).await.is_empty());
+
+    // A job given back by a worker that is stopping.
+    let other = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!(told_of(&mut watcher).await, [plan.id]);
+    assert!(release(&pool, &other.lease).await.unwrap());
+    assert_eq!(told_of(&mut watcher).await, [plan.id], "released");
+
+    // Cancelled: the plan, its jobs and its orders, in one word.
+    assert!(cancel_plan(&pool, plan.id).await.unwrap());
+    assert_eq!(told_of(&mut watcher).await, [plan.id], "cancelled");
+    assert!(!cancel_plan(&pool, plan.id).await.unwrap());
+    assert!(told_of(&mut watcher).await.is_empty());
+}
+
+#[sqlx::test]
+async fn a_watcher_hears_how_a_plan_ends(pool: PgPool) {
+    let last_attempt = async |routing: &Routing| {
+        sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE plan_id = $1")
+            .bind(routing.plan.id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+    };
+    let mut watcher = watching(&pool).await;
+
+    // Done with its last route, and then discarded.
+    let done = testing::routing(&pool, date(12), 1, 1).await;
+    let job = claim(&pool, WorkerId::generate(), LONG).await.unwrap();
+    told_of(&mut watcher).await;
+    assert_eq!(
+        complete_route(&pool, &job.unwrap()).await,
+        Some(PlanStatus::Done)
+    );
+    assert_eq!(told_of(&mut watcher).await, [done.plan.id], "done");
+    assert!(discard_plan(&pool, done.plan.id).await.unwrap());
+    assert_eq!(told_of(&mut watcher).await, [done.plan.id], "discarded");
+    assert!(!discard_plan(&pool, done.plan.id).await.unwrap());
+    assert!(told_of(&mut watcher).await.is_empty());
+
+    // Failed for good: the job, the plan and its other job, in one word.
+    let failing = testing::routing(&pool, date(13), 2, 1).await;
+    last_attempt(&failing).await;
+    let job = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    told_of(&mut watcher).await;
+    assert!(fail(&pool, &job.lease, "broken").await.unwrap());
+    assert_eq!(told_of(&mut watcher).await, [failing.plan.id], "failed");
+
+    // Its worker died on the last attempt, and an idle worker buried the job.
+    let abandoned = testing::routing(&pool, date(14), 1, 1).await;
+    last_attempt(&abandoned).await;
+    claim(&pool, WorkerId::generate(), Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    told_of(&mut watcher).await;
+    assert_eq!(
+        claim(&pool, WorkerId::generate(), LONG).await.unwrap(),
+        None
+    );
+    assert_eq!(told_of(&mut watcher).await, [abandoned.plan.id], "buried");
+    let plan = plans::get(&pool, abandoned.plan.id).await.unwrap().unwrap();
+    assert_eq!(plan.status, PlanStatus::Failed);
+}
+
+/// The watchers have a channel of their own. On the channel of the workers, every claim
+/// and every stored route would wake every worker, to find a queue it has just looked at.
+#[sqlx::test]
+async fn what_the_watchers_are_told_does_not_wake_the_workers(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 3, 1).await;
+    let mut workers = PgListener::connect_with(&pool).await.unwrap();
+    workers.listen(JOBS_CHANNEL).await.unwrap();
+    let worker = WorkerId::generate();
+
+    let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    let progress = JobProgress {
+        iterations: 16_384,
+        best_cost_m: 4_200,
+    };
+    heartbeat(&pool, &job.lease, LONG, Some(progress))
+        .await
+        .unwrap();
+    announce_progress(&pool, &job.lease, progress, Some(&[0]))
+        .await
+        .unwrap();
+    assert_eq!(complete_route(&pool, &job).await, Some(PlanStatus::Routing));
+    let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert!(fail(&pool, &job.lease, "out of memory").await.unwrap());
+    assert!(cancel_plan(&pool, routing.plan.id).await.unwrap());
+
+    let silence = Duration::from_millis(300);
+    assert!(
+        tokio::time::timeout(silence, workers.recv()).await.is_err(),
+        "a worker was woken for something it has no use for"
+    );
+}
+
+#[sqlx::test]
+async fn progress_is_announced_with_the_claim_it_comes_from_and_stored_nowhere(pool: PgPool) {
+    let routing = testing::routing(&pool, date(12), 1, 3).await;
+    let worker = WorkerId::generate();
+    // Claimed twice, so that the attempt is not the 1 it would be by accident.
+    let first = claim(&pool, worker, Duration::ZERO).await.unwrap().unwrap();
+    let job = claim(&pool, worker, LONG).await.unwrap().unwrap();
+    assert_eq!((first.lease.attempt, job.lease.attempt), (1, 2));
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(PROGRESS_CHANNEL).await.unwrap();
+    let mut said = async || -> RouteProgress {
+        let notification = soon(listener.recv()).await.unwrap();
+        assert_eq!(notification.channel(), PROGRESS_CHANNEL);
+        serde_json::from_str(notification.payload()).unwrap()
+    };
+    let progress = JobProgress {
+        iterations: 32_768,
+        best_cost_m: 4_200,
+    };
+
+    announce_progress(&pool, &job.lease, progress, Some(&[2, 0, 1]))
+        .await
+        .unwrap();
+    assert_eq!(
+        said().await,
+        RouteProgress {
+            plan_id: routing.plan.id,
+            job_id: job.lease.job_id,
+            attempt: 2,
+            iterations: 32_768,
+            best_cost_m: 4_200,
+            order: Some(vec![2, 0, 1]),
+        }
+    );
+
+    // The worker that lost the job can still be heard, and is told apart by its attempt.
+    announce_progress(&pool, &first.lease, progress, None)
+        .await
+        .unwrap();
+    let stale = said().await;
+    assert_eq!((stale.attempt, stale.order), (1, None));
+
+    // What a job has stored is what its last heartbeat said, and it has sent none.
+    assert_eq!(stored(&pool, job.lease.job_id).await.progress, None);
+}
+
+/// A notification has a longest payload, and a route of thousands of stops is longer.
+#[sqlx::test]
+async fn a_route_too_long_for_a_notification_is_announced_by_its_numbers(pool: PgPool) {
+    // The limit is the one PostgreSQL has, to the byte.
+    let notify = async |length: usize| {
+        sqlx::query("SELECT pg_notify('routeforge_test', repeat('x', $1))")
+            .bind(length as i32)
+            .execute(&pool)
+            .await
+    };
+    notify(LONGEST_PAYLOAD).await.unwrap();
+    let error = notify(LONGEST_PAYLOAD + 1).await.unwrap_err();
+    assert!(error.to_string().contains("too long"), "{error}");
+
+    testing::routing(&pool, date(12), 1, 1).await;
+    let job = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    let progress = JobProgress {
+        iterations: u64::MAX,
+        best_cost_m: u64::MAX,
+    };
+    let in_order = |stops: u32| -> Vec<u32> { (0..stops).collect() };
+    let fits = |stops: u32| {
+        let announced = RouteProgress {
+            plan_id: job.lease.plan_id,
+            job_id: job.lease.job_id,
+            attempt: job.lease.attempt,
+            iterations: progress.iterations,
+            best_cost_m: progress.best_cost_m,
+            order: Some(in_order(stops)),
+        };
+        notification(&announced).unwrap().len() <= LONGEST_PAYLOAD
+    };
+    let most = (1..10_000).take_while(|&stops| fits(stops)).last().unwrap();
+    assert!(most > 1_000, "only {most} stops fit");
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(PROGRESS_CHANNEL).await.unwrap();
+    let mut said = async |stops: u32| -> RouteProgress {
+        announce_progress(&pool, &job.lease, progress, Some(&in_order(stops)))
+            .await
+            .unwrap();
+        let notification = soon(listener.recv()).await.unwrap();
+        serde_json::from_str(notification.payload()).unwrap()
+    };
+
+    // The longest route that fits is announced whole.
+    assert_eq!(said(most).await.order, Some(in_order(most)));
+    // One stop more, and the route is left out. The numbers are still said.
+    let numbers = said(most + 1).await;
+    assert_eq!(numbers.order, None);
+    assert_eq!(
+        (numbers.job_id, numbers.iterations, numbers.best_cost_m),
+        (job.lease.job_id, u64::MAX, u64::MAX)
+    );
+    assert_eq!(said(3 * most).await.order, None);
 }
