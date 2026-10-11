@@ -12,13 +12,16 @@ routeforge-domain = { workspace = true, features = ["db"] }
 routeforge-tsp.workspace = true
 
 anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+# For the jitter of the polling interval, from a generator seeded with the worker's id.
+rand.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-uuid.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

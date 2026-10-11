@@ -66,3 +66,13 @@ jobs:
         run: |
           cargo sqlx migrate run --source crates/routeforge-domain/migrations
           cargo sqlx prepare --workspace --check -- --all-targets
+
+  # The image `docker compose up` builds. It has to build from the base image alone:
+  # with no database (D28) and with no native library that the base does not have (D12).
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the solver image
+        run: docker build --target solver --tag routeforge-solver .

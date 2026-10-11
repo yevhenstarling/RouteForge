@@ -4,6 +4,7 @@
 //! `db` read and write. A `New…` type holds what creating the thing needs.
 
 use std::fmt;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -192,6 +193,70 @@ pub struct OrderFilter {
     pub status: Option<OrderStatus>,
 }
 
+/// How long the search for each route of a plan may go on (D31).
+///
+/// The limits are those of the search itself (D15): a span of time, a number of
+/// candidate moves, or both, in which case whichever is reached first ends the search.
+/// A value of this type has at least one of them, because annealing never ends on its
+/// own (D18): [`RouteBudget::new`] and deserialization both check.
+///
+/// With moves alone, the same seed gives the same route (D5). A span of time cuts the
+/// search wherever the machine has got to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedBudget")]
+pub struct RouteBudget {
+    time_ms: Option<u32>,
+    iterations: Option<u64>,
+}
+
+/// A route budget that sets no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a route budget needs a limit: a time, a number of moves, or both")]
+pub struct UnlimitedBudget;
+
+/// What a budget looks like in JSON, before it is checked.
+#[derive(Deserialize)]
+struct UncheckedBudget {
+    time_ms: Option<u32>,
+    iterations: Option<u64>,
+}
+
+impl TryFrom<UncheckedBudget> for RouteBudget {
+    type Error = UnlimitedBudget;
+
+    fn try_from(unchecked: UncheckedBudget) -> Result<Self, Self::Error> {
+        Self::new(unchecked.time_ms, unchecked.iterations)
+    }
+}
+
+impl RouteBudget {
+    /// A budget of `time_ms` milliseconds, of `iterations` candidate moves, or of both.
+    pub fn new(time_ms: Option<u32>, iterations: Option<u64>) -> Result<Self, UnlimitedBudget> {
+        if time_ms.is_none() && iterations.is_none() {
+            return Err(UnlimitedBudget);
+        }
+        Ok(Self {
+            time_ms,
+            iterations,
+        })
+    }
+
+    /// The time one route may take, in milliseconds.
+    pub fn time_ms(self) -> Option<u32> {
+        self.time_ms
+    }
+
+    /// The time one route may take.
+    pub fn time(self) -> Option<Duration> {
+        self.time_ms.map(|ms| Duration::from_millis(u64::from(ms)))
+    }
+
+    /// The candidate moves the search for one route may evaluate.
+    pub fn iterations(self) -> Option<u64> {
+        self.iterations
+    }
+}
+
 /// One planning run: the orders of a service date turned into courier routes (D2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
@@ -202,6 +267,8 @@ pub struct Plan {
     pub status: PlanStatus,
     /// What every random choice in the plan's routes derives from (D5).
     pub seed: u32,
+    /// How long each of the plan's routes may be searched for.
+    pub budget: RouteBudget,
     pub created_by: UserId,
     /// Pending orders of the date when the plan was clustered.
     pub orders_total: u32,
@@ -224,6 +291,7 @@ pub struct NewPlan {
     pub service_date: NaiveDate,
     pub depot_id: DepotId,
     pub seed: u32,
+    pub budget: RouteBudget,
     pub created_by: UserId,
 }
 
@@ -287,6 +355,49 @@ mod tests {
             .filter(|status| status.is_active())
             .collect();
         assert_eq!(active, [PlanStatus::Queued, PlanStatus::Routing]);
+    }
+
+    #[test]
+    fn a_budget_needs_at_least_one_limit() {
+        let timed = RouteBudget::new(Some(1_500), None).unwrap();
+        assert_eq!(
+            (timed.time_ms(), timed.time(), timed.iterations()),
+            (Some(1_500), Some(Duration::from_millis(1_500)), None)
+        );
+        let counted = RouteBudget::new(None, Some(u64::MAX)).unwrap();
+        assert_eq!(
+            (counted.time(), counted.iterations()),
+            (None, Some(u64::MAX))
+        );
+        let both = RouteBudget::new(Some(u32::MAX), Some(0)).unwrap();
+        assert_eq!(
+            (both.time_ms(), both.iterations()),
+            (Some(u32::MAX), Some(0))
+        );
+
+        let error = RouteBudget::new(None, None).unwrap_err();
+        assert!(error.to_string().contains("needs a limit"));
+    }
+
+    #[test]
+    fn json_cannot_smuggle_in_a_budget_without_a_limit() {
+        let timed: RouteBudget = serde_json::from_str(r#"{"time_ms": 10000}"#).unwrap();
+        assert_eq!(timed, RouteBudget::new(Some(10_000), None).unwrap());
+        // A limit that is not set is written out, as a null.
+        assert_eq!(
+            serde_json::to_value(timed).unwrap(),
+            serde_json::json!({ "time_ms": 10_000, "iterations": null })
+        );
+
+        let both = RouteBudget::new(Some(250), Some(1_000_000)).unwrap();
+        let json = serde_json::to_value(both).unwrap();
+        assert_eq!(serde_json::from_value::<RouteBudget>(json).unwrap(), both);
+
+        for unlimited in ["{}", r#"{"time_ms": null, "iterations": null}"#] {
+            let error = serde_json::from_str::<RouteBudget>(unlimited).unwrap_err();
+            assert!(error.to_string().contains("needs a limit"), "{unlimited}");
+        }
+        assert!(serde_json::from_str::<RouteBudget>(r#"{"time_ms": -1}"#).is_err());
     }
 
     #[test]

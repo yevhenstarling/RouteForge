@@ -12,7 +12,7 @@ use crate::ids::{CourierId, JobId, OrderId, UserId};
 use crate::job::JobPayload;
 use crate::model::{
     Courier, Depot, NewCourier, NewDepot, NewOrder, NewPlan, NewRoute, NewUser, Order, OrderKind,
-    Plan, PlanCounts, PlanStatus, Role, User,
+    Plan, PlanCounts, PlanStatus, Role, RouteBudget, User,
 };
 
 /// A lease no test outlives.
@@ -79,6 +79,7 @@ pub(crate) async fn new_plan(pool: &PgPool, service_date: NaiveDate) -> NewPlan 
         service_date,
         depot_id: depot(pool).await.id,
         seed: 2026,
+        budget: RouteBudget::new(None, Some(100_000)).unwrap(),
         created_by: user(pool, Role::Operator).await.id,
     }
 }

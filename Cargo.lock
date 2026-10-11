@@ -2726,15 +2726,15 @@ name = "routeforge-solver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "rand 0.10.3",
  "routeforge-domain",
  "routeforge-tsp",
- "serde",
  "serde_json",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
