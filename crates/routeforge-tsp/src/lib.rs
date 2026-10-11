@@ -223,6 +223,33 @@ mod tests {
         }
     }
 
+    /// A search is looked in on once per poll interval, and it ends between two looks.
+    /// So it reports once more as it returns: whoever shows the search then shows its
+    /// result, and not the tour of a moment before.
+    #[test]
+    fn the_last_report_is_of_the_tour_that_is_returned() {
+        // Two hundred stops keep local search busy for a million moves. This budget
+        // ends it half an interval after the second look, while it still improves.
+        let matrix = scattered(200, 5);
+        let budget = POLL_INTERVAL + POLL_INTERVAL / 2;
+        let mut reports = Vec::new();
+        let mut control = Control::max_iterations(budget)
+            .with_progress(|progress, best| reports.push((progress, best.clone())));
+        let tour = optimize_route(&matrix, 5, &mut control);
+        drop(control);
+
+        let (last, best) = reports.last().unwrap();
+        assert_eq!(best, &tour);
+        assert_eq!(last.best_cost, tour.cost());
+        // It says what no report before it could. The look before it came one poll
+        // interval in, give or take the row local search was at, and the search went
+        // on shortening the tour after that.
+        let (before, _) = &reports[reports.len() - 2];
+        assert!((POLL_INTERVAL..budget).contains(&before.iterations));
+        assert!(last.iterations > before.iterations);
+        assert!(before.best_cost > tour.cost());
+    }
+
     #[test]
     fn a_flag_set_beforehand_still_gives_a_route() {
         let matrix = scattered(30, 1);
