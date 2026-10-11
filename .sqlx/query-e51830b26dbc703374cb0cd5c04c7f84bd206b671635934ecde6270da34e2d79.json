@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH next AS (\n               SELECT id\n               FROM jobs\n               WHERE (status = 'queued' AND run_at <= now())\n                  OR (status = 'running' AND lease_expires_at <= now() AND attempt < max_attempts)\n               ORDER BY run_at, id\n               LIMIT 1\n               FOR UPDATE SKIP LOCKED\n           )\n           UPDATE jobs\n           SET status = 'running',\n               attempt = jobs.attempt + 1,\n               claimed_by = $1,\n               lease_expires_at = now() + $2::bigint * interval '1 millisecond',\n               progress = NULL\n           FROM next\n           WHERE jobs.id = next.id\n           RETURNING jobs.id, jobs.plan_id, jobs.payload, jobs.attempt, jobs.max_attempts,\n                     jobs.request_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "plan_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "plan_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "max_attempts",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "max_attempts"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "request_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "request_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "e51830b26dbc703374cb0cd5c04c7f84bd206b671635934ecde6270da34e2d79"
+}

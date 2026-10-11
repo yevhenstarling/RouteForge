@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE plans\n         SET routes_done = routes_done + 1,\n             status = CASE WHEN routes_done + 1 = routes_total THEN 'done' ELSE status END,\n             finished_at = CASE WHEN routes_done + 1 = routes_total THEN now() END\n         WHERE id = $1 AND status = 'routing'\n         RETURNING status",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "status"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b967da3cd7c5c01359ecc871466c3c5da5573c84a2bcfb35397e916ac019c99c"
+}

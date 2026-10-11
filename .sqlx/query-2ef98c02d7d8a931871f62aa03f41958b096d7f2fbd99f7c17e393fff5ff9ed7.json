@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE couriers SET active = $2 WHERE id = $1\n         RETURNING id, name, capacity, active, created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "capacity",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "capacity"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "active",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "active"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2ef98c02d7d8a931871f62aa03f41958b096d7f2fbd99f7c17e393fff5ff9ed7"
+}

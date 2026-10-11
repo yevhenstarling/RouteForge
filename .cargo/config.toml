@@ -1,0 +1,10 @@
+[env]
+# The compile-time checked queries are read from .sqlx/, so a build needs no database:
+# not on a fresh clone, not in CI and not in a Docker image.
+#
+# After changing a query or a migration, run scripts/sqlx-prepare, which rewrites .sqlx/
+# from the compose database, and commit the result.
+#
+# To have the compiler ask a live database while you write queries, set
+# SQLX_OFFLINE=false in the shell. A variable that is set there wins over this file.
+SQLX_OFFLINE = "true"
