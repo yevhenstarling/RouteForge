@@ -22,7 +22,10 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use sqlx::PgExecutor;
+
 use crate::geo::InvalidLatLon;
+use crate::model::UnlimitedBudget;
 use crate::text::UnknownVariant;
 
 pub mod couriers;
@@ -38,9 +41,37 @@ pub mod workers;
 
 /// The schema, embedded from the `migrations` directory of this crate.
 ///
-/// The API runs it at startup. Tests in other crates hand it to
+/// The API runs it at startup, and the solver waits until [`is_migrated`] says it has
+/// been run (D32). Tests in other crates hand it to
 /// `#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]`.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+/// PostgreSQL's code for a query that names a table which does not exist.
+const UNDEFINED_TABLE: &str = "42P01";
+
+/// Whether the database has every migration this build knows.
+///
+/// A database that nothing has been applied to answers `false`, and so does one where
+/// a migration was started and did not succeed. One with migrations this build does
+/// not know answers `true`: it is newer than the build, and what that means for a
+/// service is for the service to decide.
+pub async fn is_migrated(executor: impl PgExecutor<'_>) -> Result<bool, DbError> {
+    let applied = sqlx::query_scalar!("SELECT version FROM _sqlx_migrations WHERE success")
+        .fetch_all(executor)
+        .await;
+    let applied = match applied {
+        Ok(applied) => applied,
+        // sqlx makes its bookkeeping table when it applies the first migration.
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(UNDEFINED_TABLE) => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(MIGRATOR
+        .iter()
+        .filter(|migration| !migration.migration_type.is_down_migration())
+        .all(|migration| applied.contains(&migration.version)))
+}
 
 /// Why a repository or the queue could not do what it was asked.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +102,12 @@ impl From<UnknownVariant> for DbError {
 impl From<InvalidLatLon> for DbError {
     fn from(invalid: InvalidLatLon) -> Self {
         Self::Unreadable(invalid.to_string())
+    }
+}
+
+impl From<UnlimitedBudget> for DbError {
+    fn from(unlimited: UnlimitedBudget) -> Self {
+        Self::Unreadable(unlimited.to_string())
     }
 }
 
@@ -140,5 +177,48 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(applied, MIGRATOR.iter().count() as i64);
+        assert!(is_migrated(&pool).await.unwrap());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_database_is_migrated_once_every_migration_has_succeeded(pool: PgPool) {
+        // Nothing has been applied, so there is not even a bookkeeping table.
+        assert!(!is_migrated(&pool).await.unwrap());
+
+        MIGRATOR.run(&pool).await.unwrap();
+        assert!(is_migrated(&pool).await.unwrap());
+
+        // A migration that was started and did not finish.
+        sqlx::query(
+            "UPDATE _sqlx_migrations SET success = false
+             WHERE version = (SELECT max(version) FROM _sqlx_migrations)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!is_migrated(&pool).await.unwrap());
+
+        // A database that is one migration behind this build.
+        sqlx::query(
+            "DELETE FROM _sqlx_migrations
+             WHERE version = (SELECT max(version) FROM _sqlx_migrations)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!is_migrated(&pool).await.unwrap());
+    }
+
+    /// The database of a newer build has everything this one needs.
+    #[sqlx::test]
+    async fn a_database_ahead_of_this_build_counts_as_migrated(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+             VALUES (9999, 'from a newer build', true, ''::bytea, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(is_migrated(&pool).await.unwrap());
     }
 }

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::{DbError, on_violation, parsed, queue, unsigned};
 use crate::ids::PlanId;
 use crate::job::JobPayload;
-use crate::model::{NewPlan, Plan, PlanCounts, PlanStatus};
+use crate::model::{NewPlan, Plan, PlanCounts, PlanStatus, RouteBudget};
 
 struct PlanRow {
     id: Uuid,
@@ -22,6 +22,8 @@ struct PlanRow {
     depot_id: Uuid,
     status: String,
     seed: i64,
+    budget_time_ms: Option<i64>,
+    budget_iterations: Option<i64>,
     created_by: Uuid,
     orders_total: i64,
     orders_unassigned: i64,
@@ -42,6 +44,7 @@ impl TryFrom<PlanRow> for Plan {
             depot_id: row.depot_id.into(),
             status: parsed(&row.status)?,
             seed: unsigned(row.seed, "plans.seed")?,
+            budget: budget(row.budget_time_ms, row.budget_iterations)?,
             created_by: row.created_by.into(),
             orders_total: unsigned(row.orders_total, "plans.orders_total")?,
             orders_unassigned: unsigned(row.orders_unassigned, "plans.orders_unassigned")?,
@@ -54,24 +57,50 @@ impl TryFrom<PlanRow> for Plan {
     }
 }
 
+/// Reads the two columns that hold a plan's [`RouteBudget`]. A limit that is not set
+/// is a NULL.
+fn budget(time_ms: Option<i64>, iterations: Option<i64>) -> Result<RouteBudget, DbError> {
+    let time_ms = time_ms
+        .map(|ms| unsigned(ms, "plans.budget_time_ms"))
+        .transpose()?;
+    let iterations = iterations
+        .map(|moves| {
+            u64::try_from(moves)
+                .map_err(|_| DbError::Unreadable(format!("plans.budget_iterations is {moves}")))
+        })
+        .transpose()?;
+    Ok(RouteBudget::new(time_ms, iterations)?)
+}
+
 /// Stores a new plan as queued, without a job. [`submit`] is the whole step.
 ///
 /// # Errors
 ///
 /// [`DbError::ActivePlanExists`] if the service date has a plan that is queued or
-/// routing.
+/// routing. [`DbError::OutOfRange`] if the budget allows more moves than fit a signed
+/// 64-bit number.
 pub async fn create(executor: impl PgExecutor<'_>, new: &NewPlan) -> Result<Plan, DbError> {
+    let budget_iterations = new
+        .budget
+        .iterations()
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| DbError::OutOfRange("the plan's iteration budget"))?;
     sqlx::query_as!(
         PlanRow,
-        "INSERT INTO plans (id, service_date, depot_id, seed, created_by)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, service_date, depot_id, status, seed, created_by, orders_total,
-                   orders_unassigned, routes_total, routes_done, error, created_at, finished_at",
+        "INSERT INTO plans (id, service_date, depot_id, seed, created_by, budget_time_ms,
+                            budget_iterations)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,
+                   created_by, orders_total, orders_unassigned, routes_total, routes_done, error,
+                   created_at, finished_at",
         PlanId::generate().0,
         new.service_date,
         new.depot_id.0,
         i64::from(new.seed),
         new.created_by.0,
+        new.budget.time_ms().map(i64::from),
+        budget_iterations,
     )
     .fetch_one(executor)
     .await
@@ -110,8 +139,9 @@ pub async fn submit(
 pub async fn get(executor: impl PgExecutor<'_>, id: PlanId) -> Result<Option<Plan>, DbError> {
     sqlx::query_as!(
         PlanRow,
-        "SELECT id, service_date, depot_id, status, seed, created_by, orders_total,
-                orders_unassigned, routes_total, routes_done, error, created_at, finished_at
+        "SELECT id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,
+                created_by, orders_total, orders_unassigned, routes_total, routes_done, error,
+                created_at, finished_at
          FROM plans
          WHERE id = $1",
         id.0,
@@ -204,6 +234,7 @@ mod tests {
             service_date: date(12),
             depot_id: depot.id,
             seed: u32::MAX,
+            budget: RouteBudget::new(Some(10_000), None).unwrap(),
             created_by: operator.id,
         };
         let created = create(&pool, &new).await.unwrap();
@@ -212,6 +243,7 @@ mod tests {
         assert_eq!(created.depot_id, depot.id);
         assert_eq!(created.status, PlanStatus::Queued);
         assert_eq!(created.seed, u32::MAX);
+        assert_eq!(created.budget, new.budget);
         assert_eq!(created.created_by, operator.id);
         assert_eq!(
             (
@@ -225,6 +257,66 @@ mod tests {
         assert_eq!((&created.error, created.finished_at), (&None, None));
         assert_eq!(get(&pool, created.id).await.unwrap(), Some(created));
         assert_eq!(get(&pool, PlanId::generate()).await.unwrap(), None);
+    }
+
+    #[sqlx::test]
+    async fn every_shape_of_budget_can_be_stored(pool: PgPool) {
+        let new = testing::new_plan(&pool, date(12)).await;
+        let budgets = [
+            RouteBudget::new(Some(0), None),
+            RouteBudget::new(Some(u32::MAX), None),
+            RouteBudget::new(None, Some(0)),
+            RouteBudget::new(None, Some(i64::MAX as u64)),
+            RouteBudget::new(Some(2_500), Some(1_000_000)),
+        ];
+        // A date has one plan in progress, so each budget gets a date of its own.
+        for (day, budget) in (12..).zip(budgets) {
+            let new = NewPlan {
+                service_date: date(day),
+                budget: budget.unwrap(),
+                ..new
+            };
+            let created = create(&pool, &new).await.unwrap();
+            assert_eq!(created.budget, new.budget);
+            let read_back = get(&pool, created.id).await.unwrap().unwrap();
+            assert_eq!(read_back.budget, new.budget);
+        }
+
+        // More moves than the column can count.
+        let too_many = NewPlan {
+            service_date: date(20),
+            budget: RouteBudget::new(None, Some(u64::MAX)).unwrap(),
+            ..new
+        };
+        let error = create(&pool, &too_many).await.unwrap_err();
+        assert!(matches!(error, DbError::OutOfRange(_)), "{error:?}");
+    }
+
+    #[sqlx::test]
+    async fn the_schema_refuses_a_plan_without_a_usable_budget(pool: PgPool) {
+        let plan = testing::plan(&pool, date(12)).await;
+        let unusable: [(Option<i64>, Option<i64>); 4] = [
+            (None, None),
+            (Some(-1), None),
+            (Some(i64::from(u32::MAX) + 1), None),
+            (None, Some(-1)),
+        ];
+        for (time_ms, iterations) in unusable {
+            let error = sqlx::query(
+                "UPDATE plans SET budget_time_ms = $2, budget_iterations = $3 WHERE id = $1",
+            )
+            .bind(plan.id.0)
+            .bind(time_ms)
+            .bind(iterations)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().constraint(),
+                Some("plans_budget_check"),
+                "{time_ms:?}, {iterations:?}"
+            );
+        }
     }
 
     #[sqlx::test]

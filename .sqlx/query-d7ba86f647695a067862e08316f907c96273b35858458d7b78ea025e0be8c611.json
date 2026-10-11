@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO plans (id, service_date, depot_id, seed, created_by)\n         VALUES ($1, $2, $3, $4, $5)\n         RETURNING id, service_date, depot_id, status, seed, created_by, orders_total,\n                   orders_unassigned, routes_total, routes_done, error, created_at, finished_at",
+  "query": "SELECT id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,\n                created_by, orders_total, orders_unassigned, routes_total, routes_done, error,\n                created_at, finished_at\n         FROM plans\n         WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,28 @@
       },
       {
         "ordinal": 5,
+        "name": "budget_time_ms",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "budget_time_ms"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "budget_iterations",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "budget_iterations"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_by",
         "type_info": "Uuid",
         "origin": {
@@ -70,7 +92,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "orders_total",
         "type_info": "Int8",
         "origin": {
@@ -81,7 +103,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "orders_unassigned",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +114,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "routes_total",
         "type_info": "Int8",
         "origin": {
@@ -103,7 +125,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "routes_done",
         "type_info": "Int8",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "error",
         "type_info": "Text",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -136,7 +158,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "finished_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -149,10 +171,6 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Date",
-        "Uuid",
-        "Int8",
         "Uuid"
       ]
     },
@@ -162,6 +180,8 @@
       false,
       false,
       false,
+      true,
+      true,
       false,
       false,
       false,
@@ -172,5 +192,5 @@
       true
     ]
   },
-  "hash": "655b4e04b39831403772f3d8655130509151d5e3d9db3d453a3d665444c2baa3"
+  "hash": "d7ba86f647695a067862e08316f907c96273b35858458d7b78ea025e0be8c611"
 }

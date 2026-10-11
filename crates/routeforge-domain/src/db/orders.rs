@@ -113,6 +113,28 @@ pub async fn list(
     orders(rows)
 }
 
+/// The orders with these ids, oldest first. An id that names no order is left out.
+///
+/// This is how a route job reads its stops.
+pub async fn list_by_ids(
+    executor: impl PgExecutor<'_>,
+    ids: &[OrderId],
+) -> Result<Vec<Order>, DbError> {
+    let ids: Vec<Uuid> = ids.iter().map(|id| id.0).collect();
+    let rows = sqlx::query_as!(
+        OrderRow,
+        "SELECT id, client_id, kind, status, service_date, lat, lon, address, demand,
+                plan_id, created_at
+         FROM orders
+         WHERE id = ANY($1)
+         ORDER BY id",
+        &ids,
+    )
+    .fetch_all(executor)
+    .await?;
+    orders(rows)
+}
+
 /// Withdraws an order. Only a pending order can be withdrawn.
 ///
 /// Returns `false`, and changes nothing, if the order is planned, already cancelled or
@@ -315,6 +337,23 @@ mod tests {
             .await
             .is_empty()
         );
+    }
+
+    #[sqlx::test]
+    async fn orders_can_be_read_by_their_ids(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let first = testing::order(&pool, client.id, date(12)).await;
+        let _between = testing::order(&pool, client.id, date(12)).await;
+        let other_day = testing::order(&pool, client.id, date(13)).await;
+
+        // In the order they were created, whatever the order they were asked for in,
+        // and without the id that names no order.
+        let asked = [other_day.id, OrderId::generate(), first.id];
+        assert_eq!(
+            list_by_ids(&pool, &asked).await.unwrap(),
+            [first, other_day]
+        );
+        assert!(list_by_ids(&pool, &[]).await.unwrap().is_empty());
     }
 
     #[sqlx::test]

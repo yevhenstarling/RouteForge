@@ -27,7 +27,7 @@ pub use ids::{CourierId, DepotId, JobId, OrderId, PlanId, RouteId, UserId, Worke
 pub use job::{Job, JobKind, JobPayload, JobProgress, JobStatus, WorkerInfo};
 pub use model::{
     Courier, Credentials, Depot, NewCourier, NewDepot, NewOrder, NewPlan, NewRoute, NewUser, Order,
-    OrderFilter, OrderKind, OrderStatus, Plan, PlanCounts, PlanStatus, Role, Route, RouteStop,
-    User,
+    OrderFilter, OrderKind, OrderStatus, Plan, PlanCounts, PlanStatus, Role, Route, RouteBudget,
+    RouteStop, UnlimitedBudget, User,
 };
 pub use text::UnknownVariant;
