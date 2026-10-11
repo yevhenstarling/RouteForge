@@ -36,6 +36,7 @@ Derived from the description:
 ```
 RouteForge/
 ├─ Cargo.toml, rust-toolchain.toml, .env.example
+├─ .cargo/config.toml       builds read query metadata from .sqlx/
 ├─ Dockerfile, docker-compose.yml
 ├─ crates/
 │  ├─ routeforge-tsp/       pure algorithms; benches/, examples/
@@ -44,7 +45,7 @@ RouteForge/
 │  ├─ routeforge-solver/    worker binary
 │  └─ routeforge-bot/       teloxide binary
 ├─ web/                     index.html, vendor/leaflet
-├─ scripts/                 demo.ps1, demo.sh
+├─ scripts/                 sqlx-prepare.ps1, sqlx-prepare.sh; later demo.ps1, demo.sh
 ├─ docs/                    description.md, plan.md, architecture.md
 └─ .sqlx/                   offline query metadata (committed)
 ```
@@ -55,7 +56,7 @@ RouteForge/
 |---|---|---|---|---|
 | 0 | Skeleton and tooling | Empty workspace builds, lints and tests | S | done locally; CI not run yet |
 | 1 | Algorithms (`routeforge-tsp`) | Cost falling stage by stage on a random instance; benchmarks | L | done |
-| 2 | Schema and job queue (`routeforge-domain`) | Queue tests: exclusive claim, lease expiry, fenced completion | L | todo |
+| 2 | Schema and job queue (`routeforge-domain`) | Queue tests: exclusive claim, lease expiry, fenced completion | L | done |
 | 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | todo |
 | 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | todo |
 | 5 | Live updates and map | Routes appearing and improving live in the browser | M | todo |
@@ -77,10 +78,9 @@ Delivered:
 - `docs/description.md`, this plan, `docs/architecture.md`, and `CLAUDE.md`.
 - `.cargo/audit.toml` with one justified ignore (D12).
 
-Not verified yet, because each needs something outside the repository:
+Not verified yet, because it needs something outside the repository:
 
-- The CI workflow has not run. It runs on the first push of `dev` or the first pull request.
-- `docker compose up -d db` has not been run, because Docker Desktop was not installed yet. Phase 2 is the first phase that needs it.
+- The CI workflow has not run. It runs on the first push of `dev` or the first pull request. Phase 2 added two steps to it, which are as untested as the rest.
 
 ## Phase 1: algorithms (`routeforge-tsp`)
 
@@ -105,21 +105,32 @@ What later phases need from it, with the reasons in the decision log:
 
 ## Phase 2: schema and job queue (`routeforge-domain`)
 
-First phase that needs Postgres.
+The first phase that needs Postgres.
 
-- Migrations inside the crate: `users`, `depots`, `couriers`, `orders`, `plans`, `routes`, `route_stops`, `jobs`, `workers`. A partial index on claimable jobs; a unique index allowing one active plan per service date.
-- Types: id newtypes, `Role`, order/plan/job status enums, `JobPayload` (tagged enum stored as JSONB), `LatLon`, DTOs.
-- Geo: haversine, a local planar projection for sweep, `DistanceProvider` and `Haversine`.
-- Repositories for users, couriers, orders, plans and routes with sqlx compile-time checked queries.
-- Queue operations:
-  - `enqueue`, with `NOTIFY`.
-  - `claim`: `FOR UPDATE SKIP LOCKED`; also takes jobs whose lease has expired.
-  - `heartbeat`: extends the lease, stores progress, reports a cancel request or a lost lease.
-  - `complete`: fenced; runs the caller's result writes in the same transaction.
-  - `fail` (retry with backoff, terminal after max attempts), `release`, `request_cancel`.
-  - Worker registry upsert, for the worker-load view.
-- Tests against real Postgres with `#[sqlx::test]`: many concurrent claimers and each job claimed once; an expired lease is re-claimed; a stale worker cannot complete; cancel propagates; max attempts ends in `failed`; route jobs completing at the same moment mark the plan done exactly once.
-- **Done when:** the queue test suite passes against the compose database.
+Delivered:
+
+- Migrations inside the crate, `0001_domain.sql` and `0002_queue.sql`: `users`, `depots`, `couriers`, `plans`, `orders`, `routes`, `route_stops`, `jobs`, `workers`. A partial index over the unfinished jobs. A unique index that allows one plan in progress per service date. Unique constraints that keep an order on one route and give a courier one route per plan.
+- Types: an id type per table, `Role`, the order, plan and job status enums, `JobPayload` (a tagged enum stored as JSONB), `LatLon`, and the entities with their `New…` inputs, which are the DTOs.
+- Geo: `haversine_m`, `Projection` for the sweep, `DistanceProvider` with `Haversine`, and `DistanceTable`.
+- Repositories with compile-time checked queries, one module per table under `db`: `users`, `depots`, `couriers`, `orders`, `plans`, `routes`.
+- The queue, `db::queue`: `enqueue` with `NOTIFY`, `claim`, `heartbeat`, `begin_complete` with its `Completion`, `fail`, `release`, `cancel_plan`, and two readers. `db::workers` is the registry.
+- Query metadata in `.sqlx/`, `SQLX_OFFLINE` set in `.cargo/config.toml`, `scripts/sqlx-prepare` for both shells, and a CI step that fails when the metadata is stale.
+- Tests: 90 in the crate, 62 of them against PostgreSQL through `#[sqlx::test]`. The six this plan asked for are among them: eight claimers drain 60 jobs and each job is claimed once; an expired lease is claimed again; a worker that lost its job can do nothing to it; cancelling stops the jobs and frees the orders; three failed attempts fail the job and its plan; route jobs completing at the same moment mark the plan done once.
+- The queue tests were tried against six faults put into the queue on purpose: the plan lock taken out of a completion, and out of a final failure; the comparison of the attempt number weakened; `SKIP LOCKED` removed; an exhausted job claimable again; and nobody burying. Each made the test written for it fail, the first two with PostgreSQL's "deadlock detected".
+
+Two names differ from what this plan first said, for reasons in the decision log: `complete` became `begin_complete` and a `Completion` (D25), and `request_cancel` became `cancel_plan` (D23).
+
+What later phases need from it:
+
+- Phase 3: the `plan` job does all its work inside its completion: `queue::begin_complete`, `orders::lock_pending`, cluster, `orders::mark_planned`, one `queue::enqueue` per cluster with the plan job's request id, `plans::start_routing`, `commit`. A route job completes with `routes::insert` and `plans::route_finished`, both through `completion.conn()`.
+- Phase 3: a worker passes spans of time and never a timestamp (D6). It should send its heartbeat well inside the lease, and stop the solve on `Heartbeat::Cancelled` and on `Heartbeat::Lost` alike.
+- Phase 3: `queue::claim` returns `DbError::Unreadable` for a job this build cannot read, after counting the attempt as failed. Log it and claim again.
+- Phase 3: a plan's seed is a `u32`, so it survives JSON in a browser. The seed of a route job is a `u64`. The plan's seed in the high half and the number of the cluster in the low half is one way to derive it.
+- Phase 3: how long a route may be optimized is not in the schema. Add it with a migration when the solver's settings are designed.
+- Phases 3 and 4: database tests in other crates use `#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]`. A test pool has five connections, so a test must not hold more than that at once.
+- Phase 4: `plans::submit` is the whole "create a plan" step. `DbError::ActivePlanExists` and `DbError::EmailTaken` are the two conflicts to turn into `409`. `orders::cancel` returns `false` for an order that is no longer pending.
+- Phase 4: the DTOs have no OpenAPI derives yet. Add `utoipa` to the domain crate behind a feature. `orders::list` has no paging, and the queue has no depth statistics.
+- Phase 4: decide whether a plan that is done may be replaced (D20).
 
 ## Phase 3: solver worker (`routeforge-solver`)
 
@@ -179,7 +190,9 @@ First phase that needs Postgres.
 
 ## Known traps
 
-- **sqlx compile-time queries** need a live database or committed `.sqlx/` metadata. Docker builds use `SQLX_OFFLINE=true`; CI runs `cargo sqlx prepare --check`.
+- **sqlx compile-time queries** are checked against the metadata in `.sqlx/`, not against a database: `.cargo/config.toml` sets `SQLX_OFFLINE`. After changing a query or a migration, run `scripts/sqlx-prepare` and commit the result, or the build fails with "no cached data for this query". The script needs `sqlx-cli`, and the command that installs it is at the top of the script. To have the compiler ask the live database while writing queries, set `SQLX_OFFLINE=false` in the shell.
+- **An applied migration must not be edited.** sqlx keeps a checksum of each and refuses one that has changed. Add a new migration instead.
+- **`localhost` on Windows with Docker Desktop.** It resolves to `::1` first, and a connection to the published port hangs there for about 20 seconds before the client falls back to IPv4. `DATABASE_URL` therefore says `127.0.0.1`.
 - **Native build tools.** The development machine has no CMake or NASM. Phase 0 chose features that need neither (D12); a new dependency must not bring OpenSSL or aws-lc back in.
 - **Recent major releases.** sqlx 0.9, utoipa 6, rand 0.10, jsonwebtoken 11, argon2 0.6 and criterion 0.8 are all newer than most tutorials. Read docs.rs for the pinned version.
 - **2-opt assumes a symmetric matrix**, and OSRM road distances are not symmetric. `DistanceMatrix` rejects an asymmetric table (D14), so the solver symmetrizes for the search and reports the real directed length itself.
@@ -189,7 +202,7 @@ First phase that needs Postgres.
 
 ## Needed from the project owner
 
-- Docker Desktop installed before Phase 2. Phase 1 does not need it.
+- `sqlx-cli` on any machine where a query or a migration is changed. The command that installs it is at the top of `scripts/sqlx-prepare`.
 - Before Phase 7: a Telegram bot token from @BotFather and an Anthropic API key.
 - If the bootcamp grades against a rubric (coverage, report, presentation format), it gets folded into Phase 8.
 

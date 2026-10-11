@@ -21,6 +21,7 @@ From Phase 2 on, tests need Postgres: `docker compose up -d db`, with `.env` cop
 - No `unsafe`. No `unwrap()` outside tests.
 - Route costs are integer metres.
 - Lease and retry times come from the database clock, not the worker's.
+- After changing a query or a migration, run `scripts/sqlx-prepare.ps1` (or `.sh`) and commit `.sqlx/`: builds check queries against that directory, not a database (D28). Never edit a migration that has been merged; add a new one.
 - Nothing may need OpenSSL, CMake or NASM to build: TLS stays on rustls with ring, crypto on pure-Rust backends (D12).
 
 ## Dependencies
