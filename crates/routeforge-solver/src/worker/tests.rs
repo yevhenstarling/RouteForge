@@ -10,12 +10,13 @@ use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use routeforge_domain::db::queue::MAX_ATTEMPTS;
+use routeforge_domain::db::queue::{MAX_ATTEMPTS, PLANS_CHANNEL, PROGRESS_CHANNEL};
 use routeforge_domain::db::{orders, plans, routes};
 use routeforge_domain::{
     CourierId, Job, JobKind, JobStatus, Order, OrderId, OrderStatus, Plan, PlanCounts, PlanId,
-    PlanStatus,
+    PlanStatus, RouteProgress,
 };
+use sqlx::postgres::PgListener;
 
 use super::*;
 use crate::testing::{
@@ -499,4 +500,82 @@ async fn what_a_job_logs_carries_the_ids_to_follow_it_by(pool: PgPool) {
         );
         assert_eq!(field(line, "attempt").as_deref(), Some("1"));
     }
+}
+
+/// What the event streams of the API are fed with (D48, D49): every step of a plan is
+/// announced to those who watch it, and so is each of its searches while it runs.
+#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+async fn a_watcher_can_follow_a_plan_from_the_queue_to_its_routes(pool: PgPool) {
+    let _turn = one_at_a_time().await;
+    let city = testing::city(&pool, &[6, 6]).await;
+    city.orders(&pool, date(12), 12, 2).await;
+    let config = Config {
+        progress: Duration::from_millis(100),
+        ..testing::config()
+    };
+    let fleet = Fleet::with_workers(&pool, config, 2);
+    let mut watcher = PgListener::connect_with(&pool).await.unwrap();
+    watcher
+        .listen_all([PLANS_CHANNEL, PROGRESS_CHANNEL])
+        .await
+        .unwrap();
+
+    let new = city.new_plan(date(12), millis(600));
+    let plan = plans::submit(&pool, &new, None).await.unwrap();
+    done(&pool, plan.id).await;
+    fleet.stop().await;
+
+    let mut changes = 0;
+    let mut searches: Vec<RouteProgress> = Vec::new();
+    let silence = Duration::from_millis(300);
+    while let Ok(notification) = tokio::time::timeout(silence, watcher.recv()).await {
+        let notification = notification.unwrap();
+        if notification.channel() == PLANS_CHANNEL {
+            assert_eq!(notification.payload(), plan.id.to_string());
+            changes += 1;
+        } else {
+            searches.push(serde_json::from_str(notification.payload()).unwrap());
+        }
+    }
+    // The plan submitted, its `plan` job claimed and done, and each of the two route
+    // jobs claimed and done. Each is a transaction, and is said once.
+    assert_eq!(changes, 7);
+
+    let jobs = queue::list_for_plan(&pool, plan.id).await.unwrap();
+    let stored = routes::list_for_plan(&pool, plan.id).await.unwrap();
+    assert_eq!((jobs.len(), stored.len()), (3, 2));
+    for job in &jobs[1..] {
+        let JobPayload::Route {
+            courier_id,
+            order_ids,
+            ..
+        } = &job.payload
+        else {
+            panic!("{:?} is not a route job", job.payload);
+        };
+        let of_this_job: Vec<&RouteProgress> = searches
+            .iter()
+            .filter(|progress| progress.job_id == job.id)
+            .collect();
+        assert!(
+            of_this_job.len() >= 2,
+            "{} announcements of a search of 600 ms",
+            of_this_job.len()
+        );
+        let route = stored
+            .iter()
+            .find(|route| route.courier_id == *courier_id)
+            .expect("the job stored a route for its courier");
+        for progress in of_this_job {
+            assert_eq!((progress.plan_id, progress.attempt), (plan.id, 1));
+            // Its route calls at every stop of the job once.
+            let mut places = progress.order.clone().unwrap();
+            places.sort_unstable();
+            assert!(places.into_iter().eq(0..order_ids.len() as u32));
+            // And the route that was stored is no longer than any announced on the way.
+            assert!(progress.best_cost_m >= route.distance_m);
+        }
+    }
+    let known = |progress: &RouteProgress| jobs.iter().any(|job| job.id == progress.job_id);
+    assert!(searches.iter().all(known));
 }

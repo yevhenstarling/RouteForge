@@ -38,6 +38,7 @@ services:
       SOLVER_LEASE_SECS:
       SOLVER_HEARTBEAT_SECS:
       SOLVER_POLL_SECS:
+      SOLVER_PROGRESS_MS:
       LOG_FORMAT:
       RUST_LOG:
     depends_on:
