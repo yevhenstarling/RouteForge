@@ -24,6 +24,7 @@ Confirmed with the project owner:
 - **The stack starts with no settings.** A fresh clone has no key to sign tokens with and no admin. Compose falls back to values for a demonstration, which are in the repository for everybody to read, and the ports are open to the machine alone (D54).
 - **The bot is in the stack before it is built.** Its image and its compose service are Phase 6's, with a stub that idles. The bot itself stays Phase 7's (D56).
 - **Phase 6 has a quick start in the README, and leaves CI alone.** Starting the stack in CI, and running the demo script there, were offered beside it and not taken.
+- **The bot takes buttons and commands, not free text.** A location and a few buttons say what an order needs. Free text through the Claude API, which the description names, is an optional item of Phase 8 and is built only when there is a key to try it with (D58).
 
 Derived from the description:
 
@@ -37,8 +38,8 @@ Derived from the description:
 - **Anytime and deterministic.** The RNG is a named seeded generator (ChaCha8). Annealing cools by iteration count, in fixed-length epochs with reheats; the deadline and the cancel flag only cut that trajectory short. Same seed plus same iteration budget gives an identical route. Tests use iteration budgets, not wall-clock time.
 - **Queue guarantee.** Delivery is at-least-once: a lease can expire and the job is retried. Completion is fenced: results are written in the same transaction that marks the job done, and only if the worker still holds the lease. Lease times use the database clock, never the worker's.
 - **Capacity, version 1.** A route is feasible when the sum of all its demands, pickups and deliveries together, fits the courier's capacity. This is stricter than mixed routes need and always safe. Tracking the real load along the route is in Phase 8.
-- **Offline.** Haversine by default, Leaflet vendored into the repo, map tiles optional (routes still draw without them), and the bot idles when its tokens are absent.
-- **Bot authority.** The bot calls the API with the Telegram user's own short-lived JWT, so the model can never do more than that user's role allows. Anything with a side effect needs a button confirmation handled in code.
+- **Offline.** Haversine by default, Leaflet vendored into the repo, map tiles optional (routes still draw without them), and the bot idles when its Telegram token is absent.
+- **Bot authority.** The bot calls the API with the Telegram user's own short-lived JWT, so it can never do more than that user's role allows. Anything with a side effect needs a button confirmation handled in code.
 
 ## Target layout
 
@@ -73,7 +74,7 @@ RouteForge/
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | todo |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | M | todo |
 
-**Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two tools (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description.
+**Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58).
 
 ## Phase 0: skeleton and tooling
 
@@ -308,19 +309,23 @@ What later phases need from it:
 ## Phase 7: Telegram bot (`routeforge-bot`)
 
 - API side: `users.telegram_id`, and a service-key endpoint that maps a Telegram user to a RouteForge user and returns a short-lived JWT for them.
-- Bot: teloxide long polling, so no public URL is needed; bounded per-chat history in memory.
-- Claude client over `reqwest` against the Messages API (there is no official Rust SDK), with a hand-written tool loop: capped iterations, all tool results of a turn returned in one message, assistant content echoed back unchanged, `refusal` and `max_tokens` stop reasons handled.
-- Tools with strict schemas. Clients: `create_order`, `list_my_orders`, `get_order`, `cancel_order`. Operators also: `list_pending_orders`, `create_plan`, `get_plan_status`.
-- Location comes from Telegram's share-location message.
-- Model id from env, default `claude-opus-5-5`. Running a cheaper model is a config change and the owner's call.
-- Tests: the tool loop against a scripted fake model; request and response shapes with wiremock.
-- **Done when:** sharing a location and writing "deliver two parcels here tomorrow" produces, after confirmation, an order visible on the map.
+- Bot: teloxide long polling, so no public URL is needed; the state of each chat's dialogue in memory. No model is asked anything (D58). The manifest of the crate still calls the bot an LLM agent, which this phase corrects.
+- Placing an order is a dialogue. It starts with Telegram's share-location message, asks with buttons for the kind, the number of parcels and the day, shows what it is about to place, and places it on a confirming button (D9).
+- The rest are commands, with buttons where there is something to pick. Clients: `list_my_orders`, `get_order`, `cancel_order`. Operators also: `list_pending_orders`, `create_plan`, `get_plan_status`.
+- Tests: the dialogue step by step against a fake of the API; the bot's requests, their paths and their tokens, against a mock server (wiremock).
+- **Done when:** sharing a location and choosing a delivery of two parcels for tomorrow produces, after confirmation, an order visible on the map.
 
 ## Phase 8: OSRM, hardening, presentation
 
 - `OsrmProvider` in the solver using OSRM's table service, falling back to Haversine on error; an `osrm` compose profile.
 - Real load tracking for mixed pickup and delivery routes.
 - Address geocoding for the bot.
+- Optional, and only with an Anthropic API key to try it with (D58): free text for the bot.
+  - A Claude client over `reqwest` against the Messages API (there is no official Rust SDK), with a hand-written tool loop: capped iterations, all tool results of a turn returned in one message, assistant content echoed back unchanged, `refusal` and `max_tokens` stop reasons handled.
+  - The tools, with strict schemas, are the operations the bot has from Phase 7. A side effect is still confirmed with a button (D9). Bounded per-chat history in memory.
+  - Model id from env, default `claude-opus-5-5`. Running a cheaper model is a config change and the owner's call.
+  - Tests: the tool loop against a scripted fake model; request and response shapes with wiremock.
+  - Left out, the README says that the bot takes no free text, and why.
 - README with benchmark numbers, quality against time, and the scaling table; final architecture doc; `cargo audit` in CI.
 
 ## Known traps
@@ -360,7 +365,9 @@ What later phases need from it:
 
 - `sqlx-cli` on any machine where a query or a migration is changed. The command that installs it is at the top of `scripts/sqlx-prepare`.
 - `curl` and `jq` on a machine where `scripts/demo.sh` is run. `scripts/demo.ps1` needs neither.
-- Before Phase 7: a Telegram bot token from @BotFather and an Anthropic API key.
+- Before Phase 7: a Telegram bot token from @BotFather.
+- For the optional free text of the bot in Phase 8: an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58).
+- If the bootcamp holds the result to the approved description: whether the bot may come without its LLM part (D58).
 - If the bootcamp grades against a rubric (coverage, report, presentation format), it gets folded into Phase 8.
 
 ## Verification

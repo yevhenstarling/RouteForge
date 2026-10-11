@@ -104,7 +104,7 @@ Why: it never overloads a courier and needs no knowledge of the stop order. It i
 
 ### D8. The demo works without the internet (in place, but for the bot)
 
-Distances default to Haversine. The Leaflet library is vendored into the repository. Map tiles are optional: without them the routes still draw. The bot idles when its tokens are missing.
+Distances default to Haversine. The Leaflet library is vendored into the repository. Map tiles are optional: without them the routes still draw. The bot idles when its Telegram token is missing.
 
 Haversine has been the default since Phase 3. The page and its Leaflet are in the binary of the API, and a test fails if the page names any host but the tile server (D52). The bot is Phase 7. Until then a stub that idles has its place in the stack (D56).
 
@@ -508,7 +508,7 @@ An order that belongs to another client is a `404` to a client, with the very bo
 
 Why:
 
-- A client has one shape of error to read: the page, and the bot, whose model is handed the `detail`. actix-web answers a body it cannot read, or a path it does not serve, in plain text. So the API sets its own handlers for bodies, paths and queries, and its own answer for whatever matches no route.
+- A client has one shape of error to read: the page, and the bot, which shows a person the `detail`. actix-web answers a body it cannot read, or a path it does not serve, in plain text. So the API sets its own handlers for bodies, paths and queries, and its own answer for whatever matches no route.
 - A `403` for somebody else's order would say that the order exists.
 - The cause of a `500` may name a table, a constraint or a host. It is logged, with the id of the request (D42), and not sent.
 - The path has no version in it. Nothing plans a second one, and whoever calls the API beside Swagger UI is in this repository.
@@ -913,3 +913,21 @@ Two things the scripts guard against, both met while they were written:
 
 - **How many solvers.** From inside PowerShell, `-Solvers 1,2,4,8` is a list. Started any other way, as `pwsh -File scripts/demo.ps1 -Solvers 1,2,4,8`, the script is handed one text, and PowerShell reads that text as the number 1248. Compose was asked for 1248 solvers, and had created every one of those containers and started some four hundred before it was stopped. The counts are now taken as text and read by the script, and anything but 1 to 20 is refused before compose is asked (D54).
 - **No `--build`.** The scripts start the stack with `docker compose up`, which builds an image that is missing and leaves one that is there. With `--build` they would need the registry every time (D54), and the demo is to work without a network (D8).
+
+### D58. The bot takes buttons and commands, and free text waits for a key (planned)
+
+Decided by the project owner on 2026-10-12.
+
+The bot of Phase 7 asks no model anything. A person shares a location, and the bot asks with buttons for what an order needs beside it: a delivery or a pickup, how many parcels, and which day. It shows what it is about to place, and places it when that is confirmed (D9). Whatever else a client or an operator may do is a command.
+
+The approved description calls the bot LLM-powered and names the Claude API. That part is not given up. It is below the cut line: free text is an optional item of Phase 8, built only when there is an Anthropic API key to try it with. `docs/description.md` stays as it was approved, and until the item is built the README says that the bot takes no free text.
+
+Why:
+
+- The Claude API wants a key from an account of its own, with credit on it, paid for by the token. A Claude subscription does not include one. Phase 7 does not wait for it.
+- An order says four things: where, which kind, how much and which day. A location and three buttons say them, the same way every time, which is what a presentation wants.
+- The bot then leans on no service but Telegram that can be slow, down or out of credit on the day. Whoever clones the repository needs one token, from @BotFather, to see all of it.
+- Nothing is built twice. What a button does and what a tool of a model would do is the same request to the API, so free text goes on top of the bot of Phase 7.
+- Code for the Claude API that was never run against the Claude API is not shipped. A scripted model shows that the loop is right, and not that the requests are what the API takes. So that part is not written ahead of a key.
+
+What it costs: "deliver two parcels here tomorrow" is a few taps and not a sentence, and for as long as the item of Phase 8 is not built the bot is less than the description says of it.
