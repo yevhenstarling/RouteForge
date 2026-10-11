@@ -165,7 +165,10 @@ fn set(var: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use routeforge_domain::Login;
+
     use super::*;
+    use crate::validate;
 
     fn vars<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |name| {
@@ -321,5 +324,72 @@ mod tests {
             };
             assert!(error.to_string().contains(missing), "{error}");
         }
+    }
+
+    /// The lines of the `api` service in `docker-compose.yml`, as they are on a clone
+    /// that has no `.env`: every `${VARIABLE:-fallback}` replaced by its fallback.
+    fn api_service_of_the_stack() -> Vec<String> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docker-compose.yml");
+        let compose = std::fs::read_to_string(path).unwrap();
+        compose
+            .lines()
+            .skip_while(|line| *line != "  api:")
+            .skip(1)
+            // The service ends where a line is indented as little as its own name.
+            .take_while(|line| line.starts_with("    ") || line.trim().is_empty())
+            .map(|line| fallbacks(line.trim()))
+            .collect()
+    }
+
+    /// `text` with every `${VARIABLE:-fallback}` replaced by its fallback. A variable
+    /// without one would be empty on a fresh clone, which is what must not be.
+    fn fallbacks(text: &str) -> String {
+        let mut resolved = String::new();
+        let mut rest = text;
+        while let Some((before, variable)) = rest.split_once("${") {
+            let (variable, after) = variable.split_once('}').expect("a `${` is closed");
+            let (_, fallback) = variable
+                .split_once(":-")
+                .unwrap_or_else(|| panic!("${{{variable}}} has nothing to fall back on"));
+            resolved.push_str(before);
+            resolved.push_str(fallback);
+            rest = after;
+        }
+        resolved + rest
+    }
+
+    /// A fresh clone has no `.env`, and `docker compose up` is to be all it needs
+    /// (D54). So what the compose file falls back to has to be settings the API
+    /// starts with.
+    #[test]
+    fn the_stack_starts_on_what_the_compose_file_falls_back_to() {
+        let service = api_service_of_the_stack();
+        let given = |name: &str| {
+            service.iter().find_map(|line| {
+                let (key, value) = line.split_once(": ")?;
+                (key == name).then(|| value.to_owned())
+            })
+        };
+
+        let secrets = Secrets::from_vars(given).unwrap();
+        // On the compose network, where the database is `db`.
+        assert!(
+            secrets.database_url.ends_with("@db:5432/routeforge"),
+            "{}",
+            secrets.database_url
+        );
+        let admin = secrets.admin.expect("an admin to log in as");
+        let login = Login {
+            email: admin.email,
+            password: admin.password,
+        };
+        validate::registration(&login).expect("an account the API makes when it starts");
+
+        let config = Config::from_vars(given).unwrap();
+        // Every address of the container, on the port that is published, which is
+        // open to this machine alone.
+        assert_eq!(config.bind, "0.0.0.0:8080".parse().unwrap());
+        let published = "- \"127.0.0.1:8080:8080\"".to_owned();
+        assert!(service.contains(&published), "{service:#?}");
     }
 }
