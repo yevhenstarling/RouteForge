@@ -1,5 +1,20 @@
+# Build output and what belongs to this machine.
 target/
 .git/
-.github/
 .env
+.claude/
+.idea/
+.vscode/
+
+# Not needed to build an image. Left out, a change to them rebuilds nothing.
+.github/
 docs/
+scripts/
+*.md
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# The tag of the base image pins the compiler (D10). With this file in the context,
+# rustup would also fetch the clippy and rustfmt it names.
+rust-toolchain.toml

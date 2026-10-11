@@ -18,5 +18,30 @@ services:
       timeout: 3s
       retries: 30
 
+  # The queue workers. `docker compose up --scale solver=4` runs four of them: the
+  # service has no container name and publishes no port, so nothing stands in the way.
+  #
+  # A solver applies no migrations. It waits until the database has the schema (D32),
+  # which the API applies from Phase 4 on. Until then, migrate the database by hand:
+  #   cargo sqlx migrate run --source crates/routeforge-domain/migrations
+  solver:
+    build:
+      context: .
+      target: solver
+    environment:
+      # `db` is the service above, on the compose network. The URL in .env is for
+      # programs outside Docker and says 127.0.0.1.
+      DATABASE_URL: postgres://${POSTGRES_USER:-routeforge}:${POSTGRES_PASSWORD:-routeforge}@db:5432/${POSTGRES_DB:-routeforge}
+      # Passed on if set in .env or in the shell, and left to their defaults if not.
+      SOLVER_CONCURRENCY:
+      SOLVER_LEASE_SECS:
+      SOLVER_HEARTBEAT_SECS:
+      SOLVER_POLL_SECS:
+      LOG_FORMAT:
+      RUST_LOG:
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   db-data:
