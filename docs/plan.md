@@ -19,6 +19,8 @@ Confirmed with the project owner:
 - **Route budget.** A plan says how long each of its routes may be searched for: a time, a number of moves, or both (D31).
 - **Migrations.** The API applies them. A solver applies none and waits until the schema is there (D32).
 - **Phases keep to their list.** When Phase 4 was planned, the image and compose service of the API were offered ahead of Phase 6, and a list of plans ahead of Phase 5. Both stayed where this plan has them.
+- **Routes are drawn while they are searched for.** The search hands out its best tour, the worker announces it, and the map shows it as a line that moves. The progress of a job as two numbers was not enough for "improve live" (D49).
+- **The page has three controls beyond the list of Phase 5:** discarding a done plan, a demo setup for an empty database, and a budget and a seed for a plan (D52).
 
 Derived from the description:
 
@@ -63,7 +65,7 @@ RouteForge/
 | 2 | Schema and job queue (`routeforge-domain`) | Queue tests: exclusive claim, lease expiry, fenced completion | L | done |
 | 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | done |
 | 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | done |
-| 5 | Live updates and map | Routes appearing and improving live in the browser | M | todo |
+| 5 | Live updates and map | Routes appearing and improving live in the browser | M | done |
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | todo |
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | todo |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | M | todo |
@@ -209,11 +211,46 @@ What later phases need from it:
 
 ## Phase 5: live updates and map
 
-- API: one `PgListener` feeding a `tokio::sync::broadcast` channel; SSE endpoints for one plan's events and for system stats.
-- Workers publish status and throttled progress with `NOTIFY`.
-- `web/index.html`, served by the API: login, date picker, generate demo orders, plan, cancel; a Leaflet map with the depot, stops and one coloured line per courier; per-route progress; queue depth and worker list.
-- Leaflet vendored under `web/vendor/`; the tile layer is optional.
-- **Done when:** pressing Plan shows routes appear and improve live, with the network unplugged as well.
+Delivered:
+
+- In `routeforge-tsp`: the progress callback of a search is handed the best tour beside the two numbers, and a search reports once more as it returns (D49).
+- In `routeforge-domain`: two channels beside the one of the workers, `routeforge_plans` and `routeforge_progress`. Every function of the queue that changes a plan or one of its jobs announces the plan, in the statement or the transaction of the change (D48). `queue::announce_progress`, `RouteProgress` and `RouteJob`. `plans::list` and `PlanFilter` (D53). No migration.
+- In the solver: a search under way is announced with its best route, at most every `SOLVER_PROGRESS_MS`, by a third future beside the search and the heartbeat (D49). A worker takes three connections.
+- In the API: one connection that listens, and a hub the streams subscribe to. `GET /api/plans/{id}/events` and `GET /api/system/stats/events` as `text/event-stream` (D50). `GET /api/plans?service_date=` (D53). The page at `/` and Leaflet under `/vendor/`, out of the binary (D52). Ctrl-C and SIGTERM heard by the API itself, so that it stops with streams open (D51).
+- `web/index.html`: login, date picker, demo orders, plan with a budget and a seed, cancel, discard, and a list of the day's plans. The map has the depot, the stops in the colour of their courier, a dashed line for each route that is searched for and a solid one for each that is stored. Beside it are, for each route, its courier, stops, status, worker, moves and length, and the queue with its workers.
+- Leaflet 1.9.4 under `web/vendor/`, and tiles that a switch on the page turns off.
+- Tests: 33 more. 21 are in the API, which has 92 now, and 15 of those run against PostgreSQL. 8 are in the domain crate (115), 3 in the solver (41) and 1 in `routeforge-tsp` (65). They hold the queue to announcing every change once and when it commits, the solver to the pace of its announcements and to the route it names in them, a stream to what it sends, to when it reads again and to when it ends, the API to serving every file under `web/`, and the page to naming no host but the tile server.
+- The tests were tried against 45 faults put into the code on purpose: 2 in `routeforge-tsp`, 15 in the domain crate, 6 in the solver and 22 in the API and the page. Each made a test fail but one. A search that did not report the tour it returns passed every test, because the searches the tests ran had stopped improving before their budgets ended. A test whose budget ends in the middle of local search was added, and fails for it. Among them: each of the seven places that announce a change gone quiet, notifications of one transaction that no longer fold, the watchers told on the workers' channel, a route too long for a notification sent all the same, a search announced as often as it reports, the stops of a route counted from one, a stream that passes on the searches of every plan, one that does not read again after it may have missed something, one that outlives its token and one that ends a second before it, the streams left open when the API stops, a gate taken off a stream, a file under `web/` without its row, and a script loaded from another host.
+- Tried in a browser, on a database made for it, with the API on the host and four solvers in containers. A script drove a headless Edge over the DevTools protocol and took pictures, and the pictures were looked at:
+  - On a fresh database: logged in as the seeded admin, set up the demo city, generated 300 orders and pressed Plan. Four routes of 87, 86, 78 and 49 stops were searched by the four solvers for the ten seconds the API gives by default, and stored, 125.29 km in all. The stream of the plan, read by a plain client beside the page, sent 167 events in 11.9 seconds. One search was announced at 38 975 m, a quarter of a second later at 32 642 m, and at 32 548 m from then on.
+  - A day of 1200 orders, on couriers large enough for it: routes of up to 353 stops. One went from 81.04 km at its first announcement to 67.34 km at its second, and to 66.38 km after ten seconds. Two announcements of one search were 250 to 256 ms apart.
+  - With the tile server blocked in the browser, which is the network unplugged as far as the page can tell: the page said that the tiles could not be loaded, and drew everything else on paper with a grid.
+  - A plan cancelled in the middle of its searches was shown as cancelled, with its four jobs stopped and its orders pending again. A second and a half later the four workers were idle. The solvers ran with a heartbeat of two seconds then.
+  - A done plan was discarded and the day planned again, twice with seed 7 and 30 million moves a route: 65.21, 65.10, 63.34 and 41.87 km both times. Seed 8 gave 65.40, 65.96, 63.40 and 41.77 km.
+  - With logins that last twenty seconds, both streams ended after 21 seconds, and two seconds later the page was back at the login, saying that the login had ended.
+  - With a page open the API was sent Ctrl-C. It had stopped 0.33 seconds later, and had logged the end of both streams with the reason.
+  - A client saw the depot and their own two orders, and no planning. An address with HTML in it was shown as the text it is.
+  - In every run the console of the browser stayed empty, and the only hosts the page asked were the API and the tile server.
+
+Where it differs from what this plan first said:
+
+- The search hands out its tour, and the map draws it while the search runs. The plan had the progress as two numbers. Decided with the project owner (D49).
+- The page has three controls more than the list: discard, a demo setup, and a budget and a seed for a plan. Decided by the project owner (D52). The vans of the demo setup are sized for the day that is asked for, which was not asked for and is easy to take out again.
+- "Workers publish status" became: whoever changes a plan announces it. The functions of the queue do, so a cancel or a discard through the API is announced like a job that a worker completes (D48).
+- The API hears Ctrl-C and SIGTERM itself. An event stream never finishes, and actix-web waits for a response to finish before it stops (D51).
+
+What there is to see depends on the size of the routes (D49). With 300 orders on four vans a route has under a hundred stops and is at its final length a quarter of a second after the search began, so its line appears, jumps once and stands. With 1200 orders the lines go on changing for the ten seconds of the budget.
+
+What later phases need from it:
+
+- Phase 6: the image of the API needs `web/` in the build context, because `page.rs` includes its files when the crate is compiled. It is there: `.dockerignore` does not leave it out. `cargo chef cook` does not need it.
+- Phase 6: the API stops within a second of SIGTERM, streams or no streams (D51). `SOLVER_PROGRESS_MS` is passed on to the solvers by compose.
+- Phase 6: on a fresh database the page offers an admin "Set up a demo city", which replaces setting the depot and the couriers by hand in verification step 2. Its vans are sized for the number in the Orders field at that moment.
+- Phase 6: for the scaling run, a budget of 150 million moves took about three and a half seconds for a route of a hundred stops on the development machine. On routes that short every seed ends at the same lengths, so such a run says nothing about seeds. On routes of 330 stops with 30 million moves the same seed gave the same lengths twice, and another seed gave others. A day of 300 orders shows next to nothing on the map while it is searched. A day of 1200 does.
+- Phase 7: the bot's `get_plan_status` can find the plan of a day with `GET /api/plans?service_date=`.
+- Phase 7: an order placed through the bot shows on the map when Refresh is pressed. Nothing announces an order, and `routeforge_plans` says nothing of one that no plan has taken. If the map is to show it by itself, placing an order has to notify a channel of its own.
+- Phase 8: OSRM. What a search announces as its best length is the length on the matrix it searches, which will be the symmetric one (D14). The length that is stored will be the directed one, so the two will differ a little at the moment a route is stored.
+- Phase 8: hardening that was left out. A request that is still running while the API stops may get no database connection: seen once, on a stream that was left open on purpose, and not looked into (D51). Nothing limits how many streams one person holds open. The page has no Content-Security-Policy: its script is inline, and moved into a file of its own it could be held to `script-src 'self'`. The page draws every route from the depot as it is now, not from the depot of the plan (D21). And the page is tested by hand: what a machine checks is that it is served and what it loads.
 
 ## Phase 6: one-command stack, scaling and failure demo
 
@@ -249,8 +286,13 @@ What later phases need from it:
 - **Recent major releases.** sqlx 0.9, utoipa 6, rand 0.10, jsonwebtoken 11, argon2 0.6 and criterion 0.8 are all newer than most tutorials. Read docs.rs for the pinned version.
 - **2-opt assumes a symmetric matrix**, and OSRM road distances are not symmetric. `DistanceMatrix` rejects an asymmetric table (D14), so the solver symmetrizes for the search and reports the real directed length itself.
 - **Two route jobs finishing at once** must not each see the other as unfinished. The plan row's counter update serializes them; Phase 2 has a test for it.
-- **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well. Payloads are capped near 8 kB, so they carry ids and small numbers only.
+- **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well, and so do the event streams of the API (D50). A payload has to be shorter than 8000 bytes. A change to a plan is announced by its id alone, and the progress of a search leaves its route out when it would not fit (D48, D49).
 - **Browser `EventSource` cannot send an `Authorization` header.** The page reads the SSE stream with `fetch`.
+- **An endless response hangs a test that reads its body to the end.** `Api::send` in the API's tests takes what an event stream opens with and drops the rest, and `Api::open` reads a stream one event at a time. Without the first, the test of who may call what would never return from the stats stream.
+- **A graceful stop waits for an endless response.** actix-web drains its connections when it is told to stop and cuts no body short. The streams have to be ended first (D51).
+- **A token is accepted through the second it expires in.** jsonwebtoken refuses one when `exp` is less than now, not when it is equal. A stream that ended at `exp` could be opened again for the rest of that second, so it ends a second later (D50).
+- **Leaflet draws a canvas in the order things were added to it.** Dots that are drawn again cover a line that was there before them. The page draws its lines in SVG, above the canvas of the dots (D52). A tooltip that is given a string takes it as HTML, so the page gives it an element.
+- **On Windows, whether a process ignores Ctrl-C is inherited.** A service started from a tool that ignores it cannot be stopped with it, whatever the service does. To try D51 the API was started by a launcher that turns Ctrl-C back on (`SetConsoleCtrlHandler(NULL, FALSE)`), in a console of its own.
 - **A `tracing` subscriber for one thread loses lines in tests.** `tracing` remembers for every place that logs whether anybody listens, and with one subscriber that belongs to one thread it may ask a thread that has none. A test that reads the log sets a subscriber for the whole process and picks its own lines out by an id: see `captured_log` in the solver's tests.
 - **A fresh database has no schema until an API has started against it.** A solver waits for it and applies none (D32). The API has no service in compose before Phase 6, so until then it is run on the host: `CLAUDE.md` says how. `scripts/sqlx-prepare` applies the migrations to the compose database as well.
 - **utoipa leaves things out without a word.** An enumeration whose values come out of a macro as `literal`s is documented by the names of its variants; `web::Path<OrderId>` is read as a struct of parameters; a query struct that is not named in `params(...)` is not described at all. Each compiled and gave a document that was wrong (D43). Read `openapi.json` after changing a type or a handler.
@@ -268,7 +310,7 @@ What later phases need from it:
 ## Verification
 
 1. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` with the compose `db` up, and `cargo bench -p routeforge-tsp`.
-2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, generate 300 orders, press Plan. Routes appear and improve live; `/docs` lists every endpoint.
+2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, set up the demo city, generate 300 orders, press Plan. Routes appear and improve live; `/docs` lists every endpoint. With 1200 orders in the field before the city is set up, the routes are long enough to be seen improving for seconds (D49).
 3. Determinism: run a plan, discard it (D30), and run it again with the same seed and an iteration budget; the routes are identical.
 4. Scaling: the same plan with 1 solver and with 4, discarded in between; completion time drops until workers outnumber routes.
 5. Failure: `docker kill` one solver mid-solve; within the lease time another worker takes over and every order is still routed exactly once.
