@@ -13,6 +13,10 @@ cargo test --workspace --locked
 
 From Phase 2 on, tests need Postgres: `docker compose up -d db`, with `.env` copied from `.env.example`.
 
+From Phase 3 on there is an image too. After a change to the dependencies or to the `Dockerfile`, build it: `docker compose build solver`.
+
+Until the API exists (Phase 4) nothing applies the schema to the compose database but `scripts/sqlx-prepare`, and a solver started against a database without it waits (D32).
+
 ## Rules that are easy to break
 
 - Exactly five crates. Helpers go into an existing crate, never a new one.
@@ -23,6 +27,9 @@ From Phase 2 on, tests need Postgres: `docker compose up -d db`, with `.env` cop
 - Lease and retry times come from the database clock, not the worker's.
 - After changing a query or a migration, run `scripts/sqlx-prepare.ps1` (or `.sh`) and commit `.sqlx/`: builds check queries against that directory, not a database (D28). Never edit a migration that has been merged; add a new one.
 - Nothing may need OpenSSL, CMake or NASM to build: TLS stays on rustls with ring, crypto on pure-Rust backends (D12).
+- A solver applies no migrations. The API owns the schema (D32).
+- A job's heartbeat and its search belong to the job's future. Put either into a task of its own and a job that is dropped keeps its lease, or its thread (D34).
+- `rust-toolchain.toml` and the base image in the `Dockerfile` name the same compiler. Change them together (D10).
 
 ## Dependencies
 

@@ -16,6 +16,8 @@ Confirmed with the project owner:
 - **Job unit.** A plan request enqueues one `plan` job. A worker runs sweep clustering and, in the same transaction, enqueues one `route` job per cluster. Each worker then optimizes one courier's route with its own time budget, so more workers finish a plan sooner.
 - **Docker.** Docker Desktop with the WSL2 backend.
 - **Planning a date again.** A plan that is done can be discarded: its routes are deleted, its orders are pending again, and the date is planned afresh. Without a discard, a later plan for the date takes only the orders that are still pending (D30).
+- **Route budget.** A plan says how long each of its routes may be searched for: a time, a number of moves, or both (D31).
+- **Migrations.** The API applies them. A solver applies none and waits until the schema is there (D32).
 
 Derived from the description:
 
@@ -58,7 +60,7 @@ RouteForge/
 | 0 | Skeleton and tooling | Empty workspace builds, lints and tests | S | done locally; CI not run yet |
 | 1 | Algorithms (`routeforge-tsp`) | Cost falling stage by stage on a random instance; benchmarks | L | done |
 | 2 | Schema and job queue (`routeforge-domain`) | Queue tests: exclusive claim, lease expiry, fenced completion | L | done |
-| 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | todo |
+| 3 | Solver worker (`routeforge-solver`) | Workers draining a plan and surviving a killed worker | M | done |
 | 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | todo |
 | 5 | Live updates and map | Routes appearing and improving live in the browser | M | todo |
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | todo |
@@ -81,7 +83,7 @@ Delivered:
 
 Not verified yet, because it needs something outside the repository:
 
-- The CI workflow has not run. It runs on the first push of `dev` or the first pull request. Phase 2 added two steps to it, which are as untested as the rest.
+- The CI workflow has not run. It runs on the first push of `dev` or the first pull request. Phase 2 added two steps to it and Phase 3 a job that builds the solver image, and they are as untested as the rest.
 
 ## Phase 1: algorithms (`routeforge-tsp`)
 
@@ -135,14 +137,35 @@ What later phases need from it:
 
 ## Phase 3: solver worker (`routeforge-solver`)
 
-- Worker loop: connect with retry, register, `LISTEN` plus a jittered polling fallback, claim, run, complete or fail. One job at a time per instance by default, so capacity scales with the instance count.
-- `plan` job: load the date's orders, active couriers and depot; project; `cluster`; insert the `route` jobs and update the plan inside the completing transaction.
-- `route` job: build the matrix through `DistanceProvider`; run `optimize_route` in `spawn_blocking`; a heartbeat task extends the lease, publishes progress from a `watch` channel, and sets the cancel flag on a cancel request or a lost lease; fenced completion writes `routes` and `route_stops` and increments the plan's done counter.
-- Graceful shutdown on Ctrl-C or SIGTERM: stop claiming, cancel the solve, release the job back to the queue.
-- `tracing` spans carrying `worker_id`, `job_id`, `plan_id`, `request_id`.
-- `Dockerfile` (multi-stage with cargo-chef, `SQLX_OFFLINE=true`) and a `solver` service in compose, so image builds are exercised from here on.
-- Tests: headless end to end (seed orders, enqueue a plan, run three in-process workers, every order routed exactly once within capacity); abort a worker mid-solve and the plan still completes after lease expiry; cancel stops jobs within one heartbeat.
-- **Done when:** those tests pass and `docker compose up --scale solver=3` starts three idle workers.
+Delivered:
+
+- In `routeforge-domain`, what the worker needed: migration `0003_route_budget.sql` and `RouteBudget` on `NewPlan` and `Plan` (D31), `orders::list_by_ids`, and `db::is_migrated`.
+- The worker loop: connect with retry, wait for the schema, register, claim until nothing is due, then wait for a notification, for a jittered poll interval or to be told to stop (D33). One job at a time per worker, and `SOLVER_CONCURRENCY` workers per process, one by default.
+- The `plan` job, all in the transaction that completes it: lock the pending orders of the date, project them round the depot, `cluster`, mark the orders planned, enqueue a route job for each cluster with the plan job's request id, move the plan to `routing` (D36).
+- The `route` job: the matrix through `DistanceProvider`; `optimize_route` on a blocking thread under the plan's budget; a heartbeat beside it that extends the lease, stores the progress from a `watch` channel, and stops the search when the plan was cancelled or the job was taken (D34); a fenced completion that writes the route and counts it.
+- Graceful shutdown on Ctrl-C or SIGTERM: stop claiming, drop the job, give it back (D35).
+- A failed attempt is reported with its reason, and trouble with the database outside a job is waited out (D37).
+- `tracing` spans with the ids of the worker, the job, the plan and the request. `LOG_FORMAT=json` for JSON lines.
+- `Dockerfile` with cargo-chef and a `solver` target, a `solver` service in compose, the solver's settings in `.env.example`, and a CI job that builds the image (D38).
+- Tests: 38 in the crate, 19 of them against PostgreSQL, 9 of those with workers running inside the test. The three this plan asked for are among them: three workers route every order once within capacity; a worker is aborted in the middle of a route and the plan completes once its lease has run out; a cancel stops the searches within a heartbeat. Beside them: a job taken by another worker is given up; a route that outlasts its lease is not taken over; a worker told to stop gives its job back; a job that keeps failing fails its plan with the reason; the same day planned twice gives the same routes; a solver waits for the schema.
+- The tests were tried against eleven faults put into the worker on purpose: notifications not counted, no polling, the answer of a heartbeat ignored, no heartbeat, no release, a dropped search left running, tour nodes mapped to the wrong orders, a failure not reported, the request id not passed on, seeds that differ from run to run, and a `plan` job that fails where it should stand aside. Each made the test written for it fail. The seed fault did so only after its test was given a route long enough for the seed to matter.
+- Tried by hand in containers, in a database made for it: three solvers waited for the schema and started when it was applied; a plan of 100 orders was done in 24 seconds with every order on one route, although one solver was killed in the middle of a route; a solver stopped with `docker stop` gave its job back within half a second.
+
+Two things differ from what this plan first said, for reasons in the decision log:
+
+- The heartbeat is not a task. It runs beside the search in the job's own task, so that a job that goes away cannot leave its lease behind (D34).
+- A solver applies no migrations and waits for the schema (D32). Until the API exists a fresh database is migrated by hand, so `docker compose up --scale solver=3` starts three idle workers only on a database that `scripts/sqlx-prepare` or `cargo sqlx migrate run --source crates/routeforge-domain/migrations` has been run against. On any other the three wait, and say so.
+
+What later phases need from it:
+
+- Phase 4: a `NewPlan` needs a `budget`. The API has to give it a default and an upper limit (D31), and `RouteBudget` needs an OpenAPI schema like the other DTOs.
+- Phase 4: the API runs `db::MIGRATOR` when it starts, which ends the migrating by hand. The comment on the `solver` service in `docker-compose.yml` and the note in `CLAUDE.md` then go.
+- Phase 4: `workers::list` gives a row per worker, and a process can run several (D33). A worker marks itself as seen every `SOLVER_HEARTBEAT_SECS`, 5 by default, so "alive" is a few times that.
+- Phase 4: the migration for `discarded` (D30) is number 0004.
+- Phase 5: `jobs.progress` is as fresh as the last heartbeat. The search reports every 16 384 moves into a `watch` channel that `route_job::heartbeats` reads, which is the place to publish from more often.
+- Phase 6: a service gets into the image by adding its package to the two `--package` lines of the builder stage and a target of its own (D38). The services need no start order, since a solver waits for the schema.
+- Phase 6: after a `docker kill` the job is taken over when the lease has run out and an idle worker has polled: 30 seconds and then up to 6 more by default. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` shorten that for a demo. With a budget of time, a plan takes as many budgets as it has rounds: its routes divided by the workers, rounded up.
+- Phase 8: `main.rs` hands `Haversine` to `worker::run`, and an OSRM provider goes in its place. `route_job::search_matrix` is where its table has to be made symmetric, and `route_job::complete` stores `tour.cost()` as the distance, which then has to become the directed length (D14).
 
 ## Phase 4: API (`routeforge-api`)
 
@@ -200,6 +223,8 @@ What later phases need from it:
 - **Two route jobs finishing at once** must not each see the other as unfinished. The plan row's counter update serializes them; Phase 2 has a test for it.
 - **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well. Payloads are capped near 8 kB, so they carry ids and small numbers only.
 - **Browser `EventSource` cannot send an `Authorization` header.** The page reads the SSE stream with `fetch`.
+- **A `tracing` subscriber for one thread loses lines in tests.** `tracing` remembers for every place that logs whether anybody listens, and with one subscriber that belongs to one thread it may ask a thread that has none. A test that reads the log sets a subscriber for the whole process and picks its own lines out by an id: see `captured_log` in the solver's tests.
+- **A fresh database has no schema until the API exists.** A solver waits for it and applies none (D32). Until Phase 4, run `scripts/sqlx-prepare` or `cargo sqlx migrate run --source crates/routeforge-domain/migrations`.
 
 ## Needed from the project owner
 

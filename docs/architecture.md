@@ -46,13 +46,15 @@ Why: this is the capacitated vehicle routing problem, which the approved algorit
 
 The schema has had it since Phase 2: an order has one kind, `delivery` or `pickup`, and one position.
 
-### D2. A plan is one `plan` job that fans out into `route` jobs (in place in the queue; the solver that fans out is Phase 3)
+### D2. A plan is one `plan` job that fans out into `route` jobs (in place)
 
 Why: optimizing one courier's route is the expensive part, and the routes of a plan are independent of each other. With one job per route, adding solver instances shortens a plan. With one job per whole plan, extra instances would help only when several plans were queued.
 
 Cost: the plan must be marked done exactly once when its last route job finishes, including when two finish at the same moment. A counter on the plan row, incremented in each completing transaction, serializes them.
 
 The counter is `plans::route_finished`. Two tests complete route jobs at the same moment, once with two transactions that are made to overlap and once with eight at a time. In both, exactly one completion sees the plan become done.
+
+How the solver runs the two kinds of job is in D34 and D36.
 
 ### D3. Persistence lives in `routeforge-domain`, behind the `db` feature (in place)
 
@@ -100,7 +102,7 @@ Why: whatever the language model decides, the api applies that user's role, so t
 
 ### D10. Rust 1.99.0, pinned (in place)
 
-`rust-toolchain.toml` pins the compiler for developers, CI and the Docker image.
+`rust-toolchain.toml` pins the compiler for developers and CI. The Docker image is built with the same version, which the Dockerfile repeats in the tag of its base image (D38).
 
 Why: sqlx 0.9 needs Rust 1.94 or newer, and one compiler everywhere removes differences between machines.
 
@@ -180,7 +182,7 @@ There is no convergence test. `optimize_route` returns when the budget is used u
 
 Why: "anytime" means the caller decides how long a route is worth. A convergence test would be a second, hidden stop condition, and the description asks for a solver that works until its deadline.
 
-Consequence for Phase 3: a route job with four or more stops takes the whole time the solver gives it. The time budget per route is therefore what sets the length of a plan.
+Consequence for the solver: a route job with four or more stops takes the whole budget its plan gives it (D31). The budget per route is therefore what sets the length of a plan.
 
 Deliberately not built in Phase 1, because the plan does not ask for them: neighbour lists to speed up large instances, an exact solver for small routes, and a "stop when nothing improves" option.
 
@@ -276,7 +278,7 @@ Why the kind as payload: PostgreSQL folds equal notifications of one transaction
 
 ### D27. The worker registry is not part of the queue (in place)
 
-`workers` has a row per solver process: its id, its host name, when it started and when it was last seen. `jobs.claimed_by` holds a worker's id and is not a foreign key to that table.
+`workers` has a row per worker: its id, its host name, when it started and when it was last seen. A solver process runs one worker unless it is told to run more (D33), and a worker marks itself as seen once per heartbeat interval. `jobs.claimed_by` holds a worker's id and is not a foreign key to that table.
 
 Why: the registry is there for the load view. If the queue depended on it, a worker that could not register could not work, and a row could not be removed while a finished job still named it. As it is, the registry can be wrong or empty and no job is lost.
 
@@ -327,3 +329,121 @@ What it needs:
 
 - A `discarded` value for `plans.status`. The two `CHECK`s that list the statuses, `plans_status_check` and `plans_finished_check`, are in a migration that is merged, so this is a new migration.
 - `queue::discard_plan` beside `queue::cancel_plan`. The undo exists as `end_plan` in `db::queue`, where it is limited to plans that are queued or routing. Like every operation on a plan, it locks the plan row first (D24).
+
+### D31. How long a route is searched for is part of the plan (in place)
+
+Decided with the project owner on 2026-10-11.
+
+A plan carries a budget for each of its routes: a span of time, a number of candidate moves, or both, in which case whichever is reached first ends the search. These are the two limits of the search itself (D15). `plans.budget_time_ms` and `plans.budget_iterations` hold them, and a `CHECK` wants at least one. In Rust the budget is a `RouteBudget`, which cannot be built, or read from JSON, without a limit. A route job reads it from the row of its plan, which it reads anyway for the depot.
+
+Why:
+
+- Two promises of the description pull apart here. "Works until its deadline" is a budget of time. "Deterministic given a seed" needs a budget of moves, because a clock cuts the search wherever the machine has got to (D5). With both on offer, a demo runs for a known time and the determinism check runs on moves.
+- On the plan, every route of a plan gets the same budget whichever solver runs it. As a setting of the solver, instances that were configured differently would give one plan routes of different quality, and changing the budget would mean restarting them all.
+- A budget without a limit would be a search that never returns (D18). Ruling it out in the type and in the schema is cheaper than checking for it wherever a budget is used.
+
+Each attempt of a route job gets the whole budget. The solver measures the time itself, from the moment the search starts. It is a span, like every time a worker handles (D6).
+
+The schema accepts any time a `u32` of milliseconds can hold, which is seven weeks. The API of Phase 4 has to give the budget a default and an upper limit.
+
+### D32. The API owns the schema, and a solver waits for it (in place for the solver; the API is Phase 4)
+
+Decided by the project owner on 2026-10-11.
+
+A solver applies no migrations. After it has connected it asks once a second whether the database has every migration its build knows (`db::is_migrated`), and starts its workers when it has. The API applies the migrations when it starts.
+
+Why:
+
+- The schema has one owner. With two kinds of service migrating, each would have to be trusted to carry the newest migrations.
+- A solver that is older than the schema still starts: a database with migrations the build does not know counts as migrated. That is in line with how the queue treats a job such a solver cannot read (D22). Had the solver run the migrator itself, the migrator would refuse a database that is ahead of it.
+- The stack needs no start order. A solver that comes up before the API waits.
+
+Cost: there is no API before Phase 4, so until then a fresh database is migrated by hand, or a solver waits for ever: `cargo sqlx migrate run --source crates/routeforge-domain/migrations`, which `scripts/sqlx-prepare` runs as well.
+
+`is_migrated` reads `_sqlx_migrations`, the table sqlx keeps its own books in, through a compile-time checked query like every other (D28). The metadata in `.sqlx/` is therefore prepared against a database that has been migrated, which the script and the CI step both see to.
+
+### D33. The worker loop (in place)
+
+A worker does one job at a time. It claims until nothing is due, then waits for whichever comes first: a wake-up, its poll interval, or the order to stop.
+
+- **Wake-ups.** One connection per process listens on the jobs channel and counts the notifications. A worker notes the count before it claims and waits for it to change after, so a job that is announced between the claim and the wait is not missed. When the listener has had to reconnect it counts as well, because a notification may have been lost meanwhile.
+- **Polling.** A job that becomes due because its retry time has come or its lease has run out announces nothing (D26). So an idle worker also looks at the queue every `SOLVER_POLL_SECS`, 5 by default, give or take a quarter. The quarter comes from a generator seeded with the worker's id, so that workers started together do not ask in step. `rand` is built without the operating system's entropy (D5), and the id is random already.
+- **Leases.** `SOLVER_LEASE_SECS` is 30 and `SOLVER_HEARTBEAT_SECS` is 5 by default. The lease has to be at least twice the heartbeat, so that one heartbeat that does not get through does not cost the job.
+- **Concurrency.** A process runs `SOLVER_CONCURRENCY` workers, 1 by default. Each has an id and a registry row of its own (D27), and they share the pool and the listening connection. Scaling is by instances, as the description says. More workers in one process are for running a few without Docker.
+- **Spans.** What a worker logs is inside a `worker` span with its id, and what it logs about a job is inside a `job` span with the ids of the job and the plan, the kind, the attempt and the id of the request that asked for the plan.
+
+Why:
+
+- Claiming until nothing is due is what makes one notification enough for a plan that fans out into twenty jobs (D26).
+- The claim is not raced against the order to stop. A claim abandoned half way could have taken a job that nobody then knows of, and the job would wait out its lease.
+- One listening connection for the process, not one for each worker: a notification means "look at the queue" to every worker alike, and a connection that only listens is a connection less for work.
+
+Two tests keep the two ways of waking apart. In one, three workers with a poll interval of a minute take up a plan that is submitted while they wait, which nothing but the notification can make them do. In the other, the lease of a dead worker runs out some two seconds after the other workers have run out of work, and they take its job over, which nothing but polling lets them do.
+
+### D34. A lease lives exactly as long as the job's future (in place)
+
+While a route is searched for, a heartbeat extends the lease every `SOLVER_HEARTBEAT_SECS` and stores the progress the search last reported. When it is answered `Cancelled` or `Lost`, the worker stops the search and drops what it had found.
+
+The search runs on a blocking thread. The heartbeat is a future polled beside the wait for that thread, in the same task, and not a task of its own. The search is a value, `Search`, that tells its thread to stop when it is dropped.
+
+Why:
+
+- A job's future can end in ways that nothing inside it sees: the worker is told to stop, its task is aborted, or it panics. With the heartbeat inside the future the lease stops being extended in each of these cases, and the job passes to another worker. A heartbeat in a task of its own would have to be stopped by hand in each, and one that was forgotten would keep a lease with nobody working behind it, for good.
+- The same goes for the search. A thread cannot be dropped. Without the flag, a search whose job is gone would run to the end of its budget and hold a processor for nobody, and a solver that is stopping would not exit until it had.
+
+`docs/plan.md` first called it a heartbeat task. This is why it is not one.
+
+The search writes its progress to a `watch` channel every 16 384 moves (D15), and the heartbeat stores what it finds there. So `jobs.progress` is as fresh as the last heartbeat.
+
+Tests: a search that is dropped stops, and so does one whose owning task is aborted; a route that takes two and a half times its lease is not taken over while an idle worker looks for work; a cancel frees three workers that each had two minutes of search ahead of them; a job that another worker has claimed is given up.
+
+### D35. A worker that is told to stop drops its job and gives it back (in place)
+
+On Ctrl-C or SIGTERM a solver stops claiming. A worker in the middle of a job drops the job's future and calls `queue::release`: the job is due at once and has used no attempt (D23). Both kinds of job go the same way. Dropping a `plan` job rolls its completion back (D25), and dropping a `route` job stops its search (D34).
+
+Why:
+
+- `docker stop` allows ten seconds. Finishing the job first would take the rest of its budget. Giving it back takes one query.
+- There is one way out for both kinds of job, and an abort or a panic takes the first half of it too. So it is not a path that only ever runs at shutdown.
+
+A job that completes in the very moment the order comes is not harmed either way: `release` changes nothing when the job is already done.
+
+In a container, a solver in the middle of a route was stopped with `docker stop` and had exited within half a second. The job was queued again with no attempt used, and another solver finished it.
+
+### D36. The `plan` job is one transaction (in place)
+
+Everything a `plan` job does happens inside its completion (D25). It locks the pending orders of the date, clusters them, marks those that fit a courier as planned, enqueues a route job for each cluster and moves the plan to `routing`. Clustering itself runs on a blocking thread.
+
+What follows from that:
+
+- An order cannot be withdrawn between being counted into a cluster and being marked (D20).
+- The route jobs appear, and are announced, in the moment the plan becomes `routing` (D26).
+- A job that fails half way leaves nothing behind: no order marked, no route job.
+- The job sends no heartbeat. `begin_complete` locks the job's row and a claim skips a locked row, so the job cannot be taken over while the transaction is open, however long it takes.
+
+The seed of a route is the plan's seed in the high half and the number of its cluster in the low half. Clustering gives the same clusters in the same order for the same orders and couriers, and both are read in the order of their ids. So a plan that is run again with its seed gives every route its seed again (D5). A test plans the same day twice and compares the routes. One of its routes has a hundred stops and a budget that ends in the second round of annealing, because on routes of a handful of stops any seed finds the same best tour and the test would prove nothing.
+
+Each route job carries the request id of the plan job. That is how one request can be followed into the log of every solver that worked on its plan.
+
+### D37. What counts as a failed attempt (in place)
+
+- An error while a job runs is reported with `queue::fail`, with the chain of its causes as the text. The queue retries the job or, after the last attempt, fails it together with its plan (D23). The reason is then on the plan for the operator to read.
+- A panic in the search is such an error.
+- A job this build cannot read is logged and the next one claimed. The queue has counted that attempt already (D22).
+- Trouble with the database outside a job is not held against any job. A claim that fails is tried again after the poll interval, a heartbeat at the next heartbeat, and a connection at startup after a pause that doubles up to 30 seconds.
+- A failure that cannot be reported is left alone. The lease runs out, and the queue treats the job as it treats that of a worker that died.
+
+Why: the queue already bounds the damage of a job that takes its worker down with it. Reporting the reason makes the same outcome quicker and readable. And a database that is away for a minute says nothing about any job, so it must not use up the attempts of the jobs that happened to be running.
+
+### D38. One Dockerfile, a target for each service (in place for the solver)
+
+The Dockerfile at the root builds every service, and each service is a target: `docker build --target solver .`. Phase 3 has the `solver` target. A later phase adds its package to the build and a target of its own.
+
+- **cargo-chef.** The dependencies are built as a layer of their own, from the manifests and the lock file alone. A change to the workspace's crates then rebuilds in seconds. cargo-chef is pinned, like everything else.
+- **Base images.** The Rust image of the pinned compiler to build, Debian slim to run. `rust-toolchain.toml` is kept out of the build context: the tag of the base image is the pin (D10), and with the file there rustup would also fetch the clippy and rustfmt it names.
+- **What the build needs.** No database, because queries are checked against `.sqlx/` (D28), and nothing native that the base image does not have (D12). The solver's binary links to the C library and nothing else, so the runtime image needs neither OpenSSL nor CA certificates. It runs as a user without privileges.
+- **Compose.** The `solver` service has no container name and publishes no port, which is what lets `--scale solver=N` work. It is given the database's address on the compose network. The solver's other settings are passed on when they are set in `.env` and left to their defaults when they are not.
+
+Why one file: the services are binaries of one workspace and share almost all their dependencies. With one builder stage they are compiled once, however many targets are built.
+
+CI builds the image in a job of its own, so a dependency that needs a native library fails there and not on the day of the demo.
