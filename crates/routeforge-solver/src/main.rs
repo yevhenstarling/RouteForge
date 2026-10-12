@@ -43,7 +43,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::osrm::{Osrm, Provider};
+use crate::osrm::Provider;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,10 +55,7 @@ async fn main() -> anyhow::Result<()> {
         ?config,
         "the solver is starting"
     );
-    let distances = match &config.roads {
-        Some(roads) => Provider::Osrm(Osrm::new(&roads.url, roads.within)?),
-        None => Provider::GreatCircles,
-    };
+    let distances = Provider::of(config.roads.as_ref())?;
 
     let (stop, mut shutdown) = watch::channel(false);
     tokio::spawn(async move {

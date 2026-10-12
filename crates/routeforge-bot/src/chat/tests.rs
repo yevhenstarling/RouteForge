@@ -1574,25 +1574,47 @@ async fn a_new_search_takes_the_place_of_the_one_before() {
 
     let first = bot.says(10, "Хрещатик 22").await;
     let second = bot.says(11, "Хрещатик 22 Дніпро").await;
-    let late = bot.presses(&first, "Yes, an order there").await;
-    assert_eq!(late.text, STALE_SEARCH);
+    // Neither button of the first search does anything to the second: not the one
+    // that picks, and not the one that gives up.
+    for label in ["Yes, an order there", "No"] {
+        let late = bot.presses(&first, label).await;
+        assert_eq!(late.text, STALE_SEARCH, "{label}");
+    }
 
     let asked = bot.presses(&second, "Yes, an order there").await;
     assert!(asked.text.contains("Дніпро"), "{}", asked.text);
-
-    // And /cancel drops a search that waits for its place as it drops an order.
-    bot.says(12, "Хрещатик 22").await;
-    let dropped = bot.says(13, "/cancel").await;
-    assert_eq!(dropped.text, "Dropped: nothing was placed.");
 }
 
-/// A button that names a place the search never had picks nothing.
+/// `/cancel` drops a search whose places wait to be picked, as it drops an order that
+/// is being put together: the search is the beginning of one.
+#[tokio::test]
+async fn cancel_drops_a_search_that_waits_for_its_place() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик 22", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+
+    let found = bot.says(10, "Хрещатик 22").await;
+    let dropped = bot.says(11, "/cancel").await;
+    assert_eq!(dropped.text, "Dropped: nothing was placed.");
+    // Its place is no longer on offer, and there is nothing more to drop.
+    let late = bot.presses(&found, "Yes, an order there").await;
+    assert_eq!(late.text, STALE_SEARCH);
+    let nothing = bot.says(12, "/cancel").await;
+    assert!(
+        nothing
+            .text
+            .starts_with("You are not putting an order together")
+    );
+}
+
+/// A button that names a place the search never had picks nothing, and ends nothing:
+/// the place the search did find is still there to be picked.
 #[tokio::test]
 async fn a_place_that_was_not_among_those_found_is_not_taken() {
     let bot = bot_that_looks_addresses_up();
     bot.places
         .answers("Хрещатик 22", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
-    bot.says(10, "Хрещатик 22").await;
+    let found = bot.says(10, "Хрещатик 22").await;
 
     for made_up in [
         Press::Found(10, 1),
@@ -1602,6 +1624,9 @@ async fn a_place_that_was_not_among_those_found_is_not_taken() {
         let reply = bot.sends(&made_up.data()).await;
         assert_eq!(reply.text, STALE_SEARCH, "{made_up:?}");
     }
+    let asked = bot.presses(&found, "Yes, an order there").await;
+    assert!(asked.text.starts_with("An order at 22, Хрещатик вулиця"));
+
     // Before anything was ever searched for, too.
     let fresh = bot_that_looks_addresses_up();
     let reply = fresh.sends(&Press::Found(10, 0).data()).await;

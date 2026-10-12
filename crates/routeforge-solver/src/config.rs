@@ -316,4 +316,103 @@ mod tests {
 
         from(&[("SOLVER_LEASE_SECS", "10"), ("SOLVER_HEARTBEAT_SECS", "5")]).unwrap();
     }
+
+    /// The lines of one service in `docker-compose.yml`, as they are on a clone that
+    /// has no `.env`: every `${VARIABLE:-fallback}` replaced by its fallback.
+    fn service_of_the_stack(name: &str) -> Vec<String> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docker-compose.yml");
+        let compose = std::fs::read_to_string(path).unwrap();
+        let opening = format!("  {name}:");
+        compose
+            .lines()
+            .skip_while(|line| *line != opening)
+            .skip(1)
+            // The service ends where a line is indented as little as its own name.
+            .take_while(|line| line.starts_with("    ") || line.trim().is_empty())
+            .map(|line| fallbacks(line.trim()))
+            .collect()
+    }
+
+    /// `text` with every `${VARIABLE:-fallback}` replaced by its fallback. A variable
+    /// without one would be empty on a fresh clone, which is what must not be.
+    fn fallbacks(text: &str) -> String {
+        let mut resolved = String::new();
+        let mut rest = text;
+        while let Some((before, variable)) = rest.split_once("${") {
+            let (variable, after) = variable.split_once('}').expect("a `${` is closed");
+            let (_, fallback) = variable
+                .split_once(":-")
+                .unwrap_or_else(|| panic!("${{{variable}}} has nothing to fall back on"));
+            resolved.push_str(before);
+            resolved.push_str(fallback);
+            rest = after;
+        }
+        resolved + rest
+    }
+
+    /// What a service is given for a variable, on a clone that has no `.env`.
+    fn given(service: &[String], name: &str) -> Option<String> {
+        service.iter().find_map(|line| {
+            let (key, value) = line.split_once(": ")?;
+            (key == name).then(|| value.to_owned())
+        })
+    }
+
+    /// A fresh clone has no `.env` (D54), and on one the stack asks nobody for
+    /// anything (D8). So the solvers are started with no routing service to ask, and
+    /// the one in the compose file stays out until somebody asks for it (D67).
+    #[test]
+    fn the_stack_starts_its_solvers_with_nobody_to_ask_for_distances() {
+        let solver = service_of_the_stack("solver");
+        let on_a_clone = |name: &str| given(&solver, name);
+
+        assert_eq!(Config::from_vars(on_a_clone).unwrap(), from(&[]).unwrap());
+        // On the compose network, where the database is `db`.
+        let database = on_a_clone("DATABASE_URL").expect("a database to work on");
+        assert!(database.ends_with("@db:5432/routeforge"), "{database}");
+
+        // The routing service is in the file, behind a profile, and nothing waits
+        // for it: a solver that gets no answer falls back, route by route (D66).
+        let osrm = service_of_the_stack("osrm");
+        assert!(
+            osrm.contains(&"profiles: [\"osrm\"]".to_owned()),
+            "{osrm:#?}"
+        );
+        assert!(!solver.contains(&"osrm:".to_owned()), "{solver:#?}");
+        // Given its roads to read and no more, and open to this machine alone.
+        assert!(osrm.contains(&"- ./osrm:/data:ro".to_owned()), "{osrm:#?}");
+        let published = "- \"127.0.0.1:5000:5000\"".to_owned();
+        assert!(osrm.contains(&published), "{osrm:#?}");
+    }
+
+    /// A setting that compose does not hand on is one that `.env` cannot set: the
+    /// container never sees it. So every variable the solver reads is named in its
+    /// service.
+    #[test]
+    fn every_setting_the_solver_reads_is_one_compose_hands_on() {
+        let solver = service_of_the_stack("solver");
+        let read = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        // With a routing service named, so that how long to wait for it is read too.
+        let noting = |name: &str| {
+            read.borrow_mut().insert(name.to_owned());
+            match name {
+                "OSRM_URL" => Some("http://osrm:5000".to_owned()),
+                other => given(&solver, other),
+            }
+        };
+        let config = Config::from_vars(noting).unwrap();
+        assert!(config.roads.is_some());
+
+        let read = read.into_inner();
+        assert!(read.len() >= 7, "{read:?}");
+        for name in read {
+            let handed_on = solver
+                .iter()
+                .any(|line| line.split_once(':').is_some_and(|(key, _)| key == name));
+            assert!(
+                handed_on,
+                "the solver reads {name}, and compose does not hand it on"
+            );
+        }
+    }
 }

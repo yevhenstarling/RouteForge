@@ -588,4 +588,31 @@ mod tests {
         let published = "- \"127.0.0.1:8080:8080\"".to_owned();
         assert!(service.contains(&published), "{service:#?}");
     }
+
+    /// A setting that compose does not hand on is one that `.env` cannot set: the
+    /// container never sees it. So every variable the API reads is named in its
+    /// service.
+    #[test]
+    fn every_setting_the_api_reads_is_one_compose_hands_on() {
+        let service = service_of_the_stack("api");
+        let read = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let noting = |name: &str| {
+            read.borrow_mut().insert(name.to_owned());
+            given(&service, name)
+        };
+        Config::from_vars(noting).unwrap();
+        Secrets::from_vars(noting).unwrap();
+
+        let read = read.into_inner();
+        assert!(read.len() >= 14, "{read:?}");
+        for name in read {
+            let handed_on = service
+                .iter()
+                .any(|line| line.split_once(':').is_some_and(|(key, _)| key == name));
+            assert!(
+                handed_on,
+                "the API reads {name}, and compose does not hand it on"
+            );
+        }
+    }
 }

@@ -326,4 +326,35 @@ mod tests {
         // And the bot is started after the API can answer it.
         assert!(bot.contains(&"condition: service_healthy".to_owned()));
     }
+
+    /// A setting that compose does not hand on is one that `.env` cannot set: the
+    /// container never sees it. So every variable the bot reads is named in its
+    /// service.
+    #[test]
+    fn every_setting_the_bot_reads_is_one_compose_hands_on() {
+        let bot = service_of_the_stack("bot");
+        let read = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        // With a token, so that the key is read too.
+        let noting = |name: &str| {
+            read.borrow_mut().insert(name.to_owned());
+            match name {
+                "TELEGRAM_BOT_TOKEN" => Some("123456:made-up-token".to_owned()),
+                other => given(&bot, other),
+            }
+        };
+        Config::from_vars(noting).unwrap();
+        assert!(Secrets::from_vars(noting).unwrap().is_some());
+
+        let read = read.into_inner();
+        assert!(read.len() >= 5, "{read:?}");
+        for name in read {
+            let handed_on = bot
+                .iter()
+                .any(|line| line.split_once(':').is_some_and(|(key, _)| key == name));
+            assert!(
+                handed_on,
+                "the bot reads {name}, and compose does not hand it on"
+            );
+        }
+    }
 }

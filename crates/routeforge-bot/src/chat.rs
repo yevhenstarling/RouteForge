@@ -725,15 +725,20 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
 
     /// Begins an order at the place of a search that was picked. The search is over
     /// with that: its other places go with the message they were listed in.
+    ///
+    /// A press that names no place of the chat's search picks nothing, and ends
+    /// nothing: the places are still there for a button that names one.
     fn pick(&self, sender: &Sender, id: i32, place: u8) -> Reply {
         let picked = {
             let mut searches = self.searches();
-            match searches.get(&sender.chat) {
-                Some(search) if search.id == id => searches
-                    .remove(&sender.chat)
-                    .and_then(|search| search.found.into_iter().nth(usize::from(place))),
-                _ => None,
+            let picked = searches
+                .get(&sender.chat)
+                .filter(|search| search.id == id)
+                .and_then(|search| search.found.get(usize::from(place)).cloned());
+            if picked.is_some() {
+                searches.remove(&sender.chat);
             }
+            picked
         };
         match picked {
             Some(found) => {

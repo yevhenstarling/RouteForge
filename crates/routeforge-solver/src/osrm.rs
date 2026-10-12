@@ -17,6 +17,8 @@ use reqwest::{Client, StatusCode, Url};
 use routeforge_domain::{DistanceProvider, DistanceTable, Distances, LatLon};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Roads;
+
 /// The profile the server is asked for: what travels on the roads. A server is
 /// prepared for one profile, and `scripts/osrm-prepare` prepares it for cars.
 const PROFILE: &str = "driving";
@@ -31,6 +33,17 @@ const CONNECT_WITHIN: Duration = Duration::from_secs(5);
 pub(crate) enum Provider {
     GreatCircles,
     Osrm(Osrm),
+}
+
+impl Provider {
+    /// Where a solver takes its distances from, by its settings: the routing service
+    /// they name, and great circles if they name none.
+    pub(crate) fn of(roads: Option<&Roads>) -> anyhow::Result<Self> {
+        Ok(match roads {
+            Some(roads) => Self::Osrm(Osrm::new(&roads.url, roads.within)?),
+            None => Self::GreatCircles,
+        })
+    }
 }
 
 impl DistanceProvider for Provider {
@@ -378,6 +391,11 @@ mod tests {
                 "a short row",
             ),
             (
+                // Nine distances, as three positions have, and no three rows of three.
+                json!({ "code": "Ok", "distances": [[0, 1], [1, 0, 2, 2], [2, 1, 0]] }),
+                "a short row made up for by a long one",
+            ),
+            (
                 json!({ "code": "Ok", "distances": [[0, -1, 2], [1, 0, 2], [2, 1, 0]] }),
                 "a distance below nothing",
             ),
@@ -429,10 +447,12 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    /// What a solver is started with decides whom it asks: the service its settings
+    /// name, and nobody if they name none (D8).
     #[tokio::test]
-    async fn without_a_service_the_distances_are_great_circles() {
+    async fn a_solver_asks_the_service_it_was_given_and_nobody_without_one() {
         let places = three_places();
-        let provider = Provider::GreatCircles;
+        let provider = Provider::of(None).unwrap();
         assert_eq!(provider.measures(), Distances::GreatCircle);
         assert_eq!(
             provider.table(&places).await.unwrap(),
@@ -441,9 +461,14 @@ mod tests {
 
         let answer = json!({ "code": "Ok", "distances": [[0, 5], [7, 0]] });
         let server = answering(200, answer).await;
-        let provider = Provider::Osrm(osrm(&server));
+        let roads = Roads {
+            url: Url::parse(&server.uri()).unwrap(),
+            within: Duration::from_secs(5),
+        };
+        let provider = Provider::of(Some(&roads)).unwrap();
         assert_eq!(provider.measures(), Distances::Road);
         let table = provider.table(&places[..2]).await.unwrap();
         assert_eq!((table.get(0, 1), table.get(1, 0)), (5, 7));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

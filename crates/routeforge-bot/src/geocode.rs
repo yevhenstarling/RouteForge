@@ -470,6 +470,8 @@ mod tests {
     async fn a_service_that_refuses_or_cannot_be_read_is_away() {
         for (status, answer) in [
             (503, json!({ "error": "busy" })),
+            // A refusal is no answer, whatever it carries: this is not "nothing found".
+            (503, json!([])),
             (403, json!("blocked")),
             (200, json!({ "error": "not a list" })),
             (

@@ -283,6 +283,33 @@ mod tests {
         assert_eq!(api.post(None, LOGIN, right).await.status, StatusCode::OK);
     }
 
+    /// A login that is over the limit is refused before anything is looked up or hashed
+    /// (D68), so refusing it costs the API nothing. Here no password can be looked at
+    /// at all, and the refusal comes at once all the same.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_login_over_the_limit_is_refused_without_its_password_being_looked_at(pool: PgPool) {
+        // One password at a time, and one that waits for its turn waits five seconds.
+        let passwords = Passwords::cheap_for(1, Duration::from_secs(5));
+        let logins = Logins::new(2, WINDOW);
+        let api = testing::api_with_logins(&pool, logins, passwords.clone());
+        let right = account(&api, "ada@example.com").await;
+        for _ in 0..2 {
+            let refused = api.post(None, LOGIN, wrong_for("ada@example.com")).await;
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+        }
+
+        // The one turn there is, taken by somebody else's password.
+        let _held = passwords.turn().await.unwrap();
+        let asked = std::time::Instant::now();
+        let refused = api.post(None, LOGIN, right).await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        let took = asked.elapsed();
+        assert!(
+            took < Duration::from_secs(2),
+            "it waited for a turn: {took:?}"
+        );
+    }
+
     /// Passwords are hashed a few at a time (D68). A login that finds no turn free is
     /// told to come back, and is no try at the password: it was never looked at.
     #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
