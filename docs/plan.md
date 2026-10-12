@@ -25,6 +25,9 @@ Confirmed with the project owner:
 - **The bot is in the stack before it is built.** Its image and its compose service are Phase 6's, with a stub that idles. The bot itself stays Phase 7's (D56).
 - **Phase 6 has a quick start in the README, and leaves CI alone.** Starting the stack in CI, and running the demo script there, were offered beside it and not taken.
 - **The bot takes buttons and commands, not free text.** A location and a few buttons say what an order needs. Free text through the Claude API, which the description names, is an optional item of Phase 8 and is built only when there is a key to try it with (D58).
+- **A Telegram user gets an account of their own, the first time they write to the bot.** A client's, with no address and no password, which an admin can make an operator's. Tying a Telegram user to an account that is there already, by a code, was offered beside it and not taken (D59).
+- **Phase 7 has two things beyond its list:** an order shows on the map as it is placed, and the bot takes coordinates that are typed where a location cannot be shared (D61, D63).
+- **Phase 7 was merged before it was tried against Telegram.** There was no token for a bot while it was built. It was built and tried against a stand-in for Telegram (D64), and the try with a real bot is the one step of it that is open.
 
 Derived from the description:
 
@@ -71,7 +74,7 @@ RouteForge/
 | 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | done |
 | 5 | Live updates and map | Routes appearing and improving live in the browser | M | done |
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | done |
-| 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | todo |
+| 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | built; not tried against Telegram yet |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | M | todo |
 
 **Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58).
@@ -308,12 +311,49 @@ What later phases need from it:
 
 ## Phase 7: Telegram bot (`routeforge-bot`)
 
-- API side: `users.telegram_id`, and a service-key endpoint that maps a Telegram user to a RouteForge user and returns a short-lived JWT for them.
-- Bot: teloxide long polling, so no public URL is needed; the state of each chat's dialogue in memory. No model is asked anything (D58). The manifest of the crate still calls the bot an LLM agent, which this phase corrects.
-- Placing an order is a dialogue. It starts with Telegram's share-location message, asks with buttons for the kind, the number of parcels and the day, shows what it is about to place, and places it on a confirming button (D9).
-- The rest are commands, with buttons where there is something to pick. Clients: `list_my_orders`, `get_order`, `cancel_order`. Operators also: `list_pending_orders`, `create_plan`, `get_plan_status`.
-- Tests: the dialogue step by step against a fake of the API; the bot's requests, their paths and their tokens, against a mock server (wiremock).
-- **Done when:** sharing a location and choosing a delivery of two parcels for tomorrow produces, after confirmation, an order visible on the map.
+Built, and tried against a stand-in for Telegram. The "Done when" of the phase is not shown yet: sharing a location and choosing a delivery of two parcels for tomorrow produces, after confirmation, an order visible on the map. That takes a bot of Telegram's own, and there was no token for one.
+
+Delivered:
+
+- In `routeforge-domain`: migration `0005_telegram.sql`, with `users.telegram_id` and an account that needs no address (D59); `User` with an optional `email` and an optional `telegram_id`; `users::find_or_create_by_telegram`; the bodies `TelegramLogin` and `OrdersChanged`; and a channel of the orders' own, which `orders::create` and `orders::cancel` notify (D63).
+- In the API: `POST /api/auth/telegram`, behind a fourth extractor, `Bot`, which takes the bot's key and no token (D60); tokens that are told how long they are good for; the settings `BOT_SERVICE_KEY` and `BOT_JWT_TTL_SECS`; the orders' channel on the connection that listens, and an `orders` event on the stats stream.
+- On the page: the orders of the shown day are read again when the stats stream says that one was placed or withdrawn, when that stream opens again after a break, and every thirty seconds.
+- The bot, in three parts (D61): `api`, what it asks of the API and how; `chat`, the dialogue, with no Telegram in it; `telegram`, which turns updates into events and replies into messages.
+  - **An order** begins with a location, a venue, or `/order 50.45 30.52`. The kind, the parcels and the day are asked for with buttons, the order is shown, and a button places it.
+  - **The commands** are the six operations this plan named. `/orders` is `list_my_orders`, and its buttons are `get_order` and `cancel_order`. For operators, `/pending` is `list_pending_orders`, `/plan` is `create_plan` and `/status` is `get_plan_status`, each for a day that is picked with a button. Beside them are `/start`, `/help` and `/cancel`.
+  - **It runs** on a token from @BotFather and on nothing else. Without one it idles. It waits for a Telegram that is away, ends on a token that Telegram refuses, and stops when it is told to (D62).
+- In compose: the bot's token, passed on from `.env`; one demo key for the bot and the API; the address of the API; `TZ`. `.env.example`, the README and `CLAUDE.md` say what there is to set.
+- The manifest of the crate no longer calls the bot an LLM agent.
+- Tests: 65 more. 47 are the bot's, 11 the API's, which has 111 now, and 7 the domain crate's (122). Of the bot's, 23 try the dialogue against a fake of the API, 6 its requests against a server that answers where the API's OpenAPI document says and nowhere else, 7 the whole bot against a stand-in for Telegram, 6 its settings, and 5 run the binary (D64).
+- The tests were tried against 68 faults put into the code and into the compose file on purpose: 38 in the bot, 14 in the API, 11 in the domain crate, three of those in the migration, and 5 in the compose file. Each made a test fail but one. With an address of the API taken that carries a password and no user name, every test passed, because the test of the settings tried an address with both and no other. It tries one with a password alone now, and one with a name alone, and fails for the fault. One test was found too weak before its fault was tried: the bot was told to stop while its first request was on its way, and never during the pause between two attempts. It has a second half for that, which a pause that cannot be cut short fails. Among the others: an order not taken out before the API is asked, so that two presses place two; an order asked for with the bot's key and not with the person's token; a token kept from one update to the next; a button of a draft that is gone taken for one of the draft that is there; a day that has passed still taken; an order withdrawn, and a day planned, by the first press; a group answered like a private chat; a refused token tried again and again, and a Telegram that is away ending the bot; the bot stopping without telling Telegram which updates it has had; a key taken that only begins as the key does; the body read before the key; a token that says a minute and is signed for an hour; whoever writes to the bot first made an admin; the loser of the race for a new account given nothing; an account that nobody can reach; an order that says nothing when it is placed; the day written as the session writes its dates; and compose giving the bot another key than the API.
+- Tried by hand, in containers and in a browser, with the development database left alone:
+  - **The stack,** in a project of its own and on a new volume: up nine seconds after `docker compose up`, with the bot saying that it idles. The idle bot had stopped 0.4 seconds after `docker compose stop bot`. With `TZ=Europe/Kyiv` it said that its day was `2026-10-12 +03:00`. The stack was down after 2.2 seconds.
+  - **A token that was made up.** The bot, in its container, reached `api.telegram.org` over TLS, was told that there is no such bot, and ended with status 1 and the reason, 2.8 seconds after it was started. The image has no CA certificates: the roots are in the binary (D62).
+  - **The bot's endpoint,** through the API of the stack and with the demo key: a token good for 60 seconds, of a new client's account that has no address; an order placed with it; a `403` for the plans; the account made an operator's by the admin, and the next token opening the plans; and a `401` each for no key, a wrong key and the admin's token.
+  - **The map,** in a headless Edge against an API on the host. An order placed through the API with a Telegram user's token was on the map 0.37 seconds later, with nobody pressing Refresh, and its withdrawal after 0.37 seconds. An order of another day caused no read. One that was stored by an `INSERT` that announces nothing was shown 26 seconds later, by the read the page makes unasked. The console stayed empty, and the page asked no host but the API and the tile server.
+  - **The images:** 140, 126 and 134 MB, the bot's binary 12 MB. The first build failed in `cargo chef cook` and the second went through: the trap of the registry, below.
+
+Not verified yet, because it needs something outside the repository:
+
+- **The "Done when".** The stand-in for Telegram shows that the bot does what it should with what Telegram sends. It cannot show that Telegram takes what the bot sends (D64). That takes a token from @BotFather, and "Needed from the project owner" says what to do with it, step by step.
+
+Where it differs from what this plan first said:
+
+- A Telegram user is not mapped to an account that is there. They are given one (D59).
+- The state of a dialogue is in a map of the bot's own and not in teloxide's storage for dialogues, and the bot reads its commands itself. Both are in the part that knows nothing of Telegram, which is what lets the dialogue be tested step by step (D61).
+- An order shows on the map as it is placed, and the bot takes coordinates that are typed. Both by the project owner's choice (D61, D63).
+- The tests have a stand-in for Telegram, beside the fake of the API and the mock server this plan asked for. Without a token it was the only way to try the half of the bot that faces Telegram (D64).
+- The workspace asks teloxide for neither its `ctrlc_handler` nor its `macros` feature any more (D61, D62).
+- The page was changed, which is Phase 5's, and so were two functions of the domain crate that are Phase 2's.
+
+What later phases need from it:
+
+- Phase 8: free text goes on top of `chat`. A text that is no command arrives in `Chats::handle` as `Event::Text` and is answered with `NOT_UNDERSTOOD` today: that is where a model would be asked. What it may ask for is what the buttons do, the methods of `Chats` that take a `Sender`. A tool that changes something has to end in the same question with the same confirming button (D9), and `Press` is where a new button gets its data.
+- Phase 8: geocoding. A draft has an `address` already, and `Chats::begin` takes a place. An address that is typed needs coordinates before it is one, from a service the bot would ask as it asks the API: behind a trait, so that the dialogue's tests can put a fake in its place.
+- Phase 8: the README says that the bot takes no free text, and why. When free text is built, that paragraph goes.
+- Phase 8: hardening that was left out. Nothing limits how often the bot's endpoint is asked, or how many accounts it makes. The bot's key is one key, with no way to change it but to restart both. An account with an address cannot be reached from Telegram. An order whose answer was lost on the way back can be placed a second time. A message the bot could not send, because Telegram said that it was sending too many, is logged and not sent again.
+- Phase 8: what the page still learns only from Refresh: a plan that was asked for elsewhere, by chat for one, and for a client everything, since a client's page has no stream (D63).
+- Phase 8: the bot's tests need no network and no token, so `cargo test --workspace` in CI runs them as it is. CI still builds the `solver` target alone, which compiles the bot as well (D38).
 
 ## Phase 8: OSRM, hardening, presentation
 
@@ -348,7 +388,7 @@ What later phases need from it:
 - **A fresh database has no schema until an API has started against it.** A solver waits for it and applies none (D32). `docker compose up` starts an API. `docker compose up -d db solver` does not, and its solvers wait. `scripts/sqlx-prepare` applies the migrations to the compose database as well.
 - **`pg_isready` over the socket says yes too early.** While it sets up a new database, the postgres image runs a server that listens on the socket alone. A service that is let go then and comes over the network finds the port closed. The compose file asks over TCP (D54).
 - **sqlx waits five seconds for a database that refuses.** A refused connection is tried again until the pool's acquire timeout. That hid the trap above in every ordinary start, and it is why an API with no database takes five seconds to say so (D47).
-- **The first process of a container is not ended by SIGTERM unless it listens for it.** A binary that does not is killed after the ten seconds `docker stop` allows. The solver, the API and the stub of the bot all listen (D35, D51, D56).
+- **The first process of a container is not ended by SIGTERM unless it listens for it.** A binary that does not is killed after the ten seconds `docker stop` allows. The solver, the API and the bot all listen (D35, D51, D62).
 - **`docker compose up --build` asks the registry every time,** for the Dockerfile frontend and the base images, with every layer cached. Without a network it fails, where `docker compose up` starts the images that are there (D54).
 - **On Windows a build is refused from a directory spelled with a lower-case drive letter.** `docker compose build`, and `docker compose up` when it has something to build, end with `additional privileges requested: pass "--allow=fs.read=Dockerfile"`. Compose 5 hands its builds to `buildx bake`, which takes the Dockerfile to lie outside the directory it was started in when the two are spelled `d:\` and `D:\`. `cmd` and Git Bash keep a working directory as they were given it, and the terminals of VS Code give it as `d:\...`. PowerShell hands `D:\...` on to what it starts, and is not affected. Three ways out: run it from PowerShell, `cd` to the directory spelled with a capital, or set `BUILDX_BAKE_ENTITLEMENTS_FS=0`, which turns that check off. `COMPOSE_BAKE=false` does not help. Seen with Compose 5.5.1 and buildx 0.37.2. `docker build --target api .` is not affected, and neither is starting images that are built.
 - **The compose file names its project.** A second copy of the repository on the same machine is the same project, with the same containers and the same volume. To try something beside the development stack: `COMPOSE_PROJECT_NAME`, with other ports in `POSTGRES_PORT` and `API_PORT`. A script that calls `docker compose` acts on whichever project that is.
@@ -360,12 +400,32 @@ What later phases need from it:
 - **A handler's name is taken.** `#[post("/api/auth/login")]` on `async fn login` makes `login` a type. A `let login = …` in any handler of that module then fails to compile, with a message about mismatched types.
 - **sqlx 0.9 takes no SQL that was put together at run time.** `sqlx::query(&format!(…))` does not compile. Tests write their SQL out.
 - **Argon2 is slow in a debug build**: a third of a second for one hash. Tests that need accounts store them directly and sign their tokens themselves, and those that log in use `Passwords::cheap()`.
+- **teloxide's handler of Ctrl-C hears no SIGTERM.** `enable_ctrlc_handler` listens for Ctrl-C alone, and `docker stop` sends SIGTERM. The bot listens for both itself and stops the dispatcher through `shutdown_token()` (D62).
+- **teloxide's `dispatch()` panics when Telegram does not answer its first request.** A network that is not up yet, and a token that is mistyped, are both a panic. `try_dispatch_with_listener` gives the error back instead.
+- **teloxide writes the name of a method as `GetMe`.** Telegram's documentation writes `getMe`, and Telegram takes either. A stand-in that answers the second alone answers nothing, and a test that waits for the bot waits for good.
+- **teloxide waits ten seconds over a `5xx` of Telegram's** before it hands the error on. In a test, a Telegram that is away is better played by an answer that is no JSON, which fails at once.
+- **A button of Telegram's carries 64 bytes.** A UUID is 36 of them. What a button means is written short and read back by one type, `Press`, and a test holds every one to the 64.
+- **A venue comes with a `location` and a `venue`.** Read the venue first, or the name and the address of the place are lost. teloxide does.
+- **`INSERT ... ON CONFLICT DO NOTHING RETURNING` returns no row to whoever loses the race.** The row that won is not in the snapshot of the statement that lost. `DO UPDATE` with an update that changes nothing returns it (D59).
+- **A column that comes through a CTE is nullable to sqlx.** `WITH placed AS (INSERT ... RETURNING ...) SELECT id FROM placed` gives an `Option`, whatever the column is in the table. `id AS "id!"` says that it is there.
+- **A date cast to text follows the session's `DateStyle`.** `service_date::text` is `2026-10-12` in one session and `12.10.2026` in another. `to_char(service_date, 'YYYY-MM-DD')` is the same in both (D63).
+- **A migration that is still being written wants a database of its own.** Once `scripts/sqlx-prepare` has applied it to the development database, changing it means resetting that database. Until it is final, prepare against a scratch database on the same server: `DATABASE_URL` in the shell, `cargo sqlx database create`, `cargo sqlx migrate run --source crates/routeforge-domain/migrations`, `cargo sqlx prepare --workspace -- --all-targets`.
+- **cargo does not see that a migration has changed.** The migrations are read when the domain crate is compiled, and a change to a `.sql` file alone does not compile it again. A change to any source file of the crate does.
+- **On Windows a connection to a port nobody listens on takes two seconds to be refused.** A test that wants something to fail at once should have something there that answers wrongly.
+- **wiremock asks its mocks in the order they were mounted,** the first that matches. To have a later one count, mount it with a lower `with_priority`.
 
 ## Needed from the project owner
 
 - `sqlx-cli` on any machine where a query or a migration is changed. The command that installs it is at the top of `scripts/sqlx-prepare`.
 - `curl` and `jq` on a machine where `scripts/demo.sh` is run. `scripts/demo.ps1` needs neither.
-- Before Phase 7: a Telegram bot token from @BotFather.
+- To close Phase 7: a Telegram bot token from @BotFather, and a few minutes with a phone. It is the one step of the phase that could not be made without it:
+  1. In Telegram, ask @BotFather for a new bot with `/newbot`, and put the token it gives into `.env` as `TELEGRAM_BOT_TOKEN=...`. Add `TZ=Europe/Kyiv`, or your own zone, so that the bot's "tomorrow" is yours.
+  2. `docker compose up -d --build --scale solver=4`, and `docker compose logs bot`: it says that Telegram knows the bot.
+  3. Open `http://127.0.0.1:8080/` as the admin, set up the demo city if the database is new, and pick tomorrow as the day.
+  4. In the chat with the bot: `/start`, then share a location in Kyiv, press Delivery, 2, Tomorrow and Place the order. The dot appears on the map as the bot says that the order is placed.
+  5. To try the operator's side: `/start` says the id of your account. In Swagger UI, as the admin, `PUT /api/users/{id}/role` with `{"role": "operator"}`. Then `/pending`, `/plan` and `/status` in the chat.
+
+  If something that Telegram answers differs from what the stand-in answered (D64), it shows in `docker compose logs bot` as a warning with Telegram's own words.
 - For the optional free text of the bot in Phase 8: an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58).
 - If the bootcamp holds the result to the approved description: whether the bot may come without its LLM part (D58).
 - If the bootcamp grades against a rubric (coverage, report, presentation format), it gets folded into Phase 8.
@@ -378,5 +438,5 @@ What later phases need from it:
 4. Scaling: `scripts/demo scaling` plans the same day with 1 solver and with 4, discarded in between. With `-Solvers 1,2,4,8`, or `DEMO_SOLVERS='1 2 4 8'` for the sh one, completion time drops until workers outnumber routes.
 5. Failure: `scripts/demo failure` kills one solver mid-solve; within the lease time another worker takes over and every order is still routed exactly once.
 6. Tracing: take the `X-Request-Id` of the plan request and find it in the logs of the API and of every solver that worked on that plan. The demo scripts print the one they sent.
-7. Offline: disconnect the network and repeat step 2 without `--build`, which asks the registry (D54). Routes draw without map tiles and the bot idles.
-8. Bot: place an order by chat and see it on the map.
+7. Offline: disconnect the network and repeat step 2 without `--build`, which asks the registry (D54). Routes draw without map tiles. The bot idles if it has no token, and with one it says that it cannot reach Telegram and goes on trying (D62).
+8. Bot: place an order by chat and see it on the map, as "Needed from the project owner" says step by step. Without a token: `cargo test -p routeforge-bot` places the same order against a stand-in for Telegram (D64), and an order placed through the API appears on an open page without Refresh (D63).

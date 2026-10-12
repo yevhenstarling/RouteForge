@@ -10,7 +10,7 @@ Three services and one database:
 
 - **api** accepts orders, handles authentication and puts work on the queue.
 - **solver** runs as several identical instances. Each one takes jobs from the queue and computes routes.
-- **bot** is a Telegram assistant that places orders through the api.
+- **bot** is a Telegram bot that takes orders in a chat and places them through the api.
 - **PostgreSQL** holds both the domain data and the job queue.
 
 There is no load balancer and no message broker. A free solver takes the next job from the queue itself.
@@ -30,10 +30,17 @@ How a plan is watched:
 2. One connection of the api listens. What it hears reaches every open event stream, and a stream that hears of its plan reads the plan again and sends what has changed (D50).
 3. The page, which the api serves at `/`, reads the stream and draws: a dashed line for a route that is still searched for, a solid one when it is stored (D52).
 
+How an order is placed by chat:
+
+1. A person shares a location with the bot. The bot asks with buttons for what an order needs beside it: a delivery or a pickup, how many parcels, which day. It shows what it is about to place (D58, D61).
+2. On the confirming button the bot shows the api its key and says which Telegram user it is talking to. The api answers with a short-lived token of that user's account, which it makes if this is the first it hears of them (D59, D60).
+3. With that token the bot places the order: as that person, with their rights and no others (D9).
+4. The order announces its day in the database. The api passes the word on, and a page that shows that day reads its orders again, so the order is on the map (D63).
+
 How it is run:
 
 1. `docker compose up --build --scale solver=4`, on a clone with no settings, brings up the database, the api, four solvers and the bot (D54).
-2. The api waits for the database to be healthy and applies the schema. The solvers wait for the schema (D32). The bot waits for the api.
+2. The api waits for the database to be healthy and applies the schema. The solvers wait for the schema (D32). The bot waits for the api, and without a token from Telegram it idles (D62).
 3. `scripts/demo` shows the two claims about the workers on that stack: more solvers finish a plan sooner, and a solver that dies loses no route (D57).
 
 ## Crates
@@ -102,19 +109,21 @@ A route is feasible when the sum of its demands, pickups and deliveries together
 
 Why: it never overloads a courier and needs no knowledge of the stop order. It is stricter than necessary, because a courier who delivers before picking up could carry more in total. Tracking the real load along the route is planned for Phase 8.
 
-### D8. The demo works without the internet (in place, but for the bot)
+### D8. The demo works without the internet (in place)
 
 Distances default to Haversine. The Leaflet library is vendored into the repository. Map tiles are optional: without them the routes still draw. The bot idles when its Telegram token is missing.
 
-Haversine has been the default since Phase 3. The page and its Leaflet are in the binary of the API, and a test fails if the page names any host but the tile server (D52). The bot is Phase 7. Until then a stub that idles has its place in the stack (D56).
+Haversine has been the default since Phase 3. The page and its Leaflet are in the binary of the API, and a test fails if the page names any host but the tile server (D52). The bot is the one part that is nothing without the internet: Telegram is where its chats are. Without a token it says so and idles, and with one and no network it waits for Telegram and goes on trying (D62). Nothing else in the stack waits for the bot.
 
 Building is not part of this. A build asks the registry for its base images, and the first one fetches every crate. Once the images are there, `docker compose up` without `--build` starts them and asks nobody (D54).
 
-### D9. The bot has no authority of its own (planned)
+### D9. The bot has no authority of its own (in place)
 
 The bot calls the api with a short-lived token of the Telegram user it is talking to. Actions with side effects are confirmed with a button, and the confirmation is handled in code.
 
-Why: whatever the language model decides, the api applies that user's role, so the model cannot do more than the user could. The confirmation step keeps a misread message from creating or cancelling anything.
+Why: whatever the bot is made to do, the api applies that user's role, so the bot cannot do more than the user could. That holds for a fault in the bot, for what somebody sends in the place of what a button carries, and for the language model that may one day read free text (D58). The confirmation step keeps a slip of the finger, or a misread message, from creating or cancelling anything.
+
+How it is built: the token is D60, and the confirmation is D61. The bot looks at a person's role in two places, to list the commands that are theirs and to say at once that planning is an operator's. Neither is a gate. Take both out and a client is refused all the same, by the api, a press later.
 
 ### D10. Rust 1.99.0, pinned (in place)
 
@@ -472,14 +481,14 @@ The Dockerfile at the root builds every service, and each service is a target: `
 
 - **cargo-chef.** The dependencies are built as a layer of their own, from the manifests and the lock file alone. A change to the workspace's crates then rebuilds in seconds. cargo-chef is pinned, like everything else.
 - **Base images.** The Rust image of the pinned compiler to build, Debian slim to run. `rust-toolchain.toml` is kept out of the build context: the tag of the base image is the pin (D10), and with the file there rustup would also fetch the clippy and rustfmt it names.
-- **What the build needs.** No database, because queries are checked against `.sqlx/` (D28), and nothing native that the base image does not have (D12). The solver's binary links to the C library and nothing else, so the runtime image needs neither OpenSSL nor CA certificates. It runs as a user without privileges.
+- **What the build needs.** No database, because queries are checked against `.sqlx/` (D28), and nothing native that the base image does not have (D12). The solver's binary links to the C library and nothing else, so the runtime image needs neither OpenSSL nor CA certificates. The bot is the one service that speaks TLS, to Telegram, and the roots it trusts are compiled into it (D62). It runs as a user without privileges.
 - **Compose.** The `solver` service has no container name and publishes no port, which is what lets `--scale solver=N` work. It is given the database's address on the compose network. The solver's other settings are passed on when they are set in `.env` and left to their defaults when they are not.
 
 Why one file: the services are binaries of one workspace and share almost all their dependencies. With one builder stage they are compiled once, however many targets are built.
 
 The builder stage builds the three packages with one `cargo build`. Cargo then gives a crate they share the features of all three, so in the image the bot is linked against a domain crate that was compiled with `db` and `openapi`, as it is by `cargo test --workspace` on any machine. What the bot's own manifest asks for is unchanged, and `cargo check -p routeforge-bot` in CI is what holds it to that (D3).
 
-The binaries are 16 MB for the API, which has the page and Swagger UI in it, 6 MB for the solver and 1 MB for the stub of the bot. Each links to the C library, `libm` and `libgcc`, and to nothing else. The rest of an image is Debian: the images are 140, 126 and 119 MB.
+The binaries are 16 MB for the API, which has the page and Swagger UI in it, 6 MB for the solver and 12 MB for the bot, which has teloxide's types for all of Telegram's Bot API in it, and rustls. Each links to the C library, `libm` and `libgcc`, and to nothing else. The rest of an image is Debian: the images are 140, 126 and 134 MB.
 
 CI builds the `solver` target in a job of its own, so a dependency that needs a native library fails there and not on the day of the demo. The builder stage is shared, so that job compiles all three services. The targets `api` and `bot` themselves, and the stack, are built and started by hand: `docker compose build`.
 
@@ -520,8 +529,9 @@ Good to know: a path that is served, asked for with a method it does not take, i
 - A password is stored as an Argon2id hash, with the parameters the `argon2` crate recommends: 19 MiB, two passes, one lane. Hashing and checking run on blocking threads, through `web::block`. The parameters are part of the stored hash, so they can be raised later without touching the accounts that are there.
 - A login for an address that has no account is checked all the same, against the hash of a password nobody has. Then it is refused exactly as a wrong password is, with the same status and the same words.
 - A login gives a JWT signed with HS256. It names the user (`sub`) and the role, and when it was issued and expires (`iat`, `exp`). It is good for `JWT_TTL_SECS`, an hour by default, and there is no leeway. The key is `JWT_SECRET`, at least 32 bytes long. The binary has no default for it.
+- A token the bot is given for a Telegram user is of the same key and the same shape, and is read by the same check. It is good for `BOT_JWT_TTL_SECS`, a minute by default (D60).
 - The role is in the token, and nothing is looked up to check a request.
-- An account is opened as a client's. An admin makes operators and admins of them, and cannot change their own role.
+- An account is opened as a client's, with an address and a password or by the bot for a Telegram user (D59). An admin makes operators and admins of them, and cannot change their own role.
 - The first admin comes from `ADMIN_EMAIL` and `ADMIN_PASSWORD`, when the API starts and no account has that address. An account that is there is left as it is.
 
 Why:
@@ -542,6 +552,7 @@ A debug build takes about a third of a second over a hash. The tests use the sma
 | | Client | Operator | Admin |
 |---|---|---|---|
 | Open an account, log in, health, the document, the page | without a token | | |
+| Log in a Telegram user | no: the bot alone, by its key (D60) | no | no |
 | Orders: place, list, read, withdraw | their own | all | all |
 | The depot: read | yes | yes | yes |
 | The depot: set | no | no | yes |
@@ -550,9 +561,9 @@ A debug build takes about a third of a second over a hash. The tests use the sma
 | The stats, read and watched | no | yes | yes |
 | Users, roles, demo orders | no | no | yes |
 
-A handler says who may call it by the type of its first argument: `AuthUser` for anybody with a token, `Staff` for an operator or an admin, `Admin`. actix-web takes the arguments of a handler in their order, so with this one first the gate is checked before the body is read.
+A handler says who may call it by the type of its first argument: `AuthUser` for anybody with a token, `Staff` for an operator or an admin, `Admin`, and `Bot` for the Telegram bot, which shows a key and no token (D60). actix-web takes the arguments of a handler in their order, so with this one first the gate is checked before the body is read.
 
-One test has the table, written out by hand as a list of every endpoint with the least role it needs. It sends every request as nobody and as each role, and expects `401`, `403` or anything else, as the table says. Another test reads the endpoints out of the OpenAPI document and compares them with the list.
+One test has the table, written out by hand as a list of every endpoint with the least role it needs. It sends every request as nobody and as each role, and expects `401`, `403` or anything else, as the table says. Where the bot's key is asked for, every one of them is answered `401`, an admin included: a token is not a key that falls short, it is no key. Another test reads the endpoints out of the OpenAPI document and compares them with the list.
 
 Why:
 
@@ -670,6 +681,8 @@ Why:
 
 A claim is still one statement (D22). Its update moved into a CTE so that the statement can notify as well.
 
+An order that no plan has taken is nobody's to announce here. Since Phase 7 it announces itself, on a channel of its own (D63).
+
 Tests: a watcher hears of every change once, at the commit and not before, and nothing of a rollback or a heartbeat; twenty route jobs, their plan and its job are one notification; a plan that fails, a job buried by an idle worker and a discard are heard; and none of it reaches the workers' channel.
 
 ### D49. A search hands out its best route, and its worker announces it (in place)
@@ -702,12 +715,12 @@ So for a line that is seen to move, a day has to give its routes several hundred
 
 ### D50. One connection listens, and the event streams read (in place)
 
-The API has one connection that listens on the two channels of D48. What it hears goes into a `tokio::sync::broadcast` channel, and every open stream holds a receiver of it. Two endpoints stream, as `text/event-stream`:
+The API has one connection that listens on the two channels of D48, and since Phase 7 on the one of D63. What it hears goes into a `tokio::sync::broadcast` channel, and every open stream holds a receiver of it. Two endpoints stream, as `text/event-stream`:
 
 | Endpoint | Events |
 |---|---|
 | `GET /api/plans/{id}/events` | `plan`: the plan. `jobs`: its route jobs, each a `RouteJob`. `progress`: a `RouteProgress`. |
-| `GET /api/system/stats/events` | `stats`: what `GET /api/system/stats` gives. |
+| `GET /api/system/stats/events` | `stats`: what `GET /api/system/stats` gives. `orders`: an `OrdersChanged`, the day an order was placed or withdrawn for (D63). |
 
 A stream opens with everything it shows. After that:
 
@@ -715,7 +728,7 @@ A stream opens with everything it shows. After that:
 - It reads at most every 200 ms, so a burst of changes is one read.
 - It reads without a reason too, every ten seconds for a plan and every two for the stats, as a worker polls (D33). A notification can be lost, and a worker comes and falls silent without one (D27).
 - When the listener has had to reconnect, and when a stream has fallen more than 1024 signals behind, the stream is told that it may have missed something, and reads.
-- Progress is passed on as it comes, with no read.
+- Progress is passed on as it comes, with no read. So is the word that an order was placed or withdrawn.
 - A comment line every 15 seconds keeps a quiet stream from being taken for a dead one.
 
 A stream ends when its reader has gone, when the token it was opened with expires, when the API is told to stop (D51), and when a read fails.
@@ -772,7 +785,7 @@ What the page can do beyond the list in the plan was decided by the project owne
 - **Budget and seed** for a plan: seconds or millions of moves for each route, and a seed. Left empty, the API gives its own (D45).
 - **Set up a demo city**, for an admin, on a database with no depot or no courier: a depot in Kyiv and four vans, through the endpoints an admin would use by hand. The vans are sized for the number of orders in the field beside the button. A demo order has a demand of 1 to 3 (D46), so a day asks for twice its number, and each van takes a quarter of that and a tenth more. So the day that is generated next gives every van a route, whether it has 300 orders or 2000.
 
-What the page does not do: it draws every route from the depot as it is now, so a plan made for an earlier depot (D21) would be drawn from the wrong place; and it learns of an order that somebody else placed only when Refresh is pressed, since nothing announces an order.
+What the page does not do: it draws every route from the depot as it is now, so a plan made for an earlier depot (D21) would be drawn from the wrong place. Until Phase 7 it also learned of an order that somebody else had placed only when Refresh was pressed. An operator's page hears of one now (D63). A client's has no stream, and still shows it after Refresh.
 
 The page has no tests of its own. The API's tests check that it is served and what it loads. What it does was tried in a browser: `docs/plan.md` says how.
 
@@ -799,7 +812,8 @@ There is no index on `plans.service_date`. A table of some hundreds of plans is 
 | `solver` | `db` to be healthy | none |
 | `bot` | `api` to be healthy | none |
 
-- **Every setting has a value to fall back on.** For most that is the default of the binary. Three have none there, and fall back to values written into `docker-compose.yml`: the key that signs the tokens, and the address and password of the first admin, `admin@example.com` and `routeforge`. Decided by the project owner on 2026-10-11. The binary still has no default for the key (D40).
+- **Every setting has a value to fall back on.** For most that is the default of the binary. Four have none there, and fall back to values written into `docker-compose.yml`: the key that signs the tokens, the address and password of the first admin, `admin@example.com` and `routeforge`, and since Phase 7 the key the bot shows (D60). Decided by the project owner on 2026-10-11. The binary still has no default for either key (D40).
+- **One setting has nothing to fall back on, and needs nothing:** the bot's token from Telegram. Without it the bot idles (D62).
 - **The ports are open to this machine alone.** The API is published on `127.0.0.1:8080`, as the database is on `127.0.0.1:5432`.
 - **No start order beyond the table.** A solver waits for the database, and for the schema by itself (D32), so the API and the solvers start side by side.
 - **No restart policy.** A service that ends stays ended.
@@ -818,6 +832,8 @@ Why TCP for the database: the postgres image sets a new database up with a serve
 What that costs is less than it sounds, and was measured too. Ten starts on a new volume went well with the old check, and ten with the new one. An API that is let go inside that window finds the port closed, and sqlx tries again for five seconds (D47), by which time the database is there. It bites when setting the database up takes longer than that after the first yes. With a script that keeps the set-up going for twelve seconds, as a slow disk or a script that loads data would, the old check let the API start, and it ended with "pool timed out while waiting for an open connection", and `docker compose up` with "dependency failed to start". With the new check the same stack was up after twenty seconds. So the check is right now, and no longer depends on a retry that is not ours.
 
 A test in the API holds the compose file to this. It reads the `api` service out of `docker-compose.yml`, takes every `${VARIABLE:-fallback}` for its fallback, and starts the API's settings from what it finds: the key is long enough, the admin is an account the API would make, the API listens on every address of its container, and the port is published to `127.0.0.1` alone. A variable without a fallback fails it.
+
+A test in the bot does the same for the `bot` service. On what a clone has, the bot idles. Given a token and nothing else, it has the address of the API on the compose network and the very key the `api` service falls back to. And the token itself has no fallback.
 
 Good to know:
 
@@ -865,6 +881,8 @@ Why:
 A service is the first process of its container, and the first process is not ended by a signal it does not listen for. So the stub listens for SIGTERM, as the solver and the API do (D35, D51). The whole stack, seven containers with four solvers, is down 2.8 seconds after `docker compose down`. A stub that slept would have made that ten.
 
 What Phase 6 does not give it: tokens, settings, the logging of the other two services, or a line of teloxide.
+
+Phase 7 gave it all of those. The service is the bot itself now, and what the stub did is what the bot does without a token (D62).
 
 ### D57. The demonstration is a script (in place)
 
@@ -914,11 +932,11 @@ Two things the scripts guard against, both met while they were written:
 - **How many solvers.** From inside PowerShell, `-Solvers 1,2,4,8` is a list. Started any other way, as `pwsh -File scripts/demo.ps1 -Solvers 1,2,4,8`, the script is handed one text, and PowerShell reads that text as the number 1248. Compose was asked for 1248 solvers, and had created every one of those containers and started some four hundred before it was stopped. The counts are now taken as text and read by the script, and anything but 1 to 20 is refused before compose is asked (D54).
 - **No `--build`.** The scripts start the stack with `docker compose up`, which builds an image that is missing and leaves one that is there. With `--build` they would need the registry every time (D54), and the demo is to work without a network (D8).
 
-### D58. The bot takes buttons and commands, and free text waits for a key (planned)
+### D58. The bot takes buttons and commands, and free text waits for a key (in place)
 
 Decided by the project owner on 2026-10-12.
 
-The bot of Phase 7 asks no model anything. A person shares a location, and the bot asks with buttons for what an order needs beside it: a delivery or a pickup, how many parcels, and which day. It shows what it is about to place, and places it when that is confirmed (D9). Whatever else a client or an operator may do is a command.
+The bot of Phase 7 asks no model anything. A person shares a location, and the bot asks with buttons for what an order needs beside it: a delivery or a pickup, how many parcels, and which day. It shows what it is about to place, and places it when that is confirmed (D9). Whatever else a client or an operator may do is a command. How that is built is D61.
 
 The approved description calls the bot LLM-powered and names the Claude API. That part is not given up. It is below the cut line: free text is an optional item of Phase 8, built only when there is an Anthropic API key to try it with. `docs/description.md` stays as it was approved, and until the item is built the README says that the bot takes no free text.
 
@@ -931,3 +949,166 @@ Why:
 - Code for the Claude API that was never run against the Claude API is not shipped. A scripted model shows that the loop is right, and not that the requests are what the API takes. So that part is not written ahead of a key.
 
 What it costs: "deliver two parcels here tomorrow" is a few taps and not a sentence, and for as long as the item of Phase 8 is not built the bot is less than the description says of it.
+
+### D59. A Telegram user gets an account of their own, the first time the bot hears of them (in place)
+
+Decided with the project owner on 2026-10-12.
+
+Migration `0005_telegram.sql` adds `users.telegram_id`, the id Telegram gives a user, unique and positive. The first time the bot names a Telegram user the API has not heard of, the API makes them an account: a client's, with that id, no address and no password. From then on that account is who they are. `users.email` and `users.password_hash` may be empty for it, under two checks: an account has an address exactly when it has a password, and every account has an address or a Telegram id. In Rust a `User` has an optional `email` and an optional `telegram_id`.
+
+An admin makes such an account an operator's as any other, with `PUT /api/users/{id}/role`. The bot tells a person the id of their account when it greets them, and whenever it refuses them what is an operator's.
+
+Why:
+
+- Whoever opens the chat can place an order, with nothing to do first. That is the "Done when" of the phase, and what a presentation wants.
+- The other way was to tie a Telegram user to an account that is there already, by a code that the page hands out and the bot takes. That is a table for the codes, two endpoints and a control on the page, and nobody could order by chat who had not first opened an account through the API. It was offered, and not taken.
+- No address is made up for such an account. An address is what a user picks: `4242@telegram` could be registered by anybody before the Telegram user of that id ever writes, and would then block their account, or be it. With no address there is nothing to squat on.
+- Nobody logs in to such an account. A login looks an account up by its address, and this one has none, nor a password to check. The first check keeps it so: no address without a password, and no password without an address.
+- The second check rules out an account that nobody could reach.
+
+How an account is made once: the bot's first two requests for a newcomer can arrive at the same moment. `users::find_or_create_by_telegram` reads first, since everybody but a newcomer is there already, and then inserts with `ON CONFLICT (telegram_id) DO UPDATE`. That update changes nothing and returns the row. Whoever loses the race waits for the winner and is given the winner's account. With `DO NOTHING` the loser would be given no row at all: the winner's is not in the snapshot of its statement.
+
+What is not built: an account with an address cannot be reached from Telegram. The schema lets an account have both, for the day that is built.
+
+Tests: an account is made once and is the same afterwards, with the role an admin gave it; eight at once make one; the loser of the race, picked by hand, is given the winner's; each of the two checks, and the uniqueness, refuse what they are there for.
+
+### D60. The bot shows a key, and is given a token of the person (in place)
+
+`POST /api/auth/telegram` is the bot's, and the bot's alone. It shows its key as `Authorization: Bearer <key>` and says which Telegram user it is talking to. The answer is a `Session`, as a login gives one: a token of that user's account (D59), the account, and how long the token is good for.
+
+- **The gate** is a fourth extractor, `Bot`, and comes first like the other three (D41). Whatever is not the key is answered `401`: no header, another key, and the token of a user, an admin's included. The key is compared in constant time, with `subtle`.
+- **The API has no default for the key.** Started without `BOT_SERVICE_KEY` it takes no bot, whatever it is shown, and says so in the `401`. A key has to be at least 32 bytes long.
+- **Compose falls back to a demo key,** the same for the `api` and the `bot` service (D54).
+- **The token is short-lived:** `BOT_JWT_TTL_SECS`, a minute by default. Otherwise it is a login's token (D40).
+- **The bot keeps no token.** It asks for one whenever a step needs the API, uses it for that step, and lets it go.
+
+Why:
+
+- This is what makes D9 hold. With the person's token the API answers the bot as it answers them. The bot needs no rule of its own about who may do what, and a fault in it cannot open what the person's role keeps shut.
+- A token for each step: the role is in the token (D40), so a token that was kept would hold on to the role it was made with. Asked for anew, a role an admin has changed applies to the next thing its owner asks. There is also nothing to renew, and nothing to throw away when an account changes. The price is one request more for each step that needs the API. It is a lookup and a signature, and no password is hashed for it.
+- A minute is longer than any step takes. It bounds what a token is worth that was read off a wire.
+- No default in the binary, as for the signing key (D40): an API that somebody starts by hand has no way in that they did not mean to open. The fallback in compose is D54's. With the ports on the loopback it gives away nothing that the demo signing key beside it does not, and a clone then needs one thing to have a bot, a token from @BotFather (D58).
+- As a bearer and not in a header of its own: the answer to a missing key is then the `401` with `WWW-Authenticate: Bearer` that the API has anyway, and credentials are read in one place. In the OpenAPI document it is a second scheme, `service_key`, so Swagger UI asks for it by name.
+- `401` and not `403` for a user's token: a `403` says that the caller is known and may not. A token is not known here at all.
+
+What the key is worth: a token of any account that Telegram reaches. That is whatever account is asked for by its Telegram id, an operator's or an admin's included. Outside a demonstration it is a secret of the rank of the signing key. Neither the API nor the bot can log it: both hold it in a type without `Debug`.
+
+The request is logged like any other (D42). Its `user_id` is the account the bot asked a token for.
+
+Tests: the key gets a token that places an order as a new client, and opens nothing that is an operator's; every wrong key, an admin's token and no key at all are answered `401`, and leave no account behind; the gate comes before the body; an API without a key takes no bot; the token is good for a minute; a role an admin gives is in the next token and not in the one from before; three requests at once for a newcomer are one account; the log names the account, and neither the key nor the token.
+
+### D61. The bot is a dialogue that knows nothing of Telegram, behind a part that decides nothing (in place)
+
+`routeforge-bot` has three parts:
+
+| Module | |
+|---|---|
+| `api` | What the bot asks of the API: a trait, `Api`, and `HttpApi`, which asks over HTTP. |
+| `chat` | What the bot says and does. What came from a chat goes in, an `Event`. A `Reply` comes out: a text, and the buttons under it. |
+| `telegram` | Updates of Telegram's become events, and replies become messages. Nothing is decided there. |
+
+How an order is placed:
+
+- It begins with a place: a location that was shared, a venue, whose address goes into the order, or `/order 50.45 30.52`.
+- The bot asks for the kind, for the number of parcels, 1 to 5, and for the day: today or one of the two days after it. One message carries the question, and changes in its place from one question to the next.
+- When nothing is missing, the message shows the order and has a button that places it. The order is placed by the press of that button, and by nothing before it (D9).
+
+What holds for everything:
+
+- **An order that is being put together is in memory,** one for each chat. Its buttons name it by the message that began it. A button of another draft, of another chat, or of a bot that has been started again is told that the order is no longer open. At most 1024 drafts are kept, and the oldest goes first.
+- **What a button means is a type,** `Press`, which writes what the button carries and reads it back. Telegram lets a button carry 64 bytes. A button that is not a draft's says everything itself, an order's id or a day, so it works after the bot has been started again.
+- **What changes something is confirmed:** placing an order, withdrawing one, asking for a plan. The first press asks, and only the second does.
+- **A draft is taken out before the API is asked,** and given back when the API would not have the order. So a second press that is already on its way finds nothing to place.
+- **The buttons for a day say the day they mean,** as `Tomorrow, Tue 13 Oct`. The days are those of the bot's clock (D62). A day that has passed since it was offered is refused, and asked for again.
+- **What the API says is what the person is told.** Its `detail` is written for a person (D39), and the bot makes a sentence of it. A failure that is the API's own is said in the bot's words. An order that got no answer is not said to have failed: it may have been stored, and the bot says that it cannot tell.
+- **The commands are a table in `chat`:** what each is called, and what Telegram's menu says of it. `/orders` lists the person's orders from today on, to look at or to withdraw. `/pending`, `/plan` and `/status` are an operator's, and each asks for the day with buttons.
+- **Every request carries `tg-<update id>` as its request id** (D42). So what a chat asked for is found in the API's log, and a plan that was asked for by chat in the log of every solver that worked on it.
+- **Private chats only.** In a group, everybody's presses would go into one person's order.
+- **Text goes out as text.** No message is given a parse mode, so an address somebody typed is never read as markup.
+
+Why:
+
+- The dialogue is where the bot can go wrong: an order placed twice, or before it was confirmed, or by the wrong person. With no Telegram in it, every step of it is a function of what came in and of what the API answered. A test says what a person sends, and presses the buttons the bot made, by their labels.
+- A draft in memory is what `docs/plan.md` asks for, and all that is lost with it is an order that was not finished. Everything that was finished is in the API.
+- The id of the message that began a draft is unique in its chat, and is there without the bot having to keep count from one start to the next.
+- The commands are read in `chat` and not by teloxide's derive. One table then serves the reading, the help and the menu, and a test sends `/order 50.45 30.52` as a person does. The workspace no longer asks teloxide for its `macros` feature.
+- Typed coordinates were added by the project owner's choice on 2026-10-12. Not every client of Telegram can share a location, and they let the bot be tried without a phone.
+
+What it does not do: take free text (D58); turn an address into a place, which is Phase 8's; show more than ten orders at once; or tell an order that was not placed from one that was placed and lost on the way back, which would take a key that makes a request safe to repeat.
+
+Tests: the order of the phase, press by press, with nothing asked of the API before the last one; dropping it at each step; buttons that are out of date, another chat's, or made up; days that have passed; every command for a client and for an operator; a role that changes between two requests; the API away, refusing, failing, and silent after an order went out. How the three parts are tried together is D64.
+
+### D62. How the bot starts, waits and stops (in place)
+
+- **Without `TELEGRAM_BOT_TOKEN` the bot idles.** It says that it has no token and where one comes from, and waits to be told to stop, as the stub did (D56).
+- **With a token it needs `BOT_SERVICE_KEY`,** the key the API has (D60). Without it, or with an address that is none, it ends at once and names the setting, as the API does (D47).
+- **It asks Telegram for its updates,** by long polling, ten seconds at a time. So Telegram needs no way to reach it. It asks for messages and for the presses of buttons, and for nothing else.
+- **A Telegram that cannot be reached is tried again,** after a pause that doubles from one second to thirty, as a solver waits for its database (D37).
+- **A token that Telegram refuses ends the process,** with the reason and a status that says so.
+- **Told to stop, it tells Telegram which updates it has had** and ends, within eight seconds at the most.
+- **"Today" is the day of its clock,** in the zone its machine is set to. Compose passes `TZ` on, and a container without it is on UTC.
+
+Why:
+
+- teloxide's `dispatch()` panics when its first request to Telegram fails. That would be a panic for a network that is not up yet, and for a mistyped token alike. The bot asks Telegram who it is itself, and tells the two apart: one is waited out, and the other is for a person to mend.
+- A refused token is not waited out. Nothing the bot does will make it good, and a process that ends has said why (D47).
+- teloxide's handler of Ctrl-C hears Ctrl-C and no SIGTERM, and SIGTERM is what `docker stop` sends. The first process of a container is not ended by a signal it does not listen for (D35, D51, D56). So the bot listens for both, as the API and the solver do, and stops teloxide's dispatcher through its shutdown token. The workspace no longer asks teloxide for its `ctrlc_handler` feature.
+- An update that is not acknowledged is sent again. Stopped without that, the bot would answer the last message twice: once now, and once when it is started again.
+- TLS is rustls with the roots it trusts compiled in: teloxide's `rustls` feature is reqwest's `rustls-tls`, which brings `webpki-roots`. So the image still has no certificates of its own, and nothing native is built (D12, D38).
+- The client that asks Telegram is built by the bot, with the settings teloxide gives its own. Built inside teloxide, a failure to build it would be a panic.
+
+Neither the token nor the key reaches a log. The settings that are logged hold neither, and the type that holds them has no `Debug`. teloxide's `Bot` has one that shows the token, so the bot never formats it, and teloxide takes the token out of the errors it reports. An address that carries a password is refused as a setting, and is not repeated.
+
+Good to know:
+
+- **One bot for a token.** Two that ask for updates with the same token are refused by turns, with a `409`.
+- **teloxide waits ten seconds over a `5xx` of Telegram's** before it hands the error on.
+- **teloxide writes the name of a method as `GetMe`** where Telegram's documentation writes `getMe`. Telegram takes either, and whatever stands in for it has to as well.
+
+Tried in containers, in a project of its own: the stack was up nine seconds after `docker compose up`, with the bot idling. The idle bot had stopped 0.4 seconds after it was told to. With `TZ=Europe/Kyiv` it said that its day was `2026-10-12 +03:00`. With a token that was made up, it reached `api.telegram.org` over TLS from an image that has no CA certificates, was told that there is no such bot, and ended with status 1 and the reason, 2.8 seconds after it was started.
+
+### D63. An order announces itself (in place)
+
+Decided with the project owner on 2026-10-12: an order that is placed by chat is to be seen on the map as it is placed.
+
+- **In the database.** `orders::create` and `orders::cancel` notify a channel of their own, `routeforge_orders`, in the statement of the change. The payload is the day of the order, written as `2026-10-12`, and nothing else.
+- **In the API.** The one connection that listens (D50) takes this channel as well. The stats stream passes the word on as an `orders` event, an `OrdersChanged` with the day. The stream of a plan ignores it.
+- **On the page.** A page that shows that day reads its orders again. It also reads them when its stats stream opens again after a break, and every thirty seconds while the stream is open.
+
+Why:
+
+- Sent with the change, the word is heard when the order can be read, and never for one that was rolled back (D48). A withdrawal that changed nothing says nothing.
+- The day alone: the notifications of one transaction for one day are then equal, and PostgreSQL folds them into one (D26). The two thousand orders of a demo day are one word. The day is also all a page needs, to know whether the word is for it.
+- `to_char` writes the day, and not a cast to text, which follows the `DateStyle` of the session that placed the order.
+- The stats stream, because it is the one stream an operator's page always has open. A stream of its own would be one more connection for every page, and one more endpoint.
+- The event names the day and no order, so it tells an operator nothing they may not read anyway. Whoever hears it reads the orders, as whoever hears of a plan reads the plan (D48).
+- A notification is a hint (D26), and nothing in the stream makes up for one that was lost: the stream holds no orders to compare with. So the page reads now and then without being told, as the streams do (D50).
+
+What it does not do:
+
+- A client's page has no stream (D41). It shows a new order after Refresh.
+- What a plan does to an order, taking it or giving it back, is the plan's to announce, and the page reads the orders again when its plan changes.
+- A plan that was asked for elsewhere, by chat for one, shows on a page after Refresh. Nothing tells a page that the day it shows has a new plan.
+
+Measured in a headless Edge, against an API on the host: an order that was placed through the API with a Telegram user's token was on the map 0.37 seconds later, and its withdrawal after 0.37 seconds. An order of another day caused no read. An order that was stored behind everybody's back, by an `INSERT` that announces nothing, was shown 26 seconds later.
+
+Tests: an order is announced once, at the commit and not before it, and not when it was rolled back or when nothing changed; forty orders of two days in one transaction are two words; the day reads the same in a session that writes its dates as `12.10.2026`; none of it reaches the channels of the workers and of the plans; the stats stream passes on a placement, a withdrawal and a day of demo orders, each once; the stream of a plan stays quiet.
+
+### D64. The bot is tried against stand-ins, and its requests are held to the API's document (in place)
+
+There was no token from Telegram while the bot was built. So what can be shown without Telegram was shown without it:
+
+- **The dialogue against a fake of the API.** `FakeApi` implements `Api`. It notes what it is asked, and gives a new token at every login, so a test can see which login a request came of.
+- **The requests against a server that knows the API's document.** A wiremock server answers each operation at the method and the path that `crates/routeforge-api/openapi.json` gives it, found by the id of the operation, and nowhere else. A request the API would not know is not answered there either.
+- **The whole bot against a stand-in for Telegram.** A second wiremock server speaks the Bot API as far as the bot uses it. It hands out the updates a test gave it, from the offset on that it is asked for, as `getUpdates` does, and takes what the bot sends. The bot runs against it and against a stand-in for the API as it runs against the real ones: with teloxide's dispatcher, and over HTTP.
+- **The binary itself,** run by a test: it idles without a token, names the setting it misses, and with its settings talks to the Telegram and the API they name.
+
+Why:
+
+- The bot may not link the API, and the API's tests cannot run the bot (D3). The document is the contract between the two (D43), and it is committed. With the bot's requests held to it, a path that changes in the API fails a test of the bot's.
+- The part that turns updates into events can only be wrong about Telegram. Updates as Telegram sends them are the one thing that tries it, read by teloxide's own types.
+- Nothing else comes in through `main`, which is what the tests of the API's binary are there for too (D55).
+
+What a stand-in cannot show: that Telegram takes what the bot sends. A keyboard that is shaped wrongly, a text too long for a button, a method that Telegram answers otherwise than teloxide expects, would all pass here and fail there. That is why the "Done when" of the phase is still open, and `docs/plan.md` says what it takes to close it.
+
+Found while it was written: teloxide asks for `GetMe` and not for `getMe` (D62). The first stand-in answered the second alone, and every test of the whole bot waited for an answer that never came.

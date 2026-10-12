@@ -27,6 +27,8 @@ The page with the map is then at `http://127.0.0.1:8080/` and Swagger UI at `htt
 
 `scripts/demo.ps1` (or `.sh`, which needs `curl` and `jq`) makes the scaling run and the failure run on that stack (D57). It plans tomorrow, and on that day it cancels and discards the plans that are in its way.
 
+The bot idles until `.env` has `TELEGRAM_BOT_TOKEN`, a token from @BotFather (D62). Nothing else has to be set for it. Whoever writes to it gets a client's account, and `/start` says the account's id, which an admin needs to make it an operator's (D59).
+
 An image holds what was in the working tree when it was built. After a change, `--build` again.
 
 The compose file names its project `routeforge`, so `docker compose` and the scripts act on the development stack wherever they are run from, and `docker compose down -v` there deletes the development database. To try something on a database of its own, set `COMPOSE_PROJECT_NAME`, `POSTGRES_PORT` and `API_PORT` in the shell first, for example to `routeforge-try`, `5433` and `8081`.
@@ -46,6 +48,8 @@ In bash it is `export NAME=value` for each. The API does not read `.env`. The se
 
 The page is compiled into the API (D52), so a change to `web/index.html` shows after the API has been built and started again.
 
+An API that is to take a bot needs `BOT_SERVICE_KEY` as well, of at least 32 bytes. The bot beside it is `cargo run -p routeforge-bot`, with the same key and `TELEGRAM_BOT_TOKEN` in its shell. It looks for the API at `http://127.0.0.1:8080` unless `BOT_API_URL` says otherwise. Its settings are listed at the top of `crates/routeforge-bot/src/main.rs`.
+
 ## Rules that are easy to break
 
 - Exactly five crates. Helpers go into an existing crate, never a new one.
@@ -57,20 +61,28 @@ The page is compiled into the API (D52), so a change to `web/index.html` shows a
 - After changing a query or a migration, run `scripts/sqlx-prepare.ps1` (or `.sh`) and commit `.sqlx/`: builds check queries against that directory, not a database (D28). Never edit a migration that has been merged; add a new one.
 - Nothing may need OpenSSL, CMake or NASM to build: TLS stays on rustls with ring, crypto on pure-Rust backends (D12).
 - A solver applies no migrations. The API owns the schema (D32).
-- In a handler, the argument that says who may call it (`AuthUser`, `Staff` or `Admin`) comes first, so the gate is checked before the body is read (D41).
+- In a handler, the argument that says who may call it (`AuthUser`, `Staff`, `Admin`, or `Bot` for the bot's key) comes first, so the gate is checked before the body is read (D41, D60).
 - A new endpoint needs a row in `MATRIX` in `crates/routeforge-api/src/app/tests.rs`. After changing a handler or a type the API sends or receives, run the tests with `UPDATE_OPENAPI=1`, read the diff of `crates/routeforge-api/openapi.json`, and commit it (D43).
 - Every error the API sends is an `ApiError`, which leaves as `application/problem+json`. The cause of a `500` goes to the log and never into the response (D39).
 - A job's heartbeat, its search and the announcer of its progress belong to the job's future. Put one of them into a task of its own and a job that is dropped keeps its lease, or its thread (D34). An event stream of the API is likewise a value its response owns, with no task behind it (D50).
 - A change to a plan or to one of its jobs goes through `db::queue`, which tells whoever watches the plan, in the transaction of the change. A new way to change either has to tell them too, with the plan's id and nothing else as the payload (D48).
+- An order that is placed or withdrawn announces its day on `routeforge_orders`, in the statement of the change. A new way to change an order that no plan announces has to do the same, with the day and nothing else as the payload (D63).
+- The bot asks the API with a token of the person it is talking to. Its key is for `telegram_login` and for nothing else, and it keeps no token from one update to the next (D9, D60).
+- In the bot, `chat.rs` has no teloxide in it, and `telegram.rs` decides nothing. What the bot says and does is written in `chat.rs` and tested against `FakeApi` (D61).
+- In the bot, what changes something is done by the press of a confirming button and by nothing before it (D9, D61).
+- A request of the bot's that is new, or goes to another path, needs its operation in `crates/routeforge-api/openapi.json`: the bot's tests answer only where that document says (D64).
+- Neither the Telegram token nor the bot's key may reach a log. Never format a teloxide `Bot`: its `Debug` shows the token (D62).
 - A file added under `web/` needs a row in `FILES` in `crates/routeforge-api/src/page.rs`. Files under `web/vendor/` are kept as they were released: do not edit them (D52).
 - The page asks no other host for anything but map tiles, and puts text from the API into the document as text, never as HTML (D52). After changing `web/index.html`, try it in a browser: the tests check that the page is served and what it loads, not what it does.
 - `rust-toolchain.toml` and the base image in the `Dockerfile` name the same compiler. Change them together (D10).
-- `docker compose up` has to work on a clone with no `.env`. A variable the compose file hands to a service needs a fallback there when the binary has no default for it. A test in `crates/routeforge-api/src/config.rs` holds the fallbacks of the `api` service to what the API starts with (D54).
-- A service is the first process in its container, and the first process is not ended by a signal it does not listen for. A binary has to hear SIGTERM itself, or stopping the stack waits ten seconds for it (D35, D51, D56).
+- `docker compose up` has to work on a clone with no `.env`. A variable the compose file hands to a service needs a fallback there when the binary has no default for it. A test in `crates/routeforge-api/src/config.rs` holds the fallbacks of the `api` service to what the API starts with, and one in `crates/routeforge-bot/src/config.rs` those of the `bot` service (D54). The bot and the API have to fall back to the same `BOT_SERVICE_KEY`.
+- A service is the first process in its container, and the first process is not ended by a signal it does not listen for. A binary has to hear SIGTERM itself, or stopping the stack waits ten seconds for it (D35, D51, D56). teloxide's own handler hears Ctrl-C alone, so the bot does not use it (D62).
 - The runtime image gets no tools. What a health check needs to ask is asked by the binary itself, as `routeforge-api healthcheck` does (D55).
 
 ## Dependencies
 
 Versions are pinned in the root `Cargo.toml` and `Cargo.lock`. Several had recent major releases (sqlx 0.9, utoipa 6, rand 0.10, jsonwebtoken 11, argon2 0.6, criterion 0.8), so check docs.rs for the pinned version. `cargo info <crate>` lists a crate's features.
+
+teloxide 0.17 is used without its `ctrlc_handler` and `macros` features, and its `dispatch()` is not called: it panics when Telegram cannot be reached (D62). The traps met with it are in `docs/plan.md`.
 
 The project is developed on Windows. Keep helper scripts in both PowerShell and bash, and files in LF.
