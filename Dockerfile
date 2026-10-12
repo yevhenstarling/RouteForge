@@ -41,7 +41,8 @@ RUN cargo build --release --locked \
 
 # What a service runs on: the C library its binary links to, and a user without
 # privileges. Nothing else is needed, neither OpenSSL nor CA certificates (D12), and
-# no curl: the API asks after its own health (D55).
+# no curl: the API asks after its own health (D55). The bot is the one service that
+# speaks TLS, to Telegram, and has the roots it trusts compiled into it (D62).
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 RUN useradd --system --no-create-home --uid 10001 routeforge
 USER routeforge
