@@ -48,6 +48,8 @@ sqlx = { version = "0.9", default-features = false, features = [
 # Auth. `rust_crypto` is the pure-Rust backend: nothing to compile with CMake or NASM.
 argon2 = "0.6"
 jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+# For comparing the bot's key in constant time. The crates above bring it in anyway.
+subtle = "2.6"
 
 # Telegram bot and outgoing HTTP. reqwest stays on the 0.12 line because teloxide 0.17
 # is built on it; both use rustls with ring, so there is one HTTP stack and no OpenSSL.

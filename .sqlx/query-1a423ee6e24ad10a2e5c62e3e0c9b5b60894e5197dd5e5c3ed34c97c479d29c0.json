@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, email, role, created_at FROM users ORDER BY id",
+  "query": "INSERT INTO users (id, telegram_id, role)\n         VALUES ($1, $2, $3)\n         ON CONFLICT (telegram_id) DO UPDATE SET telegram_id = EXCLUDED.telegram_id\n         RETURNING id, email, telegram_id, role, created_at",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,17 @@
       },
       {
         "ordinal": 2,
+        "name": "telegram_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "telegram_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
         "name": "role",
         "type_info": "Text",
         "origin": {
@@ -37,7 +48,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -49,14 +60,19 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Text"
+      ]
     },
     "nullable": [
       false,
-      false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "6d629769713455f887db4f2951c1f0a62b5eb3e0d22e2b455205a3784ba5254a"
+  "hash": "1a423ee6e24ad10a2e5c62e3e0c9b5b60894e5197dd5e5c3ed34c97c479d29c0"
 }

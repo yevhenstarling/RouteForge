@@ -18,6 +18,8 @@
 //! | `API_BIND` | `127.0.0.1:8080` | The address and port to listen on. |
 //! | `JWT_TTL_SECS` | 3600 | How long a login is good for. |
 //! | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | none | The admin to make at start-up, if there is none with that address. Both or neither. |
+//! | `BOT_SERVICE_KEY` | none | The key the Telegram bot shows to be given a user's token. At least 32 bytes. Without it the API takes no bot. |
+//! | `BOT_JWT_TTL_SECS` | 60 | How long such a token is good for. |
 //! | `API_BUDGET_DEFAULT_MS` | 10000 | The time each route of a plan gets when the plan asks for no budget. |
 //! | `API_BUDGET_MAX_MS` | 300000 | The longest a plan may ask for, for each route. |
 //! | `API_BUDGET_MAX_ITERATIONS` | 10000000000 | The most candidate moves a plan may ask for, for each route. |
@@ -54,7 +56,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{AppState, app};
-use crate::auth::{Passwords, Tokens};
+use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::{Config, Secrets};
 use crate::events::Events;
 use crate::stream::Pace;
@@ -97,10 +99,15 @@ async fn serve() -> anyhow::Result<()> {
         startup::seed_admin(&pool, &passwords, admin).await?;
     }
 
+    if secrets.bot_key.is_none() {
+        info!("BOT_SERVICE_KEY is not set: this API takes no bot");
+    }
     let state = web::Data::new(AppState {
         pool: pool.clone(),
         tokens: Tokens::new(secrets.jwt_secret.as_bytes(), config.token_ttl),
         passwords,
+        bot_key: secrets.bot_key.as_deref().map(ServiceKey::new),
+        bot_token_ttl: config.bot_token_ttl,
         limits: config.limits,
         worker_alive: config.worker_alive,
         events: Events::new(),

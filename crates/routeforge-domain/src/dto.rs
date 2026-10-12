@@ -32,6 +32,16 @@ impl fmt::Debug for Login {
     }
 }
 
+/// Who the bot is talking to, as Telegram knows them. The bot sends it with its key,
+/// and is given a `Session` for that user's account (D60).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TelegramLogin {
+    /// The id Telegram gives the user. At least 1.
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
+    pub telegram_id: i64,
+}
+
 /// What a login gives: the token that says who is asking, and for how long it does.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -191,7 +201,8 @@ mod tests {
             expires_in: 3_600,
             user: User {
                 id: UserId::generate(),
-                email: login.email,
+                email: Some(login.email),
+                telegram_id: None,
                 role: Role::Client,
                 created_at: Utc::now(),
             },

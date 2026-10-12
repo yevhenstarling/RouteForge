@@ -76,10 +76,10 @@ pub(crate) async fn seed_admin(
 
     if let Some(existing) = users::find_by_email(pool, &admin.email).await? {
         if existing.user.role == Role::Admin {
-            info!(email = %existing.user.email, "the admin of ADMIN_EMAIL is there already");
+            info!(email = %admin.email, "the admin of ADMIN_EMAIL is there already");
         } else {
             warn!(
-                email = %existing.user.email,
+                email = %admin.email,
                 role = %existing.user.role,
                 "ADMIN_EMAIL belongs to an account that is no admin; it was left as it is"
             );
@@ -96,7 +96,7 @@ pub(crate) async fn seed_admin(
         role: Role::Admin,
     };
     match users::create(pool, &new).await {
-        Ok(user) => info!(email = %user.email, "made the admin of ADMIN_EMAIL"),
+        Ok(_) => info!(email = %admin.email, "made the admin of ADMIN_EMAIL"),
         // Another API that started at the same moment was first.
         Err(DbError::EmailTaken) => {}
         Err(error) => return Err(error).context("could not store the admin of ADMIN_EMAIL"),
@@ -147,8 +147,8 @@ mod tests {
         let made = users::list(&pool).await.unwrap();
         assert_eq!(made.len(), 1);
         assert_eq!(
-            (made[0].email.as_str(), made[0].role),
-            ("admin@example.com", Role::Admin)
+            (made[0].email.as_deref(), made[0].role),
+            (Some("admin@example.com"), Role::Admin)
         );
 
         // Every start of the API runs this again.

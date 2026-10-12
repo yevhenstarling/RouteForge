@@ -11,6 +11,10 @@
 //!
 //! A handler says what it needs by the type of an argument: [`AuthUser`] for anyone
 //! who is logged in, [`Staff`] for an operator or an admin, [`Admin`] for an admin.
+//!
+//! One caller is no user: the Telegram bot, [`Bot`]. It shows a key instead of a token,
+//! and all the key is good for is a short-lived token of the Telegram user the bot is
+//! talking to. Whatever the bot then does, it does as that user (D9, D60).
 
 use std::future::{Ready, ready};
 use std::sync::Arc;
@@ -25,6 +29,7 @@ use argon2::password_hash::{self, PasswordHasher, PasswordVerifier};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use routeforge_domain::{Role, Session, User, UserId};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing_actix_web::RootSpan;
 
 use crate::app::AppState;
@@ -154,22 +159,35 @@ impl Tokens {
         }
     }
 
-    /// A session for `user`, from now.
+    /// A session for `user`, from now, for as long as a login is good for.
     pub(crate) fn issue(&self, user: User) -> Result<Session, ApiError> {
-        let token = self.sign(user.id, user.role, jsonwebtoken::get_current_timestamp())?;
+        self.issue_for(user, self.ttl)
+    }
+
+    /// A session for `user`, from now, that is good for `ttl`. The bot's are much
+    /// shorter than a login's: it asks for one each time it needs one (D60).
+    pub(crate) fn issue_for(&self, user: User, ttl: Duration) -> Result<Session, ApiError> {
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = self.sign(user.id, user.role, now, ttl)?;
         Ok(Session {
             token,
-            expires_in: self.ttl.as_secs(),
+            expires_in: ttl.as_secs(),
             user,
         })
     }
 
-    fn sign(&self, user: UserId, role: Role, issued_at: u64) -> Result<String, ApiError> {
+    fn sign(
+        &self,
+        user: UserId,
+        role: Role,
+        issued_at: u64,
+        ttl: Duration,
+    ) -> Result<String, ApiError> {
         let claims = Claims {
             sub: user,
             role,
             iat: issued_at,
-            exp: issued_at.saturating_add(self.ttl.as_secs()),
+            exp: issued_at.saturating_add(ttl.as_secs()),
         };
         jsonwebtoken::encode(&Header::default(), &claims, &self.signing).map_err(ApiError::internal)
     }
@@ -189,7 +207,28 @@ impl Tokens {
     /// can hold one that is about to expire.
     #[cfg(test)]
     pub(crate) fn issued_at(&self, user: &User, issued_at: u64) -> String {
-        self.sign(user.id, user.role, issued_at).unwrap()
+        self.sign(user.id, user.role, issued_at, self.ttl).unwrap()
+    }
+}
+
+/// The key the bot shows to be given a user's token (D60). The bot and the API have
+/// it, and nobody else.
+///
+/// It has no `Debug`, so that it cannot reach a log.
+pub(crate) struct ServiceKey(Box<[u8]>);
+
+impl ServiceKey {
+    pub(crate) fn new(key: &str) -> Self {
+        Self(key.as_bytes().into())
+    }
+
+    /// Whether `shown` is the key.
+    ///
+    /// Every byte is compared, however early the first one differs. So the time it
+    /// takes says nothing about how much of a guess was right. It does say whether
+    /// the guess is as long as the key, which is no help in guessing it.
+    fn is(&self, shown: &str) -> bool {
+        self.0.ct_eq(shown.as_bytes()).into()
     }
 }
 
@@ -219,10 +258,35 @@ pub(crate) struct Staff(pub(crate) AuthUser);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Admin(pub(crate) AuthUser);
 
-fn authenticate(request: &HttpRequest) -> Result<AuthUser, ApiError> {
-    let state = request
+/// The Telegram bot, which has shown its key (D60).
+///
+/// It is no user, and no token of a user's stands for it: an admin's opens what this
+/// guards as little as nobody's does.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bot;
+
+fn state_of(request: &HttpRequest) -> Result<&web::Data<AppState>, ApiError> {
+    request
         .app_data::<web::Data<AppState>>()
-        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("the application has no state")))?;
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("the application has no state")))
+}
+
+fn the_bot(request: &HttpRequest) -> Result<Bot, ApiError> {
+    let Some(key) = &state_of(request)?.bot_key else {
+        return Err(ApiError::Unauthorized(
+            "this API takes no bot: it was started without BOT_SERVICE_KEY",
+        ));
+    };
+    match bearer_token(request) {
+        Some(shown) if key.is(shown) => Ok(Bot),
+        _ => Err(ApiError::Unauthorized(
+            "this is for the bot, which shows its key as `Authorization: Bearer <key>`",
+        )),
+    }
+}
+
+fn authenticate(request: &HttpRequest) -> Result<AuthUser, ApiError> {
+    let state = state_of(request)?;
     let token = bearer_token(request).ok_or(ApiError::Unauthorized(
         "log in, and send the token as `Authorization: Bearer <token>`",
     ))?;
@@ -284,6 +348,15 @@ impl FromRequest for Admin {
     }
 }
 
+impl FromRequest for Bot {
+    type Error = ApiError;
+    type Future = Ready<Result<Self, ApiError>>;
+
+    fn from_request(request: &HttpRequest, _: &mut Payload) -> Self::Future {
+        ready(the_bot(request))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -296,7 +369,8 @@ mod tests {
     fn user(role: Role) -> User {
         User {
             id: UserId::generate(),
-            email: "ada@example.com".to_owned(),
+            email: Some("ada@example.com".to_owned()),
+            telegram_id: None,
             role,
             created_at: Utc::now(),
         }
@@ -329,11 +403,52 @@ mod tests {
         let now = jsonwebtoken::get_current_timestamp();
 
         // Issued an hour ago, less a minute: a minute left.
-        let nearly = tokens.sign(user.id, user.role, now - 3_540).unwrap();
+        let nearly = tokens.issued_at(&user, now - 3_540);
         assert!(tokens.read(&nearly).is_some());
         // Issued an hour and a second ago. There is no leeway.
-        let expired = tokens.sign(user.id, user.role, now - 3_601).unwrap();
+        let expired = tokens.issued_at(&user, now - 3_601);
         assert_eq!(tokens.read(&expired), None);
+    }
+
+    /// The bot's tokens are of the same key as a login's and read by the same check.
+    /// They differ in how long they are good for, and in nothing else.
+    #[test]
+    fn a_token_can_be_issued_for_less_than_a_login_lasts() {
+        let tokens = Tokens::new(SECRET, HOUR);
+        let user = user(Role::Operator);
+        let minute = Duration::from_secs(60);
+
+        let session = tokens.issue_for(user.clone(), minute).unwrap();
+        assert_eq!(session.expires_in, 60);
+        assert_eq!(session.user, user);
+        let read = tokens.read(&session.token).unwrap();
+        assert_eq!((read.id, read.role), (user.id, Role::Operator));
+        let now = jsonwebtoken::get_current_timestamp();
+        assert!(
+            (now + 50..=now + 60).contains(&read.expires_at),
+            "{} from {now}",
+            read.expires_at
+        );
+
+        // Issued two minutes ago for one minute: over, though a login would still hold.
+        let over = tokens.sign(user.id, user.role, now - 120, minute).unwrap();
+        assert_eq!(tokens.read(&over), None);
+        assert!(tokens.read(&tokens.issued_at(&user, now - 120)).is_some());
+    }
+
+    #[test]
+    fn the_bots_key_is_the_whole_key_and_nothing_but() {
+        let key = ServiceKey::new("the key the bot alone is to have");
+        assert!(key.is("the key the bot alone is to have"));
+        for wrong in [
+            "",
+            "the key the bot alone is to hav",
+            "the key the bot alone is to have.",
+            "The key the bot alone is to have",
+            "the key the bot alone is to havE",
+        ] {
+            assert!(!key.is(wrong), "{wrong:?}");
+        }
     }
 
     #[test]
@@ -355,7 +470,12 @@ mod tests {
 
         // The claims of an admin, under the signature of a client's token.
         let admin = Tokens::new(b"another key of thirty-two bytes!", HOUR)
-            .sign(user.id, Role::Admin, jsonwebtoken::get_current_timestamp())
+            .sign(
+                user.id,
+                Role::Admin,
+                jsonwebtoken::get_current_timestamp(),
+                HOUR,
+            )
             .unwrap();
         let admin_claims = admin.split('.').nth(1).unwrap();
         let promoted = format!("{}.{admin_claims}.{}", parts[0], parts[2]);
