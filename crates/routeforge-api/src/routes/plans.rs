@@ -229,8 +229,9 @@ impl Watch for PlanWatch {
                 stream::frame("progress", progress.as_ref()).map_or(Heard::Nothing, Heard::Frame)
             }
             Signal::Missed => Heard::Changed,
-            // Of another plan.
-            Signal::Plan(_) | Signal::Progress(_) => Heard::Nothing,
+            // Of another plan, or of an order that no plan has taken. What a plan
+            // does to its orders it says as a change of its own.
+            Signal::Plan(_) | Signal::Progress(_) | Signal::Orders(_) => Heard::Nothing,
         }
     }
 
@@ -878,6 +879,8 @@ mod tests {
         api.events()
             .send(Signal::Progress(Arc::new(search_of(theirs))));
         api.events().send(Signal::Plan(theirs));
+        // Nor is an order that somebody placed, be it for the plan's own day (D63).
+        api.events().send(Signal::Orders(date(12)));
         assert!(
             stream.is_quiet_for(QUIET).await,
             "another plan is none of its business"

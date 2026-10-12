@@ -391,6 +391,19 @@
         ],
         "type": "string"
       },
+      "OrdersChanged": {
+        "description": "What an `orders` event of the stats stream says: an order of this day was placed or\nwithdrawn, so whoever shows the day reads its orders again (D63).",
+        "properties": {
+          "service_date": {
+            "format": "date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_date"
+        ],
+        "type": "object"
+      },
       "Plan": {
         "description": "One planning run: the orders of a service date turned into courier routes (D2).",
         "properties": {
@@ -2442,7 +2455,7 @@
     },
     "/api/system/stats/events": {
       "get": {
-        "description": "An event stream (`text/event-stream`) that stays open. It opens with a `stats`\nevent, which is what `GET /api/system/stats` gives, and sends another whenever that\nhas changed: at once when a job is queued, claimed or finished, and within a couple\nof seconds when a worker has come or has fallen silent.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
+        "description": "An event stream (`text/event-stream`) that stays open. It opens with a `stats`\nevent, which is what `GET /api/system/stats` gives, and sends another whenever that\nhas changed: at once when a job is queued, claimed or finished, and within a couple\nof seconds when a worker has come or has fallen silent.\n\nIt also sends an `orders` event, an `OrdersChanged`, whenever an order was placed\nor withdrawn. It names the day and no order: whoever shows that day reads its\norders again. Nothing makes up for one that was lost, so a reader also reads now\nand then without being told.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
         "operationId": "watch_system_stats",
         "responses": {
           "200": {

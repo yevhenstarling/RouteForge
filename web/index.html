@@ -206,6 +206,9 @@ const NO_COURIER = '#8a8f98';
 // How many vans the demo city has: one for each solver of the stack as it is shown.
 const VANS = 4;
 const SESSION = 'routeforge.session';
+// How often the orders of the day are read again without anybody having said that one
+// was placed. Whoever places one says so, but a word like that can be lost.
+const ORDERS_EVERY_MS = 30000;
 
 const $ = (id) => document.getElementById(id);
 
@@ -237,6 +240,7 @@ let stopWatchingPlan = () => {};
 let stopWatchingStats = () => {};
 let routesAsked = 0;
 let ordersTimer = null;
+let ordersEvery = null;         // the timer of the reads that nobody asked for
 
 // ---------------------------------------------------------------- small things
 
@@ -869,6 +873,11 @@ function statsChanged(stats) {
   renderRoutes();
 }
 
+/** An order of some day was placed or withdrawn: here, on another page, or by chat. */
+function ordersChanged(changed) {
+  if (changed.service_date === state.date) loadOrdersSoon();
+}
+
 // ---------------------------------------------------------------- what the buttons do
 
 async function askForPlan() {
@@ -952,10 +961,15 @@ async function start() {
     await loadCouriers();
     if (isStaff()) {
       link.stats = false;
-      stopWatchingStats = watch('/api/system/stats/events', { stats: statsChanged }, (open) => {
+      const said = { stats: statsChanged, orders: ordersChanged };
+      stopWatchingStats = watch('/api/system/stats/events', said, (open) => {
         link.stats = open;
         renderLink();
+        // What was placed while the stream was not open was not heard of.
+        if (open) loadOrdersSoon();
       });
+      // And a word can be lost on its way while the stream is open, too.
+      ordersEvery = setInterval(() => link.stats && loadOrdersSoon(), ORDERS_EVERY_MS);
     }
     await loadDay();
   } catch (error) {
@@ -968,6 +982,8 @@ function leave(why) {
   stopWatchingStats();
   stopWatchingPlan = () => {};
   stopWatchingStats = () => {};
+  clearInterval(ordersEvery);
+  ordersEvery = null;
   link.plan = null;
   link.stats = null;
   try {

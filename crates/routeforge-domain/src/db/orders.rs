@@ -4,6 +4,10 @@
 //! steps a plan takes, [`lock_pending`] and then [`mark_planned`], belong in one
 //! transaction, so that an order cannot be cancelled between being counted into a
 //! cluster and being marked.
+//!
+//! An order that is placed or withdrawn says so on [`ORDERS_CHANNEL`], for whoever
+//! shows a day's orders to a person (D63). What a plan does to an order is announced
+//! by the plan (D48).
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgConnection, PgExecutor};
@@ -13,6 +17,15 @@ use super::{DbError, parsed, unsigned};
 use crate::geo::LatLon;
 use crate::ids::{OrderId, PlanId};
 use crate::model::{NewOrder, Order, OrderFilter, OrderStatus};
+
+/// The channel that says the orders of a day have changed: one was placed, or one was
+/// withdrawn (D63).
+///
+/// The payload is the day, written as `2026-10-12`, and nothing more. So the
+/// notifications of one transaction for one day are equal, and PostgreSQL folds them
+/// into one (D26): a day of two thousand demo orders is one word. Like every
+/// notification it is a hint. Whoever hears it reads the orders of that day again.
+pub const ORDERS_CHANNEL: &str = "routeforge_orders";
 
 struct OrderRow {
     id: Uuid,
@@ -51,16 +64,26 @@ fn orders(rows: Vec<OrderRow>) -> Result<Vec<Order>, DbError> {
     rows.into_iter().map(Order::try_from).collect()
 }
 
-/// Stores a new order as pending.
+/// Stores a new order as pending, and tells the watchers of its day.
 ///
-/// The schema refuses a demand of 0.
+/// It is one statement, and the notification is sent when the transaction it runs in
+/// commits: an order is heard of when it can be read, and one that was rolled back is
+/// not heard of at all. The schema refuses a demand of 0.
 pub async fn create(executor: impl PgExecutor<'_>, new: &NewOrder) -> Result<Order, DbError> {
-    sqlx::query_as!(
-        OrderRow,
-        "INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,
-                   plan_id, created_at",
+    // The day is written out by `to_char`, so that it reads the same whatever the
+    // session's DateStyle is.
+    let placed = sqlx::query!(
+        r#"WITH placed AS (
+               INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,
+                         plan_id, created_at
+           )
+           SELECT id AS "id!", client_id AS "client_id!", kind AS "kind!", status AS "status!",
+                  service_date AS "service_date!", lat AS "lat!", lon AS "lon!", address,
+                  demand AS "demand!", plan_id, created_at AS "created_at!",
+                  pg_notify($9, to_char(service_date, 'YYYY-MM-DD')) AS watchers
+           FROM placed"#,
         OrderId::generate().0,
         new.client_id.0,
         new.kind.as_str(),
@@ -69,9 +92,23 @@ pub async fn create(executor: impl PgExecutor<'_>, new: &NewOrder) -> Result<Ord
         new.location.lon(),
         new.address,
         i64::from(new.demand),
+        ORDERS_CHANNEL,
     )
     .fetch_one(executor)
-    .await?
+    .await?;
+    OrderRow {
+        id: placed.id,
+        client_id: placed.client_id,
+        kind: placed.kind,
+        status: placed.status,
+        service_date: placed.service_date,
+        lat: placed.lat,
+        lon: placed.lon,
+        address: placed.address,
+        demand: placed.demand,
+        plan_id: placed.plan_id,
+        created_at: placed.created_at,
+    }
     .try_into()
 }
 
@@ -143,14 +180,20 @@ pub async fn list_by_ids(
     orders(rows)
 }
 
-/// Withdraws an order. Only a pending order can be withdrawn.
+/// Withdraws an order, and tells the watchers of its day. Only a pending order can be
+/// withdrawn.
 ///
-/// Returns `false`, and changes nothing, if the order is planned, already cancelled or
-/// does not exist.
+/// Returns `false`, changes nothing and tells nobody, if the order is planned, already
+/// cancelled or does not exist.
 pub async fn cancel(executor: impl PgExecutor<'_>, id: OrderId) -> Result<bool, DbError> {
     let cancelled = sqlx::query!(
-        "UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'pending'",
+        "WITH withdrawn AS (
+             UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'pending'
+             RETURNING service_date
+         )
+         SELECT pg_notify($2, to_char(service_date, 'YYYY-MM-DD')) FROM withdrawn",
         id.0,
+        ORDERS_CHANNEL,
     )
     .execute(executor)
     .await?;
@@ -207,8 +250,10 @@ mod tests {
     use std::time::Duration;
 
     use sqlx::PgPool;
+    use sqlx::postgres::PgListener;
 
     use super::*;
+    use crate::db::queue::{JOBS_CHANNEL, PLANS_CHANNEL};
     use crate::db::testing::{self, date};
     use crate::ids::UserId;
     use crate::model::{OrderKind, Role};
@@ -486,5 +531,121 @@ mod tests {
         assert!(!withdrawal.await.unwrap(), "the plan was first");
         let stored = get(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(stored.status, OrderStatus::Planned);
+    }
+
+    /// Someone who shows the orders of a day, as the API does for the map (D63). It
+    /// listens to everything the database announces, so that a word on a channel it
+    /// was not meant for shows up as well.
+    async fn watching(pool: &PgPool) -> PgListener {
+        let mut watcher = PgListener::connect_with(pool).await.unwrap();
+        watcher
+            .listen_all([ORDERS_CHANNEL, PLANS_CHANNEL, JOBS_CHANNEL])
+            .await
+            .unwrap();
+        watcher
+    }
+
+    /// The days a watcher was told of since it last looked. It waits until nothing
+    /// more has come for a while, so that one word too many shows up as well.
+    async fn told_of(watcher: &mut PgListener) -> Vec<String> {
+        let silence = Duration::from_millis(300);
+        let mut days = Vec::new();
+        while let Ok(notification) = tokio::time::timeout(silence, watcher.recv()).await {
+            let notification = notification.unwrap();
+            assert_eq!(notification.channel(), ORDERS_CHANNEL);
+            days.push(notification.payload().to_owned());
+        }
+        days
+    }
+
+    #[sqlx::test]
+    async fn an_order_is_announced_when_it_is_placed_and_when_it_is_withdrawn(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let plan = testing::plan(&pool, date(12)).await;
+        let mut watcher = watching(&pool).await;
+
+        let order = testing::order(&pool, client.id, date(12)).await;
+        assert_eq!(told_of(&mut watcher).await, ["2026-10-12"], "placed");
+        let other_day = testing::order(&pool, client.id, date(9)).await;
+        assert_eq!(told_of(&mut watcher).await, ["2026-10-09"]);
+
+        // Nothing of an order is said before it can be read, and nothing at all of
+        // one that never could.
+        let mut tx = pool.begin().await.unwrap();
+        create(&mut *tx, &testing::new_order(client.id, date(12)))
+            .await
+            .unwrap();
+        assert!(told_of(&mut watcher).await.is_empty(), "before the commit");
+        tx.commit().await.unwrap();
+        assert_eq!(told_of(&mut watcher).await, ["2026-10-12"]);
+        let mut tx = pool.begin().await.unwrap();
+        create(&mut *tx, &testing::new_order(client.id, date(12)))
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(told_of(&mut watcher).await.is_empty(), "rolled back");
+
+        assert!(cancel(&pool, order.id).await.unwrap());
+        assert_eq!(told_of(&mut watcher).await, ["2026-10-12"], "withdrawn");
+
+        // A withdrawal that changed nothing has nothing to say: of an order that is
+        // withdrawn already, of one a plan holds, and of none.
+        mark_planned(&pool, plan.id, &[other_day.id]).await.unwrap();
+        for unchanged in [order.id, other_day.id, OrderId::generate()] {
+            assert!(!cancel(&pool, unchanged).await.unwrap());
+        }
+        // Nor has a plan that takes an order. It announces itself, elsewhere (D48).
+        assert!(told_of(&mut watcher).await.is_empty());
+    }
+
+    /// The payload is the day and nothing more, so that PostgreSQL folds the
+    /// notifications of one transaction into one for each day (D26).
+    #[sqlx::test]
+    async fn a_day_of_orders_placed_at_once_is_announced_once(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let mut watcher = watching(&pool).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        for number in 0..40 {
+            let day = if number % 4 == 0 { date(13) } else { date(12) };
+            create(&mut *tx, &testing::new_order(client.id, day))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut told = told_of(&mut watcher).await;
+        told.sort();
+        assert_eq!(told, ["2026-10-12", "2026-10-13"]);
+    }
+
+    /// The API reads the day back out of the payload, so it is written one way,
+    /// however the session that places the order writes its dates.
+    #[sqlx::test]
+    async fn the_day_is_announced_the_same_way_whatever_the_sessions_date_style(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let mut watcher = watching(&pool).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL DateStyle = 'German, DMY'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let written: String = sqlx::query_scalar("SELECT DATE '2026-10-12'::text")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            written, "12.10.2026",
+            "the session writes its dates otherwise"
+        );
+        let order = create(&mut *tx, &testing::new_order(client.id, date(12)))
+            .await
+            .unwrap();
+        assert!(cancel(&mut *tx, order.id).await.unwrap());
+        tx.commit().await.unwrap();
+
+        // Placed and withdrawn in one transaction: the same word twice, said once.
+        assert_eq!(told_of(&mut watcher).await, ["2026-10-12"]);
     }
 }

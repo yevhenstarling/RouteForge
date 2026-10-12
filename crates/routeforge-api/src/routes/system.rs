@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use actix_web::web::Bytes;
 use actix_web::{HttpResponse, get, web};
-use routeforge_domain::SystemStats;
 use routeforge_domain::db::{queue, workers};
+use routeforge_domain::{OrdersChanged, SystemStats};
 use utoipa_actix_web::service_config::ServiceConfig;
 
 use crate::app::{AppState, NotAllowed, NotLoggedIn};
@@ -47,6 +47,11 @@ async fn get_system_stats(
 /// event, which is what `GET /api/system/stats` gives, and sends another whenever that
 /// has changed: at once when a job is queued, claimed or finished, and within a couple
 /// of seconds when a worker has come or has fallen silent.
+///
+/// It also sends an `orders` event, an `OrdersChanged`, whenever an order was placed
+/// or withdrawn. It names the day and no order: whoever shows that day reads its
+/// orders again. Nothing makes up for one that was lost, so a reader also reads now
+/// and then without being told.
 ///
 /// A line that starts with a colon is a comment, sent to keep the connection open.
 /// The stream ends when the token it was opened with expires.
@@ -96,6 +101,14 @@ impl Watch for StatsWatch {
             // A change to any plan is a job queued, claimed or finished.
             Signal::Plan(_) | Signal::Missed => Heard::Changed,
             Signal::Progress(_) => Heard::Nothing,
+            // Nothing that is counted here. This is the one stream a page of an
+            // operator always has open, so it is where the word is passed on (D63).
+            Signal::Orders(service_date) => {
+                let changed = OrdersChanged {
+                    service_date: *service_date,
+                };
+                stream::frame("orders", &changed).map_or(Heard::Nothing, Heard::Frame)
+            }
         }
     }
 
@@ -126,7 +139,7 @@ mod tests {
     use actix_web::http::StatusCode;
     use routeforge_domain::db::queue;
     use routeforge_domain::{JobProgress, Role, WorkerId};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sqlx::PgPool;
 
     use super::*;
@@ -255,6 +268,51 @@ mod tests {
         queue::announce_progress(&pool, &held.lease, progress, None)
             .await
             .unwrap();
+        assert!(stream.is_quiet_for(QUIET).await);
+    }
+
+    /// What lets the map show an order that somebody placed elsewhere: by chat, or on
+    /// another page (D63).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn an_order_that_is_placed_or_withdrawn_is_passed_on_with_its_day(pool: PgPool) {
+        let api = testing::api(&pool);
+        let _listening = api.listen().await;
+        let operator = api.actor(Role::Operator).await;
+        let client = api.actor(Role::Client).await;
+        let mut stream = api.open(&operator, "/api/system/stats/events").await;
+        stream.next_of("stats").await;
+
+        // Placed through the API, as the bot places one.
+        let placed = api.order(&client, 13).await;
+        assert_eq!(
+            stream.next_of("orders").await,
+            json!({ "service_date": "2026-10-13" })
+        );
+        // The queue is as it was, so there is nothing else to send.
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        let cancel = format!("/api/orders/{placed}/cancel");
+        let withdrawn = api.post(Some(&client), &cancel, Value::Null).await;
+        assert_eq!(withdrawn.status, StatusCode::OK);
+        assert_eq!(
+            stream.next_of("orders").await,
+            json!({ "service_date": "2026-10-13" })
+        );
+        // A withdrawal that was refused changed nothing, and nothing is said of it.
+        let again = api.post(Some(&client), &cancel, Value::Null).await;
+        assert_eq!(again.status, StatusCode::CONFLICT);
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        // A day of demo orders is stored in one transaction, and is one word.
+        let admin = api.actor(Role::Admin).await;
+        api.depot().await;
+        let demo = json!({ "service_date": date(14), "count": 25, "seed": 7 });
+        let made = api.post(Some(&admin), "/api/demo/orders", demo).await;
+        assert_eq!(made.status, StatusCode::CREATED, "{}", made.text);
+        assert_eq!(
+            stream.next_of("orders").await,
+            json!({ "service_date": "2026-10-14" })
+        );
         assert!(stream.is_quiet_for(QUIET).await);
     }
 

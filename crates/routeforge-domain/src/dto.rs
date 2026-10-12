@@ -154,6 +154,14 @@ pub struct SystemStats {
     pub workers: Vec<WorkerInfo>,
 }
 
+/// What an `orders` event of the stats stream says: an order of this day was placed or
+/// withdrawn, so whoever shows the day reads its orders again (D63).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct OrdersChanged {
+    pub service_date: NaiveDate,
+}
+
 /// Why a request was refused, in the shape of RFC 9457 (`application/problem+json`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

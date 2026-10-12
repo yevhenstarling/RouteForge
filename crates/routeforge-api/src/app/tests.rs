@@ -498,6 +498,7 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
         "RouteProgress",
         "JobProgress",
         "JobStatus",
+        "OrdersChanged",
     ] {
         assert!(schemas.get(named).is_some(), "no schema for {named}");
     }
