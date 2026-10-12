@@ -220,6 +220,7 @@ const state = {
   session: null,        // { token, user, expiresAt }
   date: today(),
   depot: null,
+  planDepot: null,      // the depot the shown plan was made for, if it has moved since
   couriers: [],
   orders: new Map(),    // id -> order, those of the day
   plans: [],            // those of the day, newest first
@@ -491,10 +492,46 @@ const tip = (text) => () => el('span', '', text);
 
 function drawDepot() {
   layers.depot.clearLayers();
+  if (state.planDepot) {
+    // Where the routes of the shown plan start: the depot as it was when the plan was
+    // made (D21). Drawn fainter than the depot there is now, and under it.
+    L.circleMarker(point(state.planDepot.location), {
+      pane: 'depot', radius: 9, color: '#6b7280', weight: 3, dashArray: '4 3', fillColor: '#fff', fillOpacity: 1,
+    }).bindTooltip(tip(`The depot of this plan: ${state.planDepot.name}`)).addTo(layers.depot);
+  }
   if (!state.depot) return;
   L.circleMarker(point(state.depot.location), {
     pane: 'depot', radius: 9, color: '#111', weight: 3, fillColor: '#fff', fillOpacity: 1,
   }).bindTooltip(tip(`Depot: ${state.depot.name}`)).addTo(layers.depot);
+}
+
+/**
+ * Where the routes of the shown plan start and end: the depot the plan was made for
+ * (D21). That is the depot as it is now, unless the depot was moved since. Then it is
+ * the one the plan names, once the page has read it, and nothing until then: a route
+ * drawn from the wrong place would be a wrong route.
+ */
+function depotOfPlan() {
+  const plan = state.plan;
+  if (!plan || (state.depot && plan.depot_id === state.depot.id)) return state.depot;
+  return state.planDepot && state.planDepot.id === plan.depot_id ? state.planDepot : null;
+}
+
+/** Reads the depot of the shown plan, if that is no longer the depot there is. */
+async function loadPlanDepot() {
+  const plan = state.plan;
+  if (!plan || (state.depot && plan.depot_id === state.depot.id)) return;
+  if (state.planDepot && state.planDepot.id === plan.depot_id) return;
+  const depot = await api('GET', `/api/depots/${plan.depot_id}`);
+  // Another plan was picked while this was read.
+  if (!state.plan || state.plan.depot_id !== depot.id) return;
+  state.planDepot = depot;
+  drawDepot();
+  drawRoutes();
+  for (const job of state.jobs) {
+    const announced = state.progress.get(job.job_id);
+    if (announced && job.status === 'running') drawProvisional(job, announced);
+  }
 }
 
 /** Which courier each order of the shown plan is with: by its routes, and by its jobs. */
@@ -570,7 +607,8 @@ function dropAllProvisional() {
 
 /** The route a search has so far, as a dashed line that moves while the search goes on. */
 function drawProvisional(job, progress) {
-  if (!state.depot || !progress.order) return;
+  const depot = depotOfPlan();
+  if (!depot || !progress.order) return;
   const stops = [];
   for (const place of progress.order) {
     const order = state.orders.get(job.order_ids[place]);
@@ -581,7 +619,7 @@ function drawProvisional(job, progress) {
     }
     stops.push(point(order.location));
   }
-  const round = [point(state.depot.location), ...stops, point(state.depot.location)];
+  const round = [point(depot.location), ...stops, point(depot.location)];
   const line = provisional.get(job.job_id);
   if (line) {
     line.setLatLngs(round);
@@ -595,10 +633,11 @@ function drawProvisional(job, progress) {
 
 function drawRoutes() {
   layers.routes.clearLayers();
-  if (!state.depot) return;
+  const depot = depotOfPlan();
+  if (!depot) return;
   for (const route of state.routes) {
     const stops = route.stops.map((stop) => point(stop.location));
-    const round = [point(state.depot.location), ...stops, point(state.depot.location)];
+    const round = [point(depot.location), ...stops, point(depot.location)];
     const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)} ${along(route)}, `
       + `${route.stops.length} stops, ${carried(route)}`;
     L.polyline(round, { renderer: lines, color: colourOf(route.courier_id), weight: 3, opacity: 0.95 })
@@ -613,6 +652,7 @@ function drawRoutes() {
 function fit() {
   const points = [];
   if (state.depot) points.push(point(state.depot.location));
+  if (state.planDepot) points.push(point(state.planDepot.location));
   for (const order of state.orders.values()) {
     if (order.status !== 'cancelled') points.push(point(order.location));
   }
@@ -819,10 +859,12 @@ function forgetPlan() {
   routesAsked += 1;
   state.planId = null;
   state.plan = null;
+  state.planDepot = null;
   state.jobs = [];
   state.routes = [];
   state.progress.clear();
   dropAllProvisional();
+  drawDepot();
   drawRoutes();
   colourStops();
   renderPlan();
@@ -836,6 +878,7 @@ function showPlan(planId) {
   state.plan = state.plans.find((plan) => plan.id === planId) || null;
   renderPlans();
   renderPlan();
+  loadPlanDepot().catch((error) => state.session && say(describe(error), true));
   const shown = () => state.planId === planId;
   stopWatchingPlan = watch(`/api/plans/${planId}/events`, {
     plan: (plan) => shown() && planChanged(plan),
@@ -1040,7 +1083,7 @@ function leave(why) {
     // Nothing was kept there, then.
   }
   Object.assign(state, {
-    session: null, depot: null, couriers: [], orders: new Map(), plans: [], planId: null,
+    session: null, depot: null, planDepot: null, couriers: [], orders: new Map(), plans: [], planId: null,
     plan: null, jobs: [], routes: [], stats: null,
   });
   state.progress.clear();

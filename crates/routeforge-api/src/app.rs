@@ -23,6 +23,7 @@ use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::Limits;
 use crate::error::{self, PROBLEM_JSON};
 use crate::events::Events;
+use crate::logins::Logins;
 use crate::request_id::{self, RequestSpan};
 use crate::stream::Pace;
 use crate::{page, routes};
@@ -40,6 +41,8 @@ pub(crate) struct AppState {
     pub(crate) pool: PgPool,
     pub(crate) tokens: Tokens,
     pub(crate) passwords: Passwords,
+    /// The logins tried lately, by address: only so many are taken (D68).
+    pub(crate) logins: Logins,
     /// The key the bot shows. An API that has none takes no bot (D60).
     pub(crate) bot_key: Option<ServiceKey>,
     /// How long a token is good for that the bot was given for a Telegram user.
@@ -186,6 +189,10 @@ refusals! {
     NotNow => "409", "The thing is not in a state for this";
     /// `422`.
     NotAcceptable => "422", "Something in the request cannot be accepted. `errors` names the fields, where it is known which";
+    /// `429`, on the login.
+    TooManyLogins => "429", "Too many logins were tried for this address. `Retry-After` says in how many seconds the next may be";
+    /// `503`, where a password is hashed.
+    Busy => "503", "The server has too many passwords to check at this moment. `Retry-After` says when to try again";
 }
 
 #[cfg(test)]

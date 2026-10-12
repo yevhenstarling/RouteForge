@@ -15,8 +15,11 @@
 //! | 409 | The thing is not in a state for this. |
 //! | 413, 415 | A body that is too large, or is not JSON. |
 //! | 422 | The request was read, and something in it cannot be accepted. |
+//! | 429 | Too many logins were tried for one address. `Retry-After` says when the next may be. |
 //! | 500 | The fault is the server's. The cause is logged and not sent. |
-//! | 503 | The API cannot do its work yet: `/readyz` says so. |
+//! | 503 | The API cannot do its work yet, as `/readyz` says, or has too much of it at this moment. |
+
+use std::time::Duration;
 
 use actix_web::error::{JsonPayloadError, PathError, QueryPayloadError};
 use actix_web::http::StatusCode;
@@ -54,11 +57,30 @@ pub(crate) enum ApiError {
         /// The fields that were refused, if it is known which.
         errors: Vec<FieldError>,
     },
+    /// Too many logins were tried for one address (D68). Another may be tried after
+    /// `retry_after`.
+    #[error(
+        "too many logins were tried for this address: try again in {} seconds",
+        whole_seconds(*.retry_after)
+    )]
+    TooManyLogins { retry_after: Duration },
     /// The cause is for the log. The client is told only that it was not its fault.
     #[error("something went wrong on the server")]
     Internal(#[source] anyhow::Error),
     #[error("{0}")]
     Unavailable(&'static str),
+    /// More passwords are waiting to be checked than the API takes on at once (D68).
+    #[error("the server has too many passwords to check at this moment: try again shortly")]
+    Busy,
+}
+
+/// How long a client that was told to come back should wait when the API is busy.
+const BUSY_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// A span of time in whole seconds, rounded up: what `Retry-After` takes. A client that
+/// waits as long as it says is not refused once more for a fraction of a second.
+fn whole_seconds(span: Duration) -> u64 {
+    span.as_secs() + u64::from(span.subsec_nanos() > 0)
 }
 
 impl ApiError {
@@ -108,8 +130,9 @@ impl ResponseError for ApiError {
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotJson => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Invalid { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::TooManyLogins { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unavailable(_) | Self::Busy => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -117,6 +140,15 @@ impl ResponseError for ApiError {
         let mut response = HttpResponse::build(self.status_code());
         if matches!(self, Self::Unauthorized(_)) {
             response.insert_header((header::WWW_AUTHENTICATE, "Bearer"));
+        }
+        // Whoever is told to come back is told when.
+        let retry_after = match self {
+            Self::TooManyLogins { retry_after } => Some(*retry_after),
+            Self::Busy => Some(BUSY_RETRY_AFTER),
+            _ => None,
+        };
+        if let Some(retry_after) = retry_after {
+            response.insert_header((header::RETRY_AFTER, whole_seconds(retry_after).to_string()));
         }
         // `json` leaves a content type alone that is already set.
         response
@@ -240,6 +272,14 @@ mod tests {
                 503,
                 "Service Unavailable",
             ),
+            (
+                ApiError::TooManyLogins {
+                    retry_after: Duration::from_secs(40),
+                },
+                429,
+                "Too Many Requests",
+            ),
+            (ApiError::Busy, 503, "Service Unavailable"),
         ];
         for (error, status, title) in errors {
             let detail = error.to_string();
@@ -279,6 +319,36 @@ mod tests {
                 message: "must be at least 1".to_owned(),
             }]
         );
+    }
+
+    /// Whoever is told to come back later is told when, in whole seconds and never
+    /// too few of them.
+    #[tokio::test]
+    async fn a_client_that_is_told_to_come_back_is_told_when() {
+        let retry_after = |error: ApiError| {
+            let response = error.error_response();
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        for (span, seconds) in [
+            (Duration::from_secs(40), "40"),
+            (Duration::from_millis(40_001), "41"),
+            (Duration::from_millis(1), "1"),
+            (Duration::ZERO, "0"),
+        ] {
+            let error = ApiError::TooManyLogins { retry_after: span };
+            assert!(
+                error.to_string().contains(&format!("in {seconds} seconds")),
+                "{error}"
+            );
+            assert_eq!(retry_after(error).as_deref(), Some(seconds));
+        }
+        assert_eq!(retry_after(ApiError::Busy).as_deref(), Some("1"));
+        // An API that is not ready does not know when it will be.
+        assert_eq!(retry_after(ApiError::Unavailable("no schema")), None);
+        assert_eq!(retry_after(ApiError::Forbidden), None);
     }
 
     #[tokio::test]

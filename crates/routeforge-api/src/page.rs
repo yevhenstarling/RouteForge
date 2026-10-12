@@ -3,9 +3,17 @@
 //!
 //! The files are compiled in, as those of Swagger UI are (D43). So the API is one
 //! file wherever it runs, and what it serves is what it was built with.
+//!
+//! The page is served with a content security policy (D69): the browser runs the
+//! script that is in the page as it was built and Leaflet's, and no other.
+
+use std::sync::LazyLock;
 
 use actix_web::http::header;
 use actix_web::{HttpResponse, web};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use sha2::{Digest, Sha256};
 
 use crate::error::{self, ApiError};
 
@@ -48,6 +56,61 @@ static FILES: &[File] = &[
     file!("vendor/leaflet/images/marker-shadow.png", "image/png"),
 ];
 
+/// Where the page's map tiles come from: the one other host it may ask (D8).
+const TILE_HOST: &str = "https://tile.openstreetmap.org";
+
+/// The policy the page is served with, made once from the page as it was built.
+static POLICY: LazyLock<String> = LazyLock::new(|| {
+    let page = FILES
+        .iter()
+        .find(|file| file.path == PAGE)
+        .map_or(&[][..], |file| file.bytes);
+    policy(&String::from_utf8_lossy(page))
+});
+
+/// The content security policy for a page (D69).
+///
+/// The page is one file, with its script and its style inside it (D52). A policy that
+/// allowed "inline" script would allow any, an injected one as well, and one that
+/// allowed none would stop the page. So the policy names the script and the style of
+/// the page by their SHA-256. The browser runs what hashes to that, which is what was
+/// built into this binary, and nothing that somebody got into the page later.
+///
+/// Everything else is from where the page is from: Leaflet's script, style and
+/// images, and the API. The one other host is the tile server, for images alone.
+/// `data:` is for the pictures Leaflet carries inside its own files.
+fn policy(page: &str) -> String {
+    let script = hash_of(inline(page, "<script>", "</script>"));
+    let style = hash_of(inline(page, "<style>", "</style>"));
+    [
+        "default-src 'none'".to_owned(),
+        format!("script-src 'self' '{script}'"),
+        format!("style-src 'self' '{style}'"),
+        format!("img-src 'self' data: {TILE_HOST}"),
+        "connect-src 'self'".to_owned(),
+        "base-uri 'none'".to_owned(),
+        "form-action 'none'".to_owned(),
+        "frame-ancestors 'none'".to_owned(),
+    ]
+    .join("; ")
+}
+
+/// What is between the first `open` and the `close` after it, to the byte: that is
+/// what a browser hashes. Nothing, if the page has no such element.
+fn inline<'a>(page: &'a str, open: &str, close: &str) -> &'a str {
+    page.split_once(open)
+        .and_then(|(_, rest)| rest.split_once(close))
+        .map_or("", |(inside, _)| inside)
+}
+
+/// A source for a policy that allows exactly this text: `sha256-` and the hash.
+fn hash_of(text: &str) -> String {
+    format!(
+        "sha256-{}",
+        STANDARD.encode(Sha256::digest(text.as_bytes()))
+    )
+}
+
 /// Adds the page at `/` and what it loads under `/vendor/`. Neither asks for a token:
 /// the page is where one is got.
 pub(crate) fn configure(config: &mut web::ServiceConfig) {
@@ -57,7 +120,11 @@ pub(crate) fn configure(config: &mut web::ServiceConfig) {
 }
 
 async fn page() -> Result<HttpResponse, ApiError> {
-    serve(PAGE)
+    let mut page = serve(PAGE)?;
+    let policy = header::HeaderValue::from_str(&POLICY).map_err(ApiError::internal)?;
+    page.headers_mut()
+        .insert(header::CONTENT_SECURITY_POLICY, policy);
+    Ok(page)
 }
 
 async fn vendored(path: web::Path<String>) -> Result<HttpResponse, ApiError> {
@@ -148,6 +215,133 @@ mod tests {
             assert!(!on_disk.is_empty(), "{url}");
             assert!(served.bytes == on_disk, "{url} is not the file on disk");
         }
+    }
+
+    /// The example every description of the policy gives, and its hash as they give
+    /// it: what is hashed is the text between the tags, to the byte.
+    #[test]
+    fn a_policy_names_the_hash_of_what_is_between_the_tags() {
+        let page = "<!doctype html><style>b{}</style><script src=\"a.js\"></script>\
+            <script>alert('Hello, world.');</script>";
+        let policy = policy(page);
+        assert!(
+            policy.contains(
+                "script-src 'self' 'sha256-qznLcsROx4GACP2dm0UCKCzCG+HiZ1guq6ZZDob/Tng='"
+            ),
+            "{policy}"
+        );
+        assert_eq!(inline(page, "<style>", "</style>"), "b{}");
+        // One byte more is another script.
+        let other = policy_of_script("alert('Hello, world.'); ");
+        assert!(!other.contains("qznLcsROx4GACP2dm0UCKCzCG"), "{other}");
+        // A page without either allows the script and the style that are nothing.
+        let empty = "'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='";
+        let bare = super::policy("<!doctype html><p>nothing</p>");
+        assert!(
+            bare.contains(&format!("script-src 'self' {empty}")),
+            "{bare}"
+        );
+        assert!(
+            bare.contains(&format!("style-src 'self' {empty}")),
+            "{bare}"
+        );
+    }
+
+    fn policy_of_script(script: &str) -> String {
+        policy(&format!("<style></style><script>{script}</script>"))
+    }
+
+    /// What is between two tags, found here by another way than the one under test.
+    fn between<'a>(page: &'a str, open: &str, close: &str) -> &'a str {
+        let from = page.find(open).unwrap() + open.len();
+        let to = from + page[from..].find(close).unwrap();
+        &page[from..to]
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_page_comes_with_a_policy_that_allows_its_own_script_and_no_other(pool: PgPool) {
+        let api = testing::api(&pool);
+        let page = api.get(None, "/").await;
+        let policy = page
+            .headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("a policy")
+            .to_str()
+            .unwrap();
+
+        // The script and the style of the page as it is on disk, which is the page
+        // that was built in and is served.
+        let on_disk = std::fs::read_to_string(web().join(PAGE)).unwrap();
+        for (open, close, what) in [
+            ("<script>", "</script>", "script-src"),
+            ("<style>", "</style>", "style-src"),
+        ] {
+            let inside = between(&on_disk, open, close);
+            assert!(inside.len() > 1_000, "{open} is not the page's own");
+            let hash = STANDARD.encode(Sha256::digest(inside.as_bytes()));
+            let allowed = format!("{what} 'self' 'sha256-{hash}'");
+            assert!(policy.contains(&allowed), "{policy}");
+        }
+
+        // Nothing is allowed for being inline, for being made up as the page runs, or
+        // for coming from anywhere at all.
+        for loophole in ["unsafe-", "*", "http:", "blob:", "'none' 'self'"] {
+            assert!(!policy.contains(loophole), "{loophole} in {policy}");
+        }
+        let directives: Vec<&str> = policy.split("; ").collect();
+        assert_eq!(directives[0], "default-src 'none'");
+        for locked in [
+            "base-uri 'none'",
+            "form-action 'none'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(directives.contains(&locked), "{policy}");
+        }
+        assert!(directives.contains(&"connect-src 'self'"), "{policy}");
+        // The one other host is the one the page's tiles come from, and it may send
+        // images and nothing else.
+        let tiles = "img-src 'self' data: https://tile.openstreetmap.org";
+        assert!(directives.contains(&tiles), "{policy}");
+        assert_eq!(policy.matches("https://").count(), 1, "{policy}");
+        assert!(on_disk.contains("'https://tile.openstreetmap.org/{z}/{x}/{y}.png'"));
+
+        // A policy is a document's. What the page loads comes without one.
+        let script = api.get(None, "/vendor/leaflet/leaflet.js").await;
+        assert!(
+            script
+                .headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_none()
+        );
+    }
+
+    /// The policy allows one script and one style by their hashes. So the page must
+    /// have exactly those, and nothing else that runs or styles from inside the
+    /// markup: an attribute is not something a hash can name.
+    #[test]
+    fn the_page_has_nothing_the_policy_would_need_an_exception_for() {
+        let page = std::fs::read_to_string(web().join(PAGE)).unwrap();
+        assert_eq!(page.matches("<script>").count(), 1);
+        assert_eq!(
+            page.matches("<script").count(),
+            2,
+            "Leaflet's, and the page's"
+        );
+        assert_eq!(page.matches("<style").count(), 1);
+
+        // The markup is what comes before the page's script, less its style.
+        let (markup, _) = page.split_once("<script>").unwrap();
+        let markup = markup.replace(between(&page, "<style>", "</style>"), "");
+        for inline in [" style=", "javascript:", "<base", "<object", "<embed"] {
+            assert!(!markup.contains(inline), "{inline}");
+        }
+        // No handler in an attribute: ` onclick="`, ` onload="` and their kind.
+        let handler = markup.split(" on").skip(1).find(|rest| {
+            rest.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty() && name.chars().all(|letter| letter.is_ascii_lowercase())
+            })
+        });
+        assert_eq!(handler, None);
     }
 
     #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]

@@ -62,6 +62,8 @@ services:
       API_BUDGET_MAX_MS:
       API_BUDGET_MAX_ITERATIONS:
       API_WORKER_ALIVE_SECS:
+      API_LOGIN_ATTEMPTS:
+      API_HASHES_AT_ONCE:
       LOG_FORMAT:
       RUST_LOG:
     ports:

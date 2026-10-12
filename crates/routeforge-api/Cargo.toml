@@ -13,6 +13,7 @@ routeforge-domain = { workspace = true, features = ["db", "openapi"] }
 actix-web.workspace = true
 anyhow.workspace = true
 argon2.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 jsonwebtoken.workspace = true
@@ -21,6 +22,7 @@ rand.workspace = true
 rand_chacha.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

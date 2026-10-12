@@ -50,6 +50,10 @@ argon2 = "0.6"
 jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
 # For comparing the bot's key in constant time. The crates above bring it in anyway.
 subtle = "2.6"
+# For the hashes in the page's content security policy (D69). Both are in the build
+# already, in these versions: sqlx brings the one, and sqlx and jsonwebtoken the other.
+base64 = "0.22"
+sha2 = "0.10"
 
 # Telegram bot and outgoing HTTP. reqwest stays on the 0.12 line because teloxide 0.17
 # is built on it; both use rustls with ring, so there is one HTTP stack and no OpenSSL.

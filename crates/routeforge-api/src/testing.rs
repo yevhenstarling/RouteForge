@@ -28,6 +28,7 @@ use crate::app::{AppState, app};
 use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::Limits;
 use crate::events::{Events, Signal};
+use crate::logins::{self, Logins};
 use crate::stream::{EVENT_STREAM, Pace};
 
 /// The limits the application has in a test. Small, so that a test can step over them.
@@ -44,6 +45,10 @@ pub(crate) const BOT_KEY: &str = "the key of the bot in the tests..";
 
 /// How long a login is good for in a test.
 pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(3_600);
+
+/// How many logins the application of a test takes for one address within a minute:
+/// what the API takes when nothing is set.
+pub(crate) const LOGIN_ATTEMPTS: u32 = 5;
 
 /// How long a token is good for in a test that the bot was given.
 pub(crate) const BOT_TOKEN_TTL: Duration = Duration::from_secs(60);
@@ -100,21 +105,42 @@ pub(crate) fn api_without_a_bot(pool: &PgPool) -> Api {
     api_with(pool, PACE, None)
 }
 
+/// The application that takes so many logins for one address within so long, and
+/// hashes its passwords as `passwords` does.
+pub(crate) fn api_with_logins(pool: &PgPool, logins: Logins, passwords: Passwords) -> Api {
+    let state = AppState {
+        logins,
+        passwords,
+        ..state_for(pool, PACE, Some(BOT_KEY))
+    };
+    Api {
+        pool: pool.clone(),
+        state: web::Data::new(state),
+    }
+}
+
 fn api_with(pool: &PgPool, pace: Pace, bot_key: Option<&str>) -> Api {
-    let state = web::Data::new(AppState {
+    Api {
+        pool: pool.clone(),
+        state: web::Data::new(state_for(pool, pace, bot_key)),
+    }
+}
+
+/// What the application of a test shares, as `main` puts it together for the real one.
+fn state_for(pool: &PgPool, pace: Pace, bot_key: Option<&str>) -> AppState {
+    AppState {
         pool: pool.clone(),
         tokens: Tokens::new(SECRET, TOKEN_TTL),
         passwords: Passwords::cheap(),
+        // As many for an address within a minute as the API takes unless it is told
+        // otherwise.
+        logins: Logins::new(LOGIN_ATTEMPTS, logins::WINDOW),
         bot_key: bot_key.map(ServiceKey::new),
         bot_token_ttl: BOT_TOKEN_TTL,
         limits: LIMITS,
         worker_alive: Duration::from_secs(15),
         events: Events::new(),
         pace,
-    });
-    Api {
-        pool: pool.clone(),
-        state,
     }
 }
 

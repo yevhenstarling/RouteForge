@@ -25,7 +25,17 @@ pub(crate) struct Config {
     /// A worker that was seen within this span counts as alive. A worker marks itself
     /// as seen once per solver heartbeat (D27), so this is a few of those.
     pub(crate) worker_alive: Duration,
+    /// How many logins are taken for one address within a minute (D68).
+    pub(crate) login_attempts: u32,
+    /// How many passwords are hashed at the same time. Each takes 19 MiB (D68).
+    pub(crate) hashes_at_once: usize,
 }
+
+/// More tries than this within a minute are no limit worth the name.
+const MOST_LOGIN_ATTEMPTS: u64 = 1_000;
+
+/// More hashes at once than this are more than a gigabyte of them.
+const MOST_HASHES_AT_ONCE: u64 = 64;
 
 /// What a plan's budget for each of its routes may be (D31).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,12 +113,26 @@ impl Config {
             limits.max_budget_iterations
         );
 
+        let login_attempts = number("API_LOGIN_ATTEMPTS", 5)?;
+        ensure!(
+            (1..=MOST_LOGIN_ATTEMPTS).contains(&login_attempts),
+            "API_LOGIN_ATTEMPTS must be between 1 and {MOST_LOGIN_ATTEMPTS}, got {login_attempts}"
+        );
+        let hashes_at_once = number("API_HASHES_AT_ONCE", 4)?;
+        ensure!(
+            (1..=MOST_HASHES_AT_ONCE).contains(&hashes_at_once),
+            "API_HASHES_AT_ONCE must be between 1 and {MOST_HASHES_AT_ONCE}, got {hashes_at_once}"
+        );
+
         Ok(Self {
             bind,
             token_ttl: seconds("JWT_TTL_SECS", 3_600)?,
             bot_token_ttl: seconds("BOT_JWT_TTL_SECS", 60)?,
             limits,
             worker_alive: seconds("API_WORKER_ALIVE_SECS", 15)?,
+            // Both were held to a range that fits.
+            login_attempts: login_attempts as u32,
+            hashes_at_once: hashes_at_once as usize,
         })
     }
 }
@@ -133,6 +157,13 @@ pub(crate) struct AdminSeed {
     pub(crate) email: String,
     pub(crate) password: String,
 }
+
+/// What `docker-compose.yml` falls back to on a clone that has no `.env`, so that the
+/// stack starts with no settings (D54). The three are in the repository for everybody
+/// to read, and so they are no secrets. A test holds them to the compose file.
+const DEMO_JWT_SECRET: &str = "routeforge-demo-signing-key-not-a-secret";
+const DEMO_ADMIN_PASSWORD: &str = "routeforge";
+const DEMO_BOT_KEY: &str = "routeforge-demo-bot-key-not-a-secret";
 
 impl Secrets {
     pub(crate) fn from_env() -> anyhow::Result<Self> {
@@ -172,6 +203,44 @@ impl Secrets {
             admin,
             bot_key,
         })
+    }
+
+    /// The settings that have the value everybody can read in the repository, by name.
+    /// Empty for an API that was given values of its own.
+    pub(crate) fn known_to_everybody(&self) -> Vec<&'static str> {
+        let admin = self.admin.as_ref();
+        let mut known = Vec::new();
+        if self.jwt_secret == DEMO_JWT_SECRET {
+            known.push("JWT_SECRET");
+        }
+        if admin.is_some_and(|admin| admin.password == DEMO_ADMIN_PASSWORD) {
+            known.push("ADMIN_PASSWORD");
+        }
+        if self.bot_key.as_deref() == Some(DEMO_BOT_KEY) {
+            known.push("BOT_SERVICE_KEY");
+        }
+        known
+    }
+
+    /// What to say when the API starts on the values of the demonstration (D70).
+    /// `None` if it does not.
+    ///
+    /// The API cannot see which machines reach its port: in a container it listens on
+    /// every address, and what is published is compose's business. So it says what it
+    /// knows, each time it starts, and leaves the rest to whoever reads the log.
+    pub(crate) fn demo_warning(&self) -> Option<String> {
+        let known = self.known_to_everybody();
+        if known.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} {} what the repository has for everybody to read. Whoever reaches this \
+             API can log in as its admin, or sign a token for any account. That is for \
+             showing it on this machine alone: set values of your own in .env before \
+             the port is opened to anything else",
+            known.join(", "),
+            if known.len() == 1 { "is" } else { "are" },
+        ))
     }
 }
 
@@ -216,6 +285,8 @@ mod tests {
                     max_budget_iterations: 10_000_000_000,
                 },
                 worker_alive: Duration::from_secs(15),
+                login_attempts: 5,
+                hashes_at_once: 4,
             }
         );
     }
@@ -230,6 +301,8 @@ mod tests {
             ("API_BUDGET_MAX_MS", "2000"),
             ("API_BUDGET_MAX_ITERATIONS", "5"),
             ("API_WORKER_ALIVE_SECS", "3"),
+            ("API_LOGIN_ATTEMPTS", "20"),
+            ("API_HASHES_AT_ONCE", "1"),
         ])
         .unwrap();
         assert_eq!(
@@ -244,6 +317,8 @@ mod tests {
                     max_budget_iterations: 5,
                 },
                 worker_alive: Duration::from_secs(3),
+                login_attempts: 20,
+                hashes_at_once: 1,
             }
         );
     }
@@ -272,6 +347,11 @@ mod tests {
             ("API_BUDGET_MAX_ITERATIONS", "9223372036854775808"),
             ("API_BUDGET_MAX_ITERATIONS", "-1"),
             ("API_WORKER_ALIVE_SECS", "0"),
+            ("API_LOGIN_ATTEMPTS", "0"),
+            ("API_LOGIN_ATTEMPTS", "1001"),
+            ("API_LOGIN_ATTEMPTS", "a few"),
+            ("API_HASHES_AT_ONCE", "0"),
+            ("API_HASHES_AT_ONCE", "65"),
         ] {
             let error = config(&[(name, value)]).unwrap_err();
             assert!(error.to_string().contains(name), "{name}={value}: {error}");
@@ -375,6 +455,60 @@ mod tests {
         assert!(!error.to_string().contains(short), "{error}");
     }
 
+    /// An API that runs on what the repository has for everybody to read says so, and
+    /// names the settings. One that was given values of its own has nothing to say.
+    #[test]
+    fn an_api_on_the_values_of_the_demonstration_says_so() {
+        let base = [("DATABASE_URL", "postgres://x")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut all = base.to_vec();
+            all.extend_from_slice(extra);
+            Secrets::from_vars(vars(&all)).unwrap()
+        };
+
+        let own = with(&[
+            ("JWT_SECRET", SECRET),
+            ("ADMIN_EMAIL", "admin@example.com"),
+            ("ADMIN_PASSWORD", "correct horse"),
+            ("BOT_SERVICE_KEY", "a key the bot shows, and long enough"),
+        ]);
+        assert!(own.known_to_everybody().is_empty());
+        assert_eq!(own.demo_warning(), None);
+        // Nor has one that makes no admin and takes no bot.
+        assert_eq!(with(&[("JWT_SECRET", SECRET)]).demo_warning(), None);
+
+        let demo = with(&[
+            ("JWT_SECRET", DEMO_JWT_SECRET),
+            ("ADMIN_EMAIL", "admin@example.com"),
+            ("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD),
+            ("BOT_SERVICE_KEY", DEMO_BOT_KEY),
+        ]);
+        let warning = demo.demo_warning().unwrap();
+        assert!(
+            warning.starts_with("JWT_SECRET, ADMIN_PASSWORD, BOT_SERVICE_KEY are what"),
+            "{warning}"
+        );
+        // The names, and never the values: a log is read by more people than a file.
+        for value in [DEMO_JWT_SECRET, DEMO_BOT_KEY] {
+            assert!(!warning.contains(value), "{warning}");
+        }
+
+        // Each is told apart: an API with a key of its own and the admin of the
+        // demonstration is half way there, and is told which half is missing.
+        let half = with(&[
+            ("JWT_SECRET", SECRET),
+            ("ADMIN_EMAIL", "admin@example.com"),
+            ("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD),
+        ]);
+        assert_eq!(half.known_to_everybody(), ["ADMIN_PASSWORD"]);
+        let warning = half.demo_warning().unwrap();
+        assert!(warning.starts_with("ADMIN_PASSWORD is what"), "{warning}");
+        let key_alone = with(&[("JWT_SECRET", DEMO_JWT_SECRET)]);
+        assert_eq!(key_alone.known_to_everybody(), ["JWT_SECRET"]);
+        let bot_alone = with(&[("JWT_SECRET", SECRET), ("BOT_SERVICE_KEY", DEMO_BOT_KEY)]);
+        assert_eq!(bot_alone.known_to_everybody(), ["BOT_SERVICE_KEY"]);
+    }
+
     /// The lines of one service in `docker-compose.yml`, as they are on a clone that
     /// has no `.env`: every `${VARIABLE:-fallback}` replaced by its fallback.
     fn service_of_the_stack(name: &str) -> Vec<String> {
@@ -427,6 +561,13 @@ mod tests {
         let secrets = Secrets::from_vars(given).unwrap();
         // A bot that is given a token has an API that takes it, with nothing else set.
         assert!(secrets.bot_key.is_some(), "{service:#?}");
+        // And the API knows these values for what they are, and says so when it
+        // starts on them (D70). Should the compose file ever fall back to others, the
+        // ones the API knows have to follow.
+        assert_eq!(
+            secrets.known_to_everybody(),
+            ["JWT_SECRET", "ADMIN_PASSWORD", "BOT_SERVICE_KEY"]
+        );
         // On the compose network, where the database is `db`.
         assert!(
             secrets.database_url.ends_with("@db:5432/routeforge"),

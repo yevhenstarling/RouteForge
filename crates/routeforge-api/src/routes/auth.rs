@@ -1,12 +1,14 @@
 //! Opening an account, logging in, and the bot's way to a user's token.
 
+use std::time::Instant;
+
 use actix_web::{HttpResponse, post, web};
 use routeforge_domain::db::users;
 use routeforge_domain::{Login, NewUser, Role, Session, TelegramLogin, User};
 use tracing_actix_web::RootSpan;
 use utoipa_actix_web::service_config::ServiceConfig;
 
-use crate::app::{AppState, NoKey, NotAcceptable};
+use crate::app::{AppState, Busy, NoKey, NotAcceptable, TooManyLogins};
 use crate::auth::Bot;
 use crate::error::ApiError;
 use crate::validate;
@@ -29,6 +31,7 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
         (status = 409, description = "The address already has an account",
             body = routeforge_domain::Problem, content_type = "application/problem+json"),
         NotAcceptable,
+        Busy,
     )
 )]
 #[post("/api/auth/register")]
@@ -52,12 +55,18 @@ async fn register(
 /// The token of the answer goes with every later request, as
 /// `Authorization: Bearer <token>`. It says who the user is and what their role was at
 /// this moment, and is good for `expires_in` seconds.
+///
+/// Only so many logins are taken for one address within a minute. After that the next
+/// is refused, right password or wrong, until the minute is over. A login that
+/// succeeds clears the count.
 #[utoipa::path(
     tag = "auth",
     responses(
         (status = 200, description = "The token, and who it speaks for", body = Session),
         (status = 401, description = "The address or the password is wrong",
             body = routeforge_domain::Problem, content_type = "application/problem+json"),
+        TooManyLogins,
+        Busy,
     )
 )]
 #[post("/api/auth/login")]
@@ -66,20 +75,42 @@ async fn login(
     body: web::Json<Login>,
 ) -> Result<web::Json<Session>, ApiError> {
     let sent = body.into_inner();
+    // Counted before anything is looked up or hashed, and for an address nobody has
+    // as for one somebody has: the refusal says nothing about which is which (D68).
+    state
+        .logins
+        .begin(&sent.email, Instant::now())
+        .map_err(|retry_after| ApiError::TooManyLogins { retry_after })?;
+
+    let checked = check(&state, &sent).await;
+    match checked {
+        Ok(Some(user)) => {
+            state.logins.succeeded(&sent.email);
+            Ok(web::Json(state.tokens.issue(user)?))
+        }
+        // Which of the two was wrong is not said either.
+        Ok(None) => Err(ApiError::Unauthorized(
+            "the address or the password is wrong",
+        )),
+        // The password was not checked at all: the database is away, or the API has
+        // too many to check. That is not a try of whoever sent it.
+        Err(error) => {
+            state.logins.take_back(&sent.email);
+            Err(error)
+        }
+    }
+}
+
+/// The account a login is for, if the password is its password.
+async fn check(state: &AppState, sent: &Login) -> Result<Option<User>, ApiError> {
     let (user, hash) = match users::find_by_email(&state.pool, &sent.email).await? {
         Some(account) => (Some(account.user), Some(account.password_hash)),
         None => (None, None),
     };
     // Checked even when there is no such account, so that the time it takes does not
     // say whether there is.
-    let right = state.passwords.verify(sent.password, hash).await?;
-    match user {
-        Some(user) if right => Ok(web::Json(state.tokens.issue(user)?)),
-        // Which of the two was wrong is not said either.
-        _ => Err(ApiError::Unauthorized(
-            "the address or the password is wrong",
-        )),
-    }
+    let right = state.passwords.verify(sent.password.clone(), hash).await?;
+    Ok(user.filter(|_| right))
 }
 
 /// Log in a Telegram user, for the bot
@@ -128,8 +159,166 @@ mod tests {
     use serde_json::{Value, json};
     use sqlx::PgPool;
 
+    use std::time::Duration;
+
+    use crate::auth::Passwords;
     use crate::error::PROBLEM_JSON;
-    use crate::testing::{self, Api, BOT_KEY, BOT_TOKEN_TTL, Reply, date};
+    use crate::logins::{Logins, WINDOW};
+    use crate::testing::{self, Api, BOT_KEY, BOT_TOKEN_TTL, LOGIN_ATTEMPTS, Reply, date};
+
+    const LOGIN: &str = "/api/auth/login";
+
+    /// Opens an account through the API, and gives what logs in to it.
+    async fn account(api: &Api, email: &str) -> Value {
+        let login = json!({ "email": email, "password": "correct horse" });
+        let made = api.post(None, "/api/auth/register", login.clone()).await;
+        assert_eq!(made.status, StatusCode::CREATED, "{}", made.text);
+        login
+    }
+
+    fn wrong_for(email: &str) -> Value {
+        json!({ "email": email, "password": "wrong horse" })
+    }
+
+    /// How many seconds a refusal says to wait.
+    fn retry_after(refused: &Reply) -> u64 {
+        let seconds = refused.headers.get(header::RETRY_AFTER).expect("a wait");
+        seconds.to_str().unwrap().parse().unwrap()
+    }
+
+    /// Whoever knows an address has a handful of guesses at its password within a
+    /// minute, and no more (D68).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn so_many_logins_are_taken_for_an_address_within_a_minute(pool: PgPool) {
+        let api = testing::api(&pool);
+        let right = account(&api, "ada@example.com").await;
+        let wrong = wrong_for("ada@example.com");
+
+        for attempt in 1..=LOGIN_ATTEMPTS {
+            let refused = api.post(None, LOGIN, wrong.clone()).await;
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "try {attempt}");
+        }
+        // The next is not looked at, and the right password is refused like a wrong
+        // one: whoever guesses is not told when they have guessed.
+        for body in [wrong.clone(), right.clone(), wrong_for("ADA@Example.com")] {
+            let refused = api.post(None, LOGIN, body).await;
+            assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(refused.content_type.as_deref(), Some(PROBLEM_JSON));
+            assert!((1..=60).contains(&retry_after(&refused)));
+            let detail = refused.body["detail"].as_str().unwrap();
+            assert!(detail.contains("too many logins"), "{detail}");
+        }
+
+        // Somebody else logs in as ever.
+        let bob = account(&api, "bob@example.com").await;
+        assert_eq!(api.post(None, LOGIN, bob).await.status, StatusCode::OK);
+    }
+
+    /// The count is by the address that was sent, account or none. So how it is
+    /// refused says nothing about which addresses are registered (D40).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn an_address_nobody_has_is_limited_like_one_somebody_has(pool: PgPool) {
+        let api = testing::api(&pool);
+        account(&api, "ada@example.com").await;
+
+        let mut answers = Vec::new();
+        for email in ["ada@example.com", "nobody@example.com"] {
+            let mut statuses = Vec::new();
+            for _ in 0..LOGIN_ATTEMPTS + 2 {
+                let refused = api.post(None, LOGIN, wrong_for(email)).await;
+                statuses.push((refused.status, refused.body["title"].clone()));
+            }
+            answers.push(statuses);
+        }
+        assert_eq!(answers[0], answers[1]);
+        assert_eq!(answers[0][0].0, StatusCode::UNAUTHORIZED);
+        assert_eq!(answers[0].last().unwrap().0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_login_that_succeeds_clears_the_count(pool: PgPool) {
+        let api = testing::api(&pool);
+        let right = account(&api, "ada@example.com").await;
+        let wrong = wrong_for("ada@example.com");
+
+        // One short of too many, and then the right one, which is the last that may.
+        for _ in 1..LOGIN_ATTEMPTS {
+            assert_eq!(
+                api.post(None, LOGIN, wrong.clone()).await.status,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(api.post(None, LOGIN, right).await.status, StatusCode::OK);
+
+        // The count begins again: as many wrong ones are looked at as before.
+        for attempt in 1..=LOGIN_ATTEMPTS {
+            let refused = api.post(None, LOGIN, wrong.clone()).await;
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "try {attempt}");
+        }
+        assert_eq!(
+            api.post(None, LOGIN, wrong).await.status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_limit_is_lifted_when_its_time_is_over(pool: PgPool) {
+        let window = Duration::from_millis(400);
+        let api = testing::api_with_logins(&pool, Logins::new(2, window), Passwords::cheap());
+        let right = account(&api, "ada@example.com").await;
+        let wrong = wrong_for("ada@example.com");
+
+        for _ in 0..2 {
+            assert_eq!(
+                api.post(None, LOGIN, wrong.clone()).await.status,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let refused = api.post(None, LOGIN, right.clone()).await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        // A fraction of a second is said as a whole one: never too short a wait.
+        assert_eq!(retry_after(&refused), 1);
+
+        tokio::time::sleep(window + Duration::from_millis(100)).await;
+        assert_eq!(api.post(None, LOGIN, right).await.status, StatusCode::OK);
+    }
+
+    /// Passwords are hashed a few at a time (D68). A login that finds no turn free is
+    /// told to come back, and is no try at the password: it was never looked at.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_login_the_server_is_too_busy_for_is_told_so_and_not_counted(pool: PgPool) {
+        let passwords = Passwords::cheap_for(1, Duration::from_millis(50));
+        let logins = Logins::new(2, WINDOW);
+        let api = testing::api_with_logins(&pool, logins, passwords.clone());
+        let right = account(&api, "ada@example.com").await;
+        let wrong = wrong_for("ada@example.com");
+
+        // The one turn there is, taken by somebody else's password.
+        let held = passwords.turn().await.unwrap();
+        for _ in 0..3 {
+            let busy = api.post(None, LOGIN, wrong.clone()).await;
+            assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.content_type.as_deref(), Some(PROBLEM_JSON));
+            assert_eq!(retry_after(&busy), 1);
+        }
+        // An account cannot be opened meanwhile either: that takes a hash as well.
+        let eve = json!({ "email": "eve@example.com", "password": "correct horse" });
+        let busy = api.post(None, "/api/auth/register", eve).await;
+        assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+
+        // Both tries are still there.
+        for _ in 0..2 {
+            assert_eq!(
+                api.post(None, LOGIN, wrong.clone()).await.status,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            api.post(None, LOGIN, right).await.status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
 
     /// A request with `token` for a bearer, whoever's it is.
     async fn with_token(api: &Api, method: &str, path: &str, token: &str, body: Value) -> Reply {

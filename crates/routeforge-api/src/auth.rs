@@ -30,12 +30,23 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use routeforge_domain::{Role, Session, User, UserId};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing_actix_web::RootSpan;
 
 use crate::app::AppState;
 use crate::error::ApiError;
 
-/// Hashes passwords and checks them, off the threads that serve requests.
+/// How long a password waits for its turn to be hashed before the request is told
+/// that the API is busy. Whoever waits longer than this has given up, or should.
+const TURN_WITHIN: Duration = Duration::from_secs(5);
+
+/// Hashes passwords and checks them, off the threads that serve requests, and only so
+/// many at a time (D68).
+///
+/// A hash takes 19 MiB and some tens of milliseconds of a processor, on purpose, and
+/// anybody may ask for one: a login needs no token. Without a bound, a few hundred
+/// logins at once would take gigabytes. So they take turns, and one that does not get
+/// its turn in time is refused as [`ApiError::Busy`].
 #[derive(Clone)]
 pub(crate) struct Passwords {
     argon: Argon2<'static>,
@@ -43,18 +54,29 @@ pub(crate) struct Passwords {
     /// is checked against it, so that it takes as long as any other and the time
     /// tells nothing about which addresses are registered.
     decoy: Arc<str>,
+    /// One permit for each password that may be hashed at this moment.
+    turns: Arc<Semaphore>,
+    /// How long a password waits for a permit.
+    turn_within: Duration,
 }
 
 impl Passwords {
-    /// Argon2id with the parameters the crate recommends: 19 MiB and two passes.
-    pub(crate) fn new() -> anyhow::Result<Self> {
-        Self::with(Argon2::default())
+    /// Argon2id with the parameters the crate recommends, 19 MiB and two passes, for
+    /// at most `at_once` passwords at a time.
+    pub(crate) fn new(at_once: usize) -> anyhow::Result<Self> {
+        Self::with(Argon2::default(), at_once, TURN_WITHIN)
     }
 
     /// The same algorithm with the smallest parameters there are. A debug build takes
     /// the better part of a second over a real hash, and the tests make many.
     #[cfg(test)]
     pub(crate) fn cheap() -> Self {
+        Self::cheap_for(64, TURN_WITHIN)
+    }
+
+    /// [`cheap`](Self::cheap), for so many at once, each waiting so long for its turn.
+    #[cfg(test)]
+    pub(crate) fn cheap_for(at_once: usize, turn_within: Duration) -> Self {
         use argon2::{Params, Version};
 
         let params = Params::new(
@@ -64,15 +86,11 @@ impl Passwords {
             None,
         )
         .unwrap();
-        Self::with(Argon2::new(
-            argon2::Algorithm::Argon2id,
-            Version::V0x13,
-            params,
-        ))
-        .unwrap()
+        let argon = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
+        Self::with(argon, at_once, turn_within).unwrap()
     }
 
-    fn with(argon: Argon2<'static>) -> anyhow::Result<Self> {
+    fn with(argon: Argon2<'static>, at_once: usize, turn_within: Duration) -> anyhow::Result<Self> {
         let decoy = argon
             .hash_password(b"the password of nobody")
             .context("could not hash a password")?
@@ -80,13 +98,29 @@ impl Passwords {
         Ok(Self {
             argon,
             decoy: decoy.into(),
+            turns: Arc::new(Semaphore::new(at_once)),
+            turn_within,
         })
+    }
+
+    /// Waits for a turn to hash. The permit is what the hashing holds, on its own
+    /// thread, for exactly as long as it takes: a request that is dropped meanwhile
+    /// does not let another in before the work is done.
+    pub(crate) async fn turn(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        let waiting = Arc::clone(&self.turns).acquire_owned();
+        match tokio::time::timeout(self.turn_within, waiting).await {
+            Ok(Ok(permit)) => Ok(permit),
+            // The semaphore is never closed, so this is the time that ran out.
+            Ok(Err(_)) | Err(_) => Err(ApiError::Busy),
+        }
     }
 
     /// The hash to store for a password.
     pub(crate) async fn hash(&self, password: String) -> Result<String, ApiError> {
+        let turn = self.turn().await?;
         let argon = self.argon.clone();
         let hashing = move || {
+            let _turn = turn;
             argon
                 .hash_password(password.as_bytes())
                 .map(|hash| hash.to_string())
@@ -106,9 +140,11 @@ impl Passwords {
         password: String,
         stored: Option<String>,
     ) -> Result<bool, ApiError> {
+        let turn = self.turn().await?;
         let argon = self.argon.clone();
         let decoy = Arc::clone(&self.decoy);
         let checking = move || {
+            let _turn = turn;
             let hash = stored.as_deref().unwrap_or(&decoy);
             // The parameters are those the hash was made with, not this hasher's.
             match argon.verify_password(password.as_bytes(), hash) {
@@ -515,6 +551,63 @@ mod tests {
         assert!(check("correct horse", Some(&again)).await.unwrap());
     }
 
+    /// Passwords take turns (D68). One that finds no turn free in time is told that
+    /// the server is busy, and is not hashed.
+    #[tokio::test]
+    async fn a_password_that_gets_no_turn_in_time_is_told_that_the_server_is_busy() {
+        let passwords = Passwords::cheap_for(1, Duration::from_millis(100));
+        // Somebody else's password is being hashed, and takes its time over it.
+        let held = passwords.turn().await.unwrap();
+
+        let error = passwords
+            .hash("correct horse".to_owned())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Busy), "{error:?}");
+        let error = passwords
+            .verify("correct horse".to_owned(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Busy), "{error:?}");
+
+        // The turn comes back when the work is done, every time.
+        drop(held);
+        let hash = passwords.hash("correct horse".to_owned()).await.unwrap();
+        for _ in 0..3 {
+            let right = passwords.verify("correct horse".to_owned(), Some(hash.clone()));
+            assert!(right.await.unwrap());
+        }
+        assert_eq!(passwords.turns.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_password_waits_for_its_turn_and_takes_it_when_it_comes() {
+        let passwords = Passwords::cheap_for(1, Duration::from_secs(30));
+        let held = passwords.turn().await.unwrap();
+        let waiting = tokio::spawn({
+            let passwords = passwords.clone();
+            async move { passwords.hash("correct horse".to_owned()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "hashed without a turn");
+
+        drop(held);
+        let hash = waiting.await.unwrap().unwrap();
+        assert!(hash.starts_with("$argon2id$"), "{hash}");
+    }
+
+    /// As many at once as there are turns, and no more: with two turns and both taken,
+    /// a third waits.
+    #[tokio::test]
+    async fn so_many_passwords_are_hashed_at_once_and_no_more() {
+        let passwords = Passwords::cheap_for(2, Duration::from_millis(100));
+        let first = passwords.turn().await.unwrap();
+        let _second = passwords.turn().await.unwrap();
+        assert!(matches!(passwords.turn().await, Err(ApiError::Busy)));
+        drop(first);
+        assert!(passwords.turn().await.is_ok());
+    }
+
     #[tokio::test]
     async fn nobody_can_log_in_to_an_account_that_does_not_exist() {
         let passwords = Passwords::cheap();
@@ -545,7 +638,7 @@ mod tests {
     /// parameters travel in the hash.
     #[tokio::test]
     async fn a_hash_carries_the_parameters_it_was_made_with() {
-        let real = Passwords::new().unwrap();
+        let real = Passwords::new(1).unwrap();
         let hash = real.hash("correct horse".to_owned()).await.unwrap();
         assert!(hash.contains("m=19456,t=2,p=1"), "{hash}");
 
