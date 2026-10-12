@@ -50,6 +50,7 @@ const MATRIX: &[(&str, &str, Needs)] = &[
     ("post", "/api/orders/{id}/cancel", Needs::Anyone),
     ("get", "/api/depot", Needs::Anyone),
     ("put", "/api/depot", Needs::Admin),
+    ("get", "/api/depots/{id}", Needs::Anyone),
     ("post", "/api/couriers", Needs::Staff),
     ("get", "/api/couriers", Needs::Staff),
     ("get", "/api/couriers/{id}", Needs::Staff),

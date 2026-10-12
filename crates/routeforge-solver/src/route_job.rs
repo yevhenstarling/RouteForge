@@ -1,10 +1,24 @@
 //! The `route` job: finds the order in which one courier calls at its stops (D2, D34).
 //!
-//! It has three parts. The first reads what the search needs and builds the distance
-//! matrix. The second runs the search on a blocking thread. Beside it a heartbeat keeps
-//! the lease and stores the progress, and an announcer tells whoever watches the plan
-//! how far the search has got and with which route (D49). The third writes the route
-//! in the transaction that marks the job done.
+//! It has three parts. The first reads what the search needs: it asks for the
+//! distances between the stops, and reckons what the courier has on board along the
+//! route (D65). The second runs the search on a blocking thread. Beside it a heartbeat
+//! keeps the lease and stores the progress, and an announcer tells whoever watches the
+//! plan how far the search has got and with which route (D49). The third writes the
+//! route in the transaction that marks the job done.
+//!
+//! The distances come from whatever the solver was started with: great circles, or a
+//! routing service that knows the roads (D66). Roads differ from great circles in
+//! three ways, and each has its place here:
+//!
+//! - **The service can fail**, or take its time. It is waited for with the heartbeat
+//!   beside it, and a route it gives no distances for is searched for on great circles.
+//!   The route says which of the two its length was measured along.
+//! - **The way there is not the way back.** The search needs distances that are the
+//!   same both ways (D14), so it works on the mean of the two.
+//! - **So a tour is not as long as the same tour the other way round.** Both are
+//!   measured on the roads as they run, and the shorter is the route, if the courier
+//!   can drive it that way round with what it carries.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -13,14 +27,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use routeforge_domain::db::queue::{self, Heartbeat, Lease};
-use routeforge_domain::db::{depots, orders, plans, routes};
+use routeforge_domain::db::{couriers, depots, orders, plans, routes};
 use routeforge_domain::{
-    CourierId, Depot, DistanceProvider, DistanceTable, JobProgress, LatLon, NewRoute, Order,
+    CourierId, DistanceProvider, DistanceTable, Distances, JobProgress, LatLon, NewRoute, Order,
     OrderId, PlanId, RouteBudget,
 };
-use routeforge_tsp::{Control, DistanceMatrix, StopReason, Tour, optimize_route};
+use routeforge_tsp::{
+    Control, Demand, DistanceMatrix, Loads, StopReason, Tour, optimize_route_within,
+};
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -28,6 +44,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::plan_job;
 use crate::worker::{Context, Outcome};
 
 /// What a route job is to do, as its payload says it.
@@ -49,12 +66,22 @@ pub(crate) async fn run<P>(
 where
     P: DistanceProvider + Sync,
 {
-    let (matrix, budget) = prepare(context, route).await?;
+    let Some(prepared) = prepare(context, lease, route).await? else {
+        return Ok(Outcome::Gone);
+    };
+    let Prepared {
+        table,
+        matrix,
+        loads,
+        budget,
+        distances,
+    } = prepared;
     let Some(found) = solve(
         &context.pool,
         &context.config,
         lease,
         matrix,
+        loads.clone(),
         route.seed,
         budget,
     )
@@ -62,14 +89,36 @@ where
     else {
         return Ok(Outcome::Gone);
     };
-    complete(&context.pool, lease, route, &found).await
+    let driven = Driven::of(&table, &loads, found.tour.stops(), distances);
+    complete(&context.pool, lease, route, &loads, &driven, &found).await
 }
 
-/// Reads the depot and the stops, and asks for the distances between them.
+/// What the search for a route works on, and what its result is measured by.
+#[derive(Debug)]
+struct Prepared {
+    /// The distances as they were given: from each node to each other, which by road
+    /// is not the distance back. Node 0 is the depot, and node `n` is stop `n - 1` of
+    /// the job's list (D14).
+    table: DistanceTable,
+    /// The same distances as the search takes them: the same both ways.
+    matrix: DistanceMatrix,
+    /// What the courier has on board along the route, and how much it carries (D65).
+    loads: Loads,
+    budget: RouteBudget,
+    /// What the distances were measured along.
+    distances: Distances,
+}
+
+/// Reads the depot, the courier and the stops, asks for the distances between them,
+/// and reckons what the courier carries from stop to stop.
+///
+/// `None` means the job was taken away while the distances were waited for: its plan
+/// has ended, or another worker has claimed it.
 async fn prepare<P>(
     context: &Context<P>,
+    lease: &Lease,
     route: &Route<'_>,
-) -> anyhow::Result<(DistanceMatrix, RouteBudget)>
+) -> anyhow::Result<Option<Prepared>>
 where
     P: DistanceProvider + Sync,
 {
@@ -80,41 +129,167 @@ where
     let depot = depots::get(pool, plan.depot_id)
         .await?
         .with_context(|| format!("depot {} of the plan does not exist", plan.depot_id))?;
-    let stops = orders::list_by_ids(pool, route.order_ids).await?;
+    let courier = couriers::get(pool, route.courier_id)
+        .await?
+        .with_context(|| format!("courier {} of the route does not exist", route.courier_id))?;
+    let stored = orders::list_by_ids(pool, route.order_ids).await?;
+    let stops = in_the_order_of_the_job(route.order_ids, &stored)?;
 
-    let positions = positions(&depot, route.order_ids, &stops)?;
-    let table = context
-        .distances
-        .table(&positions)
-        .await
-        .context("could not get the distances between the stops")?;
-    Ok((search_matrix(table)?, plan.budget))
+    // Clustering gave the courier no more than it carries out, and no more than it
+    // carries back (D65). A route that asks for more is not one to search for.
+    let asked: Vec<Demand> = stops.iter().map(|order| plan_job::demand(order)).collect();
+    let loads = Loads::new(courier.capacity, &asked)
+        .with_context(|| format!("courier {} cannot drive this route", courier.id))?;
+
+    let positions: Vec<LatLon> = iter::once(depot.location)
+        .chain(stops.iter().map(|order| order.location))
+        .collect();
+    let asked = context.distances.table(&positions);
+    let Some(answered) = with_the_lease_kept(pool, &context.config, lease, asked).await else {
+        return Ok(None);
+    };
+    let (table, distances) = match answered {
+        Ok(table) => (table, context.distances.measures()),
+        // Great circles need nothing and nobody, and a route by them is a route. The
+        // one that is stored says what it was measured along, so nobody takes it for
+        // a route by road.
+        Err(error) => {
+            warn!(
+                %error,
+                stops = stops.len(),
+                "could not get the distances between the stops; searching on great circles"
+            );
+            (DistanceTable::haversine(&positions), Distances::GreatCircle)
+        }
+    };
+    ensure!(
+        table.nodes() == positions.len(),
+        "asked for the distances between {} positions and was given those between {}",
+        positions.len(),
+        table.nodes()
+    );
+    Ok(Some(Prepared {
+        matrix: search_matrix(&table),
+        table,
+        loads,
+        budget: plan.budget,
+        distances,
+    }))
 }
 
-/// The depot, then the stops in the order the job lists them.
-fn positions(depot: &Depot, order_ids: &[OrderId], stops: &[Order]) -> anyhow::Result<Vec<LatLon>> {
-    let location: HashMap<OrderId, LatLon> = stops
-        .iter()
-        .map(|order| (order.id, order.location))
-        .collect();
-    let of_the_stops = order_ids.iter().map(|id| {
-        location
+/// Waits for `work` with the job's heartbeat beside it (D34). So the lease is kept
+/// however long a routing service takes over its answer, and a plan that ends
+/// meanwhile is heard of within a heartbeat.
+///
+/// `None` means the job was taken away. `work` was dropped, and with it whatever
+/// request it had under way.
+async fn with_the_lease_kept<T>(
+    pool: &PgPool,
+    config: &Config,
+    lease: &Lease,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    // There is no search yet, and so no progress to store with a heartbeat.
+    let (_no_search, nothing) = watch::channel(None);
+    let heartbeats = heartbeats(pool, config, lease, nothing);
+    tokio::pin!(work, heartbeats);
+    tokio::select! {
+        done = &mut work => Some(done),
+        answer = &mut heartbeats => {
+            match answer {
+                Heartbeat::Cancelled => info!("the plan has ended; not waiting for the distances"),
+                _ => info!("another worker has the job; not waiting for the distances"),
+            }
+            None
+        }
+    }
+}
+
+/// The stops in the order the job lists them, which is the order of the search's
+/// nodes: the database returns them in the order of their ids.
+fn in_the_order_of_the_job<'a>(
+    order_ids: &[OrderId],
+    stored: &'a [Order],
+) -> anyhow::Result<Vec<&'a Order>> {
+    let by_id: HashMap<OrderId, &Order> = stored.iter().map(|order| (order.id, order)).collect();
+    let stop = |id: &OrderId| {
+        by_id
             .get(id)
             .copied()
             .with_context(|| format!("order {id} of the route does not exist"))
-    });
-    iter::once(Ok(depot.location)).chain(of_the_stops).collect()
+    };
+    order_ids.iter().map(stop).collect()
 }
 
 /// The distances as the search takes them.
 ///
 /// The search needs the way from A to B to be as long as the way back (D14), which
-/// great-circle distances are. Road distances are not, and a provider of those will
-/// have to make its table symmetric here.
-fn search_matrix(table: DistanceTable) -> anyhow::Result<DistanceMatrix> {
-    let nodes = table.nodes();
-    DistanceMatrix::new(nodes, table.into_metres())
-        .context("the distances between the stops cannot be searched")
+/// great-circle distances are and road distances are not. It is given the mean of the
+/// two, rounded up to the metre. A tour is then as long to the search as the mean of
+/// driving it one way round and the other, so a tour that is short to the search is
+/// short on the roads, whichever way it is driven in the end.
+///
+/// Where the two are the same already, as between great circles, the mean is what
+/// they are.
+fn search_matrix(table: &DistanceTable) -> DistanceMatrix {
+    DistanceMatrix::from_fn(table.nodes(), |from, to| {
+        let there_and_back = u64::from(table.get(from, to)) + u64::from(table.get(to, from));
+        // Half of two `u32`s is a `u32` again, rounded up or not.
+        u32::try_from(there_and_back.div_ceil(2)).unwrap_or(u32::MAX)
+    })
+}
+
+/// A route as it is to be driven, and stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Driven {
+    /// The stops in calling order, each as its node of the search.
+    stops: Vec<usize>,
+    /// How far it is from the depot through the stops and back, every leg measured in
+    /// the direction it is driven.
+    distance_m: u64,
+    /// What that was measured along.
+    distances: Distances,
+}
+
+impl Driven {
+    /// The route that the tour the search found stands for. `found` are its stops in
+    /// calling order.
+    ///
+    /// The search cannot tell a tour from the same tour driven the other way round:
+    /// on its matrix the two are equally long (D14). On roads they are not, for the
+    /// one-way streets and the turns that are allowed from one side alone. So both are
+    /// measured on the distances as they were given, and the shorter one is the route.
+    ///
+    /// The other way round the courier calls at its stops in the opposite order, and
+    /// what it carries on the way changes with that (D65). A way round that would
+    /// overload it is not taken, however short. Between two that are equally long,
+    /// which every pair is on great circles, the tour stays as the search found it.
+    fn of(table: &DistanceTable, loads: &Loads, found: &[usize], distances: Distances) -> Self {
+        let found = found.to_vec();
+        let turned: Vec<usize> = found.iter().rev().copied().collect();
+        let (as_found, as_turned) = (round_trip(table, &found), round_trip(table, &turned));
+        let (stops, distance_m) = if as_turned < as_found && loads.fits(&turned) {
+            (turned, as_turned)
+        } else {
+            (found, as_found)
+        };
+        Self {
+            stops,
+            distance_m,
+            distances,
+        }
+    }
+}
+
+/// How far it is from the depot, node 0, through the stops in this order and back,
+/// every leg in the direction it is driven.
+fn round_trip(table: &DistanceTable, stops: &[usize]) -> u64 {
+    let depot = iter::once(0);
+    let from = depot.clone().chain(stops.iter().copied());
+    let to = stops.iter().copied().chain(depot);
+    from.zip(to)
+        .map(|(from, to)| u64::from(table.get(from, to)))
+        .sum()
 }
 
 /// What a search found, and how it ended.
@@ -149,12 +324,12 @@ struct Search {
 }
 
 impl Search {
-    fn start(matrix: DistanceMatrix, seed: u64, budget: RouteBudget) -> Self {
+    fn start(matrix: DistanceMatrix, loads: Loads, seed: u64, budget: RouteBudget) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let (progress, latest) = watch::channel(None);
         let found = tokio::task::spawn_blocking({
             let cancel = Arc::clone(&cancel);
-            move || search(&matrix, seed, budget, &cancel, &progress)
+            move || search(&matrix, &loads, seed, budget, &cancel, &progress)
         });
         Self {
             found,
@@ -184,10 +359,11 @@ async fn solve(
     config: &Config,
     lease: &Lease,
     matrix: DistanceMatrix,
+    loads: Loads,
     seed: u64,
     budget: RouteBudget,
 ) -> anyhow::Result<Option<Found>> {
-    let mut search = Search::start(matrix, seed, budget);
+    let mut search = Search::start(matrix, loads, seed, budget);
     // Beside the search and not in tasks of their own: the lease is kept, and the
     // search is announced, for exactly as long as this future lives. A job that is
     // dropped can go on doing neither.
@@ -211,9 +387,11 @@ async fn solve(
     }
 }
 
-/// The search itself, on a blocking thread.
+/// The search itself, on a blocking thread. Every route it reports, and the one it
+/// returns, is one the courier can drive with what it carries (D65).
 fn search(
     matrix: &DistanceMatrix,
+    loads: &Loads,
     seed: u64,
     budget: RouteBudget,
     cancel: &AtomicBool,
@@ -248,7 +426,7 @@ fn search(
         control = control.with_deadline(deadline);
     }
 
-    let tour = optimize_route(matrix, seed, &mut control);
+    let tour = optimize_route_within(matrix, loads, seed, &mut control);
     Found {
         tour,
         iterations: control.iterations(),
@@ -323,13 +501,23 @@ async fn complete(
     pool: &PgPool,
     lease: &Lease,
     route: &Route<'_>,
+    loads: &Loads,
+    driven: &Driven,
     found: &Found,
 ) -> anyhow::Result<Outcome> {
+    // The search makes no move that overloads the courier, and the route is not
+    // turned round if that would. A route that did all the same is refused here,
+    // where it would be stored, and not driven.
+    ensure!(
+        loads.fits(&driven.stops),
+        "the route that was found has more on board than its courier carries"
+    );
     let new = NewRoute {
         plan_id: route.plan_id,
         courier_id: route.courier_id,
-        distance_m: found.tour.cost(),
-        stops: calling_order(&found.tour, route.order_ids)?,
+        distance_m: driven.distance_m,
+        distances: driven.distances,
+        stops: calling_order(&driven.stops, route.order_ids)?,
     };
     let Some(mut completion) = queue::begin_complete(pool, lease).await? else {
         return Ok(Outcome::Gone);
@@ -343,6 +531,10 @@ async fn complete(
     info!(
         stops = new.stops.len(),
         distance_m = new.distance_m,
+        distances = %new.distances,
+        // What the search took the route's length for, on distances that are the same
+        // both ways. By road that is a little off what the route is stored with.
+        searched_m = found.tour.cost(),
         iterations = found.iterations,
         stopped_by = ?found.stopped_by,
         %plan,
@@ -351,15 +543,16 @@ async fn complete(
     Ok(Outcome::Done)
 }
 
-/// The orders in the order the tour calls at them.
-fn calling_order(tour: &Tour, order_ids: &[OrderId]) -> anyhow::Result<Vec<OrderId>> {
+/// The orders in the order a route calls at them. `stops` are the nodes of the search:
+/// node `n` is order `n - 1` of the job's list.
+fn calling_order(stops: &[usize], order_ids: &[OrderId]) -> anyhow::Result<Vec<OrderId>> {
     let order_at = |&node: &usize| {
         node.checked_sub(1)
             .and_then(|stop| order_ids.get(stop))
             .copied()
             .with_context(|| format!("the tour calls at node {node}, which is no stop"))
     };
-    tour.stops().iter().map(order_at).collect()
+    stops.iter().map(order_at).collect()
 }
 
 #[cfg(test)]
@@ -367,8 +560,8 @@ mod tests {
     use std::time::Duration;
 
     use routeforge_domain::db::queue::PROGRESS_CHANNEL;
-    use routeforge_domain::{Haversine, JobPayload, RouteProgress, WorkerId};
-    use routeforge_tsp::Point;
+    use routeforge_domain::{Haversine, JobId, JobPayload, OrderKind, RouteProgress, WorkerId};
+    use routeforge_tsp::{Point, optimize_route};
     use sqlx::postgres::PgListener;
 
     use super::*;
@@ -404,34 +597,156 @@ mod tests {
         let tour = optimize_route(&matrix, 1, &mut Control::max_iterations(1_000));
         assert_eq!(tour.cost(), 800);
 
-        let called = calling_order(&tour, &order_ids).unwrap();
+        let called = calling_order(tour.stops(), &order_ids).unwrap();
         // Out along the line and back, in one direction or the other.
         let mut reversed = order_ids.clone();
         reversed.reverse();
         assert!(called == order_ids || called == reversed, "{called:?}");
 
         // A tour over more stops than the job has is refused, not truncated.
-        let error = calling_order(&tour, &order_ids[..3]).unwrap_err();
+        let error = calling_order(tour.stops(), &order_ids[..3]).unwrap_err();
         assert!(error.to_string().contains("no stop"), "{error}");
-        assert!(calling_order(&tour, &[]).is_err());
+        assert!(calling_order(tour.stops(), &[]).is_err());
+        // And the depot is no stop.
+        assert!(calling_order(&[0, 1], &order_ids).is_err());
     }
 
     #[test]
     fn a_route_without_stops_is_a_tour_without_stops() {
         let depot_alone = line(0);
         let tour = optimize_route(&depot_alone, 1, &mut Control::max_iterations(1));
-        assert!(calling_order(&tour, &[]).unwrap().is_empty());
+        assert!(calling_order(tour.stops(), &[]).unwrap().is_empty());
         assert_eq!(tour.cost(), 0);
+
+        let table = DistanceTable::new(1, vec![0]).unwrap();
+        let driven = Driven::of(&table, &Loads::none(0), tour.stops(), Distances::Road);
+        assert_eq!((driven.stops.len(), driven.distance_m), (0, 0));
+    }
+
+    /// The depot and three places on a ring road that is driven one way: 100 metres
+    /// to the next place, and 300 the long way round to the one before.
+    fn one_way_ring() -> DistanceTable {
+        #[rustfmt::skip]
+        let metres = vec![
+              0, 100, 200, 300,
+            300,   0, 100, 200,
+            200, 300,   0, 100,
+            100, 200, 300,   0,
+        ];
+        DistanceTable::new(4, metres).unwrap()
     }
 
     #[test]
-    fn a_table_that_differs_by_direction_is_refused() {
+    fn a_table_that_differs_by_direction_is_searched_on_the_mean_of_the_two() {
         let there_and_back = DistanceTable::new(2, vec![0, 5, 5, 0]).unwrap();
-        assert_eq!(search_matrix(there_and_back).unwrap().get(0, 1), 5);
+        assert_eq!(search_matrix(&there_and_back).get(0, 1), 5);
 
-        let one_way_street = DistanceTable::new(2, vec![0, 5, 7, 0]).unwrap();
-        let error = search_matrix(one_way_street).unwrap_err();
-        assert!(format!("{error:#}").contains("differs"), "{error:#}");
+        // Rounded up, so that a way is never taken for shorter than it is both ways.
+        let one_way_street = DistanceTable::new(2, vec![0, 5, 8, 0]).unwrap();
+        let matrix = search_matrix(&one_way_street);
+        assert_eq!((matrix.get(0, 1), matrix.get(1, 0)), (7, 7));
+
+        let ring = search_matrix(&one_way_ring());
+        for (from, to, mean) in [(0, 1, 200), (1, 2, 200), (0, 2, 200), (0, 3, 200)] {
+            assert_eq!(ring.get(from, to), mean, "{from} to {to}");
+            assert_eq!(ring.get(to, from), mean, "{to} to {from}");
+        }
+
+        // The longest way a table can hold, both ways, is still a way.
+        let far = DistanceTable::new(2, vec![0, u32::MAX, u32::MAX, 0]).unwrap();
+        assert_eq!(search_matrix(&far).get(0, 1), u32::MAX);
+
+        // Great circles are the same both ways already, and stay what they are.
+        let places: Vec<LatLon> = [(50.45, 30.52), (50.40, 30.60), (50.50, 30.45)]
+            .map(|(lat, lon)| LatLon::new(lat, lon).unwrap())
+            .to_vec();
+        let table = DistanceTable::haversine(&places);
+        let matrix = search_matrix(&table);
+        for from in 0..3 {
+            for to in 0..3 {
+                assert_eq!(matrix.get(from, to), table.get(from, to));
+            }
+        }
+    }
+
+    /// The search cannot tell a tour from the same tour the other way round. On roads
+    /// that run one way the two differ, and the route is the shorter.
+    #[test]
+    fn a_route_is_driven_the_way_round_that_is_shorter_by_road() {
+        let table = one_way_ring();
+        // Every pair is 200 metres apart to the search, so every tour is 800 long, and
+        // which way round it comes out is chance.
+        let free = Loads::none(3);
+
+        // Against the traffic it is 300 metres from each place to the one before.
+        let driven = Driven::of(&table, &free, &[3, 2, 1], Distances::Road);
+        assert_eq!(
+            driven,
+            Driven {
+                stops: vec![1, 2, 3],
+                distance_m: 400,
+                distances: Distances::Road,
+            }
+        );
+        // A tour that goes with the traffic already is left as it is.
+        let driven = Driven::of(&table, &free, &[1, 2, 3], Distances::Road);
+        assert_eq!((driven.stops, driven.distance_m), (vec![1, 2, 3], 400));
+        // And one that crosses the ring is as long either way, and stays as it was.
+        let driven = Driven::of(&table, &free, &[2, 1, 3], Distances::Road);
+        assert_eq!((driven.stops, driven.distance_m), (vec![2, 1, 3], 800));
+    }
+
+    /// Turned round, a route calls at its stops in the opposite order, and what the
+    /// courier has on board along it is another matter (D65).
+    #[test]
+    fn a_route_is_not_turned_round_if_that_overloads_the_courier() {
+        let table = one_way_ring();
+        // Stop 3 is a delivery of two and stop 1 a pickup of two, for a courier that
+        // carries two: the delivery has to come first, and it does, against the traffic.
+        let asked = [Demand::pickup(2), Demand::default(), Demand::delivery(2)];
+        let loads = Loads::new(2, &asked).unwrap();
+        assert!(loads.fits(&[3, 2, 1]));
+        assert!(!loads.fits(&[1, 2, 3]));
+
+        let driven = Driven::of(&table, &loads, &[3, 2, 1], Distances::Road);
+        assert_eq!((driven.stops, driven.distance_m), (vec![3, 2, 1], 1_200));
+        // With room for both at once it is turned round.
+        let roomy = Loads::new(4, &asked).unwrap();
+        let driven = Driven::of(&table, &roomy, &[3, 2, 1], Distances::Road);
+        assert_eq!((driven.stops, driven.distance_m), (vec![1, 2, 3], 400));
+    }
+
+    /// On great circles both ways round are equally long, and the route is the tour as
+    /// the search found it: what a seed gives does not depend on this.
+    #[test]
+    fn a_route_on_great_circles_is_the_tour_as_it_was_found() {
+        let places: Vec<LatLon> = [
+            (50.45, 30.52),
+            (50.40, 30.60),
+            (50.50, 30.45),
+            (50.47, 30.40),
+        ]
+        .map(|(lat, lon)| LatLon::new(lat, lon).unwrap())
+        .to_vec();
+        let table = DistanceTable::haversine(&places);
+        let matrix = search_matrix(&table);
+        for stops in [[1, 2, 3], [3, 2, 1], [2, 1, 3]] {
+            let driven = Driven::of(&table, &Loads::none(3), &stops, Distances::GreatCircle);
+            assert_eq!(driven.stops, stops);
+            assert_eq!(driven.distances, Distances::GreatCircle);
+            // As long as the search took it for.
+            let legs = [
+                (0, stops[0]),
+                (stops[0], stops[1]),
+                (stops[1], stops[2]),
+                (stops[2], 0),
+            ];
+            let searched: u64 = legs
+                .iter()
+                .map(|&(from, to)| u64::from(matrix.get(from, to)))
+                .sum();
+            assert_eq!(driven.distance_m, searched);
+        }
     }
 
     #[test]
@@ -440,7 +755,14 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let (progress, latest) = watch::channel(None);
 
-        let found = search(&matrix, 7, moves(50_000), &cancel, &progress);
+        let found = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            moves(50_000),
+            &cancel,
+            &progress,
+        );
         assert_eq!(found.stopped_by, Some(StopReason::Budget));
         assert!(found.iterations <= 50_000);
         let reported = latest.borrow().clone().unwrap();
@@ -467,7 +789,14 @@ mod tests {
         assert_eq!(length, reported.progress.best_cost_m);
 
         // The same seed and budget give the same route, as the plan promises (D5).
-        let again = search(&matrix, 7, moves(50_000), &cancel, &progress);
+        let again = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            moves(50_000),
+            &cancel,
+            &progress,
+        );
         assert_eq!(again.tour, found.tour);
     }
 
@@ -478,17 +807,31 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
-        let found = search(&matrix, 7, testing::millis(50), &cancel, &progress);
+        let found = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            testing::millis(50),
+            &cancel,
+            &progress,
+        );
         assert_eq!(found.stopped_by, Some(StopReason::Deadline));
         assert!(started.elapsed() >= Duration::from_millis(50));
 
         // Both limits: the one that is reached first ends the search.
         let both = RouteBudget::new(Some(60_000), Some(10_000)).unwrap();
-        let found = search(&matrix, 7, both, &cancel, &progress);
+        let found = search(&matrix, &Loads::none(12), 7, both, &cancel, &progress);
         assert_eq!(found.stopped_by, Some(StopReason::Budget));
 
         cancel.store(true, Ordering::Relaxed);
-        let found = search(&matrix, 7, testing::millis(60_000), &cancel, &progress);
+        let found = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            testing::millis(60_000),
+            &cancel,
+            &progress,
+        );
         assert_eq!(found.stopped_by, Some(StopReason::Cancelled));
         assert_eq!(found.iterations, 0);
     }
@@ -502,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn a_search_that_is_told_to_stop_returns_what_it_has() {
         // A minute is longer than this test waits for anything.
-        let mut search = Search::start(scattered(12), 7, testing::millis(60_000));
+        let mut search = Search::start(scattered(12), Loads::none(12), 7, testing::millis(60_000));
         let mut progress = search.progress.clone();
         soon(progress.changed()).await.unwrap();
 
@@ -516,7 +859,7 @@ mod tests {
     /// that future ends, the thread does not go on searching.
     #[tokio::test]
     async fn a_search_that_is_dropped_stops() {
-        let search = Search::start(scattered(12), 7, testing::millis(60_000));
+        let search = Search::start(scattered(12), Loads::none(12), 7, testing::millis(60_000));
         let mut progress = search.progress.clone();
         soon(progress.changed()).await.unwrap();
 
@@ -526,7 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_that_is_aborted_takes_its_search_with_it() {
-        let search = Search::start(scattered(12), 7, testing::millis(60_000));
+        let search = Search::start(scattered(12), Loads::none(12), 7, testing::millis(60_000));
         let progress = search.progress.clone();
         // A task that owns the search, as a job's does, and never gets to its end.
         let job = tokio::spawn(async move {
@@ -557,19 +900,274 @@ mod tests {
         };
         let context = testing::context(&pool, testing::config());
 
-        let (matrix, budget) = prepare(&context, &route).await.unwrap();
+        let Prepared {
+            table,
+            matrix,
+            loads,
+            budget,
+            distances,
+        } = prepare(&context, &no_lease(route.plan_id), &route)
+            .await
+            .unwrap()
+            .expect("nobody takes the job away");
 
         assert_eq!(budget, moves(10));
+        // Four deliveries of one, on a courier that carries ten.
+        assert_eq!(loads, Loads::new(10, &[Demand::delivery(1); 4]).unwrap());
         assert_eq!(matrix.len(), 5);
         let expected: Vec<LatLon> = iter::once(city.depot.location)
             .chain(listed.iter().map(|order| order.location))
             .collect();
-        let Ok(table) = Haversine.table(&expected).await;
+        let Ok(as_the_crow_flies) = Haversine.table(&expected).await;
+        // Great circles, which is what the solver of these tests has: the table as it
+        // was given, and the matrix the search works on, which is the same.
+        assert_eq!(distances, Distances::GreatCircle);
+        assert_eq!(table, as_the_crow_flies);
         for from in 0..5 {
             for to in 0..5 {
                 assert_eq!(matrix.get(from, to), table.get(from, to), "{from} to {to}");
             }
         }
+    }
+
+    /// A lease on no job, for what is handed one and gets no further than holding it:
+    /// great circles are there before the first heartbeat is due.
+    fn no_lease(plan_id: PlanId) -> Lease {
+        Lease {
+            job_id: JobId::generate(),
+            plan_id,
+            worker_id: WorkerId::generate(),
+            attempt: 1,
+            max_attempts: 3,
+        }
+    }
+
+    /// In the place of a routing service: gives the table it was made with, says that
+    /// it failed, or never answers.
+    #[derive(Clone, Debug)]
+    enum Roads {
+        Give(DistanceTable),
+        Fail,
+        Hang,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the roads are closed")]
+    struct Closed;
+
+    impl DistanceProvider for Roads {
+        type Error = Closed;
+
+        fn measures(&self) -> Distances {
+            Distances::Road
+        }
+
+        async fn table(&self, _positions: &[LatLon]) -> Result<DistanceTable, Closed> {
+            match self {
+                Self::Give(table) => Ok(table.clone()),
+                Self::Fail => Err(Closed),
+                Self::Hang => std::future::pending().await,
+            }
+        }
+    }
+
+    fn with_roads(pool: &PgPool, roads: Roads) -> Context<Roads> {
+        Context {
+            pool: pool.clone(),
+            config: testing::config(),
+            distances: roads,
+        }
+    }
+
+    /// A plan of three deliveries of one for a courier that carries ten, and the route
+    /// job of that courier, claimed.
+    async fn a_route_on_the_ring(pool: &PgPool) -> (testing::City, Vec<OrderId>, Lease) {
+        let city = testing::city(pool, &[10]).await;
+        let placed = city.orders(pool, date(12), 3, 1).await;
+        let plan = plans::submit(pool, &city.new_plan(date(12), moves(1_000)), None)
+            .await
+            .unwrap();
+        // The plan job, done by hand: the orders are the plan's, and it waits for one
+        // route.
+        let plan_job = queue::claim(pool, WorkerId::generate(), LONG)
+            .await
+            .unwrap()
+            .unwrap();
+        let order_ids: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        let mut completion = queue::begin_complete(pool, &plan_job.lease)
+            .await
+            .unwrap()
+            .unwrap();
+        orders::mark_planned(completion.conn(), plan.id, &order_ids)
+            .await
+            .unwrap();
+        let route = JobPayload::Route {
+            plan_id: plan.id,
+            courier_id: city.couriers[0].id,
+            order_ids: order_ids.clone(),
+            seed: 7,
+        };
+        queue::enqueue(completion.conn(), &route, None)
+            .await
+            .unwrap();
+        let counts = routeforge_domain::PlanCounts {
+            orders_total: 3,
+            orders_unassigned: 0,
+            routes_total: 1,
+        };
+        plans::start_routing(completion.conn(), plan.id, counts)
+            .await
+            .unwrap();
+        completion.commit().await.unwrap();
+
+        let job = queue::claim(pool, WorkerId::generate(), LONG)
+            .await
+            .unwrap()
+            .expect("the route job was enqueued a moment ago");
+        (city, order_ids, job.lease)
+    }
+
+    /// The whole job on roads that run one way: searched on the mean of the two
+    /// directions, stored the way round that is shorter, with the length by road.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_by_road_is_stored_the_shorter_way_round_and_says_so(pool: PgPool) {
+        let (city, order_ids, lease) = a_route_on_the_ring(&pool).await;
+        let context = with_roads(&pool, Roads::Give(one_way_ring()));
+        let route = Route {
+            plan_id: lease.plan_id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 7,
+        };
+
+        assert_eq!(run(&context, &lease, &route).await.unwrap(), Outcome::Done);
+
+        let stored = routes::list_for_plan(&pool, lease.plan_id).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].distances, Distances::Road);
+        // With the traffic, whichever way round the search happened to come out.
+        assert_eq!(stored[0].distance_m, 400);
+        let called: Vec<OrderId> = stored[0].stops.iter().map(|stop| stop.order_id).collect();
+        assert_eq!(called, order_ids);
+    }
+
+    /// A service that fails costs the route its roads, and nothing else.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_the_service_gives_no_distances_for_is_searched_on_great_circles(pool: PgPool) {
+        let (city, order_ids, lease) = a_route_on_the_ring(&pool).await;
+        let context = with_roads(&pool, Roads::Fail);
+        let route = Route {
+            plan_id: lease.plan_id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 7,
+        };
+
+        let prepared = prepare(&context, &lease, &route)
+            .await
+            .unwrap()
+            .expect("the job is this worker's");
+        assert_eq!(prepared.distances, Distances::GreatCircle);
+        let placed = orders::list_by_ids(&pool, &order_ids).await.unwrap();
+        let positions: Vec<LatLon> = iter::once(city.depot.location)
+            .chain(order_ids.iter().map(|id| {
+                let order = placed.iter().find(|order| order.id == *id).unwrap();
+                order.location
+            }))
+            .collect();
+        assert_eq!(prepared.table, DistanceTable::haversine(&positions));
+
+        assert_eq!(run(&context, &lease, &route).await.unwrap(), Outcome::Done);
+        let stored = routes::list_for_plan(&pool, lease.plan_id).await.unwrap();
+        // Not taken for a route by road, and as long as it says by the crow's way.
+        assert_eq!(stored[0].distances, Distances::GreatCircle);
+        assert_eq!(
+            stored[0].distance_m,
+            testing::round_trip(city.depot.location, &stored[0].stops)
+        );
+    }
+
+    /// A table of another size than was asked for is no table of this route.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_table_of_other_positions_is_an_error(pool: PgPool) {
+        let (city, order_ids, lease) = a_route_on_the_ring(&pool).await;
+        let two_places = DistanceTable::new(2, vec![0, 5, 5, 0]).unwrap();
+        let context = with_roads(&pool, Roads::Give(two_places));
+        let route = Route {
+            plan_id: lease.plan_id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 7,
+        };
+        let error = prepare(&context, &lease, &route).await.unwrap_err();
+        assert!(error.to_string().contains("4 positions"), "{error}");
+    }
+
+    /// The service is waited for with the heartbeat beside it. So the lease, which is
+    /// two seconds long here, outlasts a wait of three, and nobody else gets the job.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_lease_is_kept_while_the_distances_are_waited_for(pool: PgPool) {
+        let _turn = one_at_a_time().await;
+        let (city, order_ids, lease) = a_route_on_the_ring(&pool).await;
+        // Claimed for good in the helper. Here it is held as a worker holds it: for
+        // the two seconds of the test's settings, from now.
+        let config = testing::config();
+        assert_eq!(
+            queue::heartbeat(&pool, &lease, config.lease, None)
+                .await
+                .unwrap(),
+            Heartbeat::Extended
+        );
+        let context = with_roads(&pool, Roads::Hang);
+        let route = Route {
+            plan_id: lease.plan_id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 7,
+        };
+
+        let waiting = prepare(&context, &lease, &route);
+        tokio::pin!(waiting);
+        let waited = tokio::time::timeout(Duration::from_secs(3), &mut waiting).await;
+        assert!(waited.is_err(), "the service never answers");
+        // Still this worker's: another finds nothing to claim.
+        let other = queue::claim(&pool, WorkerId::generate(), LONG)
+            .await
+            .unwrap();
+        assert!(other.is_none(), "{other:?}");
+        assert!(
+            queue::begin_complete(&pool, &lease)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// And a plan that ends meanwhile is heard of, within a heartbeat or so.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_plan_that_is_cancelled_ends_the_wait_for_the_distances(pool: PgPool) {
+        let _turn = one_at_a_time().await;
+        let (city, order_ids, lease) = a_route_on_the_ring(&pool).await;
+        let context = with_roads(&pool, Roads::Hang);
+        let route = Route {
+            plan_id: lease.plan_id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 7,
+        };
+
+        let cancelling = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(queue::cancel_plan(&pool, lease.plan_id).await.unwrap());
+        };
+        let (outcome, ()) = tokio::join!(soon(run(&context, &lease, &route)), cancelling);
+        assert_eq!(outcome.unwrap(), Outcome::Gone);
+        assert!(
+            routes::list_for_plan(&pool, lease.plan_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
@@ -589,8 +1187,187 @@ mod tests {
         };
         let context = testing::context(&pool, testing::config());
 
-        let error = prepare(&context, &route).await.unwrap_err();
+        let error = prepare(&context, &no_lease(route.plan_id), &route)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains(&missing.to_string()), "{error}");
+    }
+
+    /// The depot and three orders on the corners of a rectangle, for a courier that
+    /// carries two: the order opposite the depot is a delivery of two, and its
+    /// neighbours are a pickup of one each.
+    async fn rectangle(pool: &PgPool) -> (testing::City, Vec<Order>) {
+        let city = testing::city(pool, &[2]).await;
+        let mut placed = Vec::new();
+        for (off, kind, demand) in [
+            ((0.0, 0.01), OrderKind::Pickup, 1),
+            ((0.01, 0.01), OrderKind::Delivery, 2),
+            ((0.01, 0.0), OrderKind::Pickup, 1),
+        ] {
+            placed.push(city.order_at(pool, date(12), off, kind, demand).await);
+        }
+        (city, placed)
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_is_searched_within_what_its_courier_carries(pool: PgPool) {
+        let (city, placed) = rectangle(&pool).await;
+        let plan = plans::create(&pool, &city.new_plan(date(12), moves(1_000)))
+            .await
+            .unwrap();
+        let order_ids: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        let route = Route {
+            plan_id: plan.id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let context = testing::context(&pool, testing::config());
+
+        let Prepared {
+            matrix,
+            loads,
+            budget,
+            ..
+        } = prepare(&context, &no_lease(route.plan_id), &route)
+            .await
+            .unwrap()
+            .expect("nobody takes the job away");
+        // What each order asks for, in the order of the job.
+        let asked = [Demand::pickup(1), Demand::delivery(2), Demand::pickup(1)];
+        assert_eq!(loads, Loads::new(2, &asked).unwrap());
+
+        let cancel = AtomicBool::new(false);
+        let (progress, latest) = watch::channel(None);
+        let found = search(&matrix, &loads, 1, budget, &cancel, &progress);
+
+        // Round the rectangle is the shortest way, and it comes to a pickup first
+        // whichever way it is driven. The courier leaves full, with the delivery.
+        let round = optimize_route(&matrix, 1, &mut Control::max_iterations(1_000));
+        assert!(!loads.fits(round.stops()));
+        assert!(loads.fits(found.tour.stops()));
+        assert!(found.tour.cost() > round.cost());
+        let called = calling_order(found.tour.stops(), &order_ids).unwrap();
+        assert_eq!(called[0], placed[1].id, "the delivery comes first");
+        // What was announced on the way is a route the courier can drive as well.
+        let reported = latest.borrow().clone().unwrap();
+        let nodes: Vec<usize> = reported
+            .order
+            .unwrap()
+            .iter()
+            .map(|&place| place as usize + 1)
+            .collect();
+        assert!(loads.fits(&nodes));
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_its_courier_cannot_carry_is_an_error(pool: PgPool) {
+        // Three deliveries of one for a courier that carries two. Clustering never
+        // gives a courier that much, so a job that says so is not to be believed.
+        let city = testing::city(&pool, &[2]).await;
+        let placed = city.orders(&pool, date(12), 3, 1).await;
+        let plan = plans::create(&pool, &city.new_plan(date(12), moves(10)))
+            .await
+            .unwrap();
+        let order_ids: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        let route = Route {
+            plan_id: plan.id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let context = testing::context(&pool, testing::config());
+
+        let error = prepare(&context, &no_lease(route.plan_id), &route)
+            .await
+            .unwrap_err();
+        let said = format!("{error:#}");
+        assert!(said.contains("deliveries"), "{said}");
+        assert!(said.contains(&city.couriers[0].id.to_string()), "{said}");
+
+        // Two pickups of two are as much too much, the other way.
+        let mut heavy = Vec::new();
+        for _ in 0..2 {
+            let order = city
+                .order_at(&pool, date(13), (0.01, 0.01), OrderKind::Pickup, 2)
+                .await;
+            heavy.push(order.id);
+        }
+        let route = Route {
+            order_ids: &heavy,
+            ..route
+        };
+        let error = prepare(&context, &no_lease(route.plan_id), &route)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("pickups"), "{error:#}");
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_for_a_courier_that_does_not_exist_is_an_error(pool: PgPool) {
+        let city = testing::city(&pool, &[10]).await;
+        let placed = city.orders(&pool, date(12), 2, 1).await;
+        let plan = plans::create(&pool, &city.new_plan(date(12), moves(10)))
+            .await
+            .unwrap();
+        let order_ids: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        let nobody = CourierId::generate();
+        let route = Route {
+            plan_id: plan.id,
+            courier_id: nobody,
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let context = testing::context(&pool, testing::config());
+
+        let error = prepare(&context, &no_lease(route.plan_id), &route)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&nobody.to_string()), "{error}");
+    }
+
+    /// The last line of defence: a route that has the courier over its capacity is
+    /// not stored, whatever found it.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_that_overloads_its_courier_is_not_stored(pool: PgPool) {
+        let lease = claimed_route(&pool, 3).await;
+        // A tour over three stops, and loads it does not fit: the first stop it calls
+        // at is a pickup, on a courier that leaves full.
+        let matrix = line(3);
+        let tour = optimize_route(&matrix, 1, &mut Control::max_iterations(100));
+        let first = tour.stops()[0];
+        let mut asked = [Demand::delivery(1); 3];
+        asked[first - 1] = Demand::pickup(2);
+        let loads = Loads::new(2, &asked).unwrap();
+        assert!(!loads.fits(tour.stops()));
+
+        let driven = Driven {
+            stops: tour.stops().to_vec(),
+            distance_m: tour.cost(),
+            distances: Distances::GreatCircle,
+        };
+        let found = Found {
+            tour,
+            iterations: 0,
+            stopped_by: None,
+        };
+        let order_ids = ids(3);
+        let route = Route {
+            plan_id: lease.plan_id,
+            courier_id: CourierId::generate(),
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let error = complete(&pool, &lease, &route, &loads, &driven, &found)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("more on board"), "{error}");
+        assert!(
+            routes::list_for_plan(&pool, lease.plan_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A route job of `stops` stops, claimed, for the lease a search is kept under.
@@ -641,10 +1418,18 @@ mod tests {
 
         let started = Instant::now();
         let budget = testing::millis(1_000);
-        let found = solve(&pool, &config, &lease, scattered(12), 7, budget)
-            .await
-            .unwrap()
-            .expect("the job is this worker's throughout");
+        let found = solve(
+            &pool,
+            &config,
+            &lease,
+            scattered(12),
+            Loads::none(12),
+            7,
+            budget,
+        )
+        .await
+        .unwrap()
+        .expect("the job is this worker's throughout");
         let took = started.elapsed();
         let said = announced_within(&mut listener, Duration::from_millis(300)).await;
 
@@ -689,7 +1474,18 @@ mod tests {
         let job = tokio::spawn({
             let pool = pool.clone();
             let budget = testing::millis(60_000);
-            async move { solve(&pool, &config, &lease, scattered(12), 7, budget).await }
+            async move {
+                solve(
+                    &pool,
+                    &config,
+                    &lease,
+                    scattered(12),
+                    Loads::none(12),
+                    7,
+                    budget,
+                )
+                .await
+            }
         });
         soon(listener.recv()).await.unwrap();
 

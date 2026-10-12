@@ -62,6 +62,8 @@ services:
       API_BUDGET_MAX_MS:
       API_BUDGET_MAX_ITERATIONS:
       API_WORKER_ALIVE_SECS:
+      API_LOGIN_ATTEMPTS:
+      API_HASHES_AT_ONCE:
       LOG_FORMAT:
       RUST_LOG:
     ports:
@@ -98,11 +100,48 @@ services:
       SOLVER_HEARTBEAT_SECS:
       SOLVER_POLL_SECS:
       SOLVER_PROGRESS_MS:
+      # Where to ask for distances by road: `http://osrm:5000` for the service below.
+      # Not set, the distances are great circles, which need nobody (D8).
+      OSRM_URL:
+      OSRM_TIMEOUT_SECS:
       LOG_FORMAT:
       RUST_LOG:
     depends_on:
       db:
         condition: service_healthy
+
+  # Distances by road, for whoever wants them (D67). The service has a profile, so
+  # `docker compose up` leaves it out, and the stack asks nobody for anything. To have
+  # it:
+  #
+  #   scripts/osrm-prepare      once: fetches the roads of Kyiv and prepares them
+  #   in .env:                  COMPOSE_PROFILES=osrm and OSRM_URL=http://osrm:5000
+  #   docker compose up --build --scale solver=4
+  #
+  # A solver that is given OSRM_URL asks this service for the distances of each route.
+  # A route it gets no answer for is searched for on great circles, and says so (D66).
+  # So nothing waits for this service, and it may come up late or not at all.
+  osrm:
+    image: &osrm ghcr.io/project-osrm/osrm-backend:v26.10.0-debian
+    profiles: ["osrm"]
+    # `ch`: the roads as scripts/osrm-prepare contracts them, which answers a table
+    # quickest. A table has a row for the depot and one for each stop of a route, and
+    # the demonstration makes days of up to 2000 orders.
+    command: ["osrm-routed", "--algorithm", "ch", "--max-table-size", "2001", "/data/kyiv.osrm"]
+    volumes:
+      - ./osrm:/data:ro
+    ports:
+      # On localhost only, for a solver that runs outside Docker.
+      - "127.0.0.1:${OSRM_PORT:-5000}:5000"
+
+  # The tools of the same image, which scripts/osrm-prepare prepares the roads with:
+  # `docker compose run --rm osrm-tools osrm-extract ...`. It has a profile nobody
+  # names, so nothing starts it but that.
+  osrm-tools:
+    image: *osrm
+    profiles: ["osrm-tools"]
+    volumes:
+      - ./osrm:/data
 
   # The Telegram bot. It reaches the system through the API alone, so that is what it
   # waits for. It asks Telegram for its updates, so it publishes no port.
@@ -121,6 +160,9 @@ services:
       # What the bot shows the API to be given a token of the person it talks to
       # (D60). It has to be the key the API has, so the two fall back to the same.
       BOT_SERVICE_KEY: ${BOT_SERVICE_KEY:-routeforge-demo-bot-key-not-a-secret}
+      # A service to ask where an address is, if the bot is to take addresses. Not
+      # set, the bot sends what people write to nobody (D72).
+      GEOCODER_URL:
       # Passed on if set in .env or in the shell, and left to their defaults if not.
       TELEGRAM_API_URL:
       LOG_FORMAT:

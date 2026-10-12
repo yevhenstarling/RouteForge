@@ -4,19 +4,13 @@
 //! cargo run -p routeforge-tsp --release --example stages -- [stops] [couriers] [seed]
 //! ```
 
-use std::env;
-use std::iter;
+mod day;
+
 use std::time::{Duration, Instant};
 
-use rand::{RngExt, SeedableRng};
-use rand_chacha::ChaCha8Rng;
-use routeforge_tsp::{
-    Control, DistanceMatrix, Point, Problem, Stop, anneal, cluster, local_search,
-    nearest_neighbour, two_opt,
-};
+use routeforge_tsp::{Control, anneal, cluster, local_search, nearest_neighbour, two_opt};
 
-/// The side of the square the stops are scattered over, in metres.
-const SIDE: f64 = 10_000.0;
+use crate::day::{SIDE, argument, grouped, matrix_of, random_day};
 
 /// How many moves annealing gets for each route.
 const ANNEALING_MOVES: u64 = 2_000_000;
@@ -50,11 +44,7 @@ fn main() -> Result<(), String> {
     let mut totals = [0u64; STAGES.len()];
     let mut times = [Duration::ZERO; STAGES.len()];
     for (route, cluster) in clustering.clusters.iter().enumerate() {
-        let stops_of_the_route = cluster.stops.iter().map(|&stop| problem.stops[stop].point);
-        let points: Vec<Point> = iter::once(problem.depot)
-            .chain(stops_of_the_route)
-            .collect();
-        let matrix = DistanceMatrix::euclidean(&points);
+        let matrix = matrix_of(&problem, &cluster.stops);
         // Local search ends on its own, so it needs no limit.
         let mut unlimited = Control::max_iterations(u64::MAX);
         let mut annealing = Control::max_iterations(ANNEALING_MOVES);
@@ -107,46 +97,4 @@ fn main() -> Result<(), String> {
         grouped(ANNEALING_MOVES)
     );
     Ok(())
-}
-
-/// The whole number at `position` on the command line, or `default` if it is missing.
-fn argument(position: usize, name: &str, default: u64) -> Result<u64, String> {
-    match env::args().nth(position) {
-        None => Ok(default),
-        Some(text) => text
-            .parse()
-            .map_err(|_| format!("{name} must be a whole number, got `{text}`")),
-    }
-}
-
-/// A depot in the middle of the square, stops scattered over it with a demand of one to
-/// three, and couriers that together have a tenth more capacity than the day needs.
-fn random_day(stops: usize, couriers: usize, seed: u64) -> Problem {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let stops: Vec<Stop> = (0..stops)
-        .map(|_| Stop {
-            point: Point::new(rng.random_range(0.0..SIDE), rng.random_range(0.0..SIDE)),
-            demand: rng.random_range(1..=3),
-        })
-        .collect();
-    let demand: u64 = stops.iter().map(|stop| u64::from(stop.demand)).sum();
-    let capacity = (demand * 11).div_ceil(10 * couriers.max(1) as u64);
-    Problem {
-        depot: Point::new(SIDE / 2.0, SIDE / 2.0),
-        stops,
-        capacities: vec![u32::try_from(capacity).unwrap_or(u32::MAX); couriers],
-    }
-}
-
-/// `1234567` as `1 234 567`.
-fn grouped(number: u64) -> String {
-    let digits = number.to_string();
-    let mut grouped = String::new();
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            grouped.push(' ');
-        }
-        grouped.push(digit);
-    }
-    grouped
 }

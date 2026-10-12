@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::geo::LatLon;
+use crate::geo::{Distances, LatLon};
 use crate::ids::{CourierId, DepotId, OrderId, PlanId, RouteId, UserId};
 use crate::text::text_enum;
 
@@ -149,7 +149,9 @@ pub struct NewDepot {
 pub struct Courier {
     pub id: CourierId,
     pub name: String,
-    /// How much demand one route of this courier may carry (D7).
+    /// How much the courier can have on board at one time. A route may ask for more
+    /// than that in all: what is delivered is off before what is picked up comes on
+    /// (D65).
     pub capacity: u32,
     /// Only active couriers get routes.
     pub active: bool,
@@ -359,6 +361,9 @@ pub struct Route {
     pub courier_id: CourierId,
     /// The length of the round trip in metres (D4).
     pub distance_m: u64,
+    /// What that length was measured along. Roads, where the solver has a routing
+    /// service to ask and was answered, and great circles otherwise (D66).
+    pub distances: Distances,
     /// In the order the courier calls.
     pub stops: Vec<RouteStop>,
 }
@@ -379,6 +384,8 @@ pub struct NewRoute {
     pub plan_id: PlanId,
     pub courier_id: CourierId,
     pub distance_m: u64,
+    /// What the distance was measured along.
+    pub distances: Distances,
     /// The orders in the order the courier calls.
     pub stops: Vec<OrderId>,
 }

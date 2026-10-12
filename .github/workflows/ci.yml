@@ -67,6 +67,26 @@ jobs:
           cargo sqlx migrate run --source crates/routeforge-domain/migrations
           cargo sqlx prepare --workspace --check -- --all-targets
 
+  # The dependencies in Cargo.lock against the advisory database as it is on the day.
+  # A job of its own: an advisory that is published tomorrow fails this and leaves
+  # the checks of the code as they were. What is ignored, and why, is in
+  # .cargo/audit.toml (D12).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Audit
+        run: cargo audit
+
   # The image `docker compose up` builds. It has to build from the base image alone:
   # with no database (D28) and with no native library that the base does not have (D12).
   image:

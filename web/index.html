@@ -205,6 +205,10 @@ const COLOURS = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf
 const NO_COURIER = '#8a8f98';
 // How many vans the demo city has: one for each solver of the stack as it is shown.
 const VANS = 4;
+// The share of the demo orders that are deliveries: four in five (D46).
+const DELIVERED = 0.8;
+// What the length of a route was measured along, as the API says it and in words (D66).
+const ALONG = { road: 'by road', great_circle: 'as the crow flies' };
 const SESSION = 'routeforge.session';
 // How often the orders of the day are read again without anybody having said that one
 // was placed. Whoever places one says so, but a word like that can be lost.
@@ -216,6 +220,7 @@ const state = {
   session: null,        // { token, user, expiresAt }
   date: today(),
   depot: null,
+  planDepot: null,      // the depot the shown plan was made for, if it has moved since
   couriers: [],
   orders: new Map(),    // id -> order, those of the day
   plans: [],            // those of the day, newest first
@@ -273,6 +278,35 @@ function say(text, isError = false) {
 function colourOf(courierId) {
   const at = state.couriers.findIndex((courier) => courier.id === courierId);
   return at < 0 ? NO_COURIER : COLOURS[at % COLOURS.length];
+}
+
+/**
+ * The most a courier has on board along a route (D65). It leaves the depot with every
+ * delivery. A delivery comes off at its stop, and a pickup comes on at its own.
+ */
+function mostOnBoard(stops) {
+  let onBoard = 0;
+  for (const stop of stops) {
+    if (stop.kind === 'delivery') onBoard += stop.demand;
+  }
+  let most = onBoard;
+  for (const stop of stops) {
+    onBoard += stop.kind === 'pickup' ? stop.demand : -stop.demand;
+    most = Math.max(most, onBoard);
+  }
+  return most;
+}
+
+/** What a stored route has its courier carry, in words: `at most 131 of 132 on board`. */
+function carried(route) {
+  const courier = state.couriers.find((known) => known.id === route.courier_id);
+  const most = mostOnBoard(route.stops);
+  return courier ? `at most ${most} of ${courier.capacity} on board` : `at most ${most} on board`;
+}
+
+/** What a stored route's length was measured along: `by road`, or `as the crow flies`. */
+function along(route) {
+  return ALONG[route.distances] || String(route.distances);
 }
 
 function nameOf(courierId) {
@@ -458,10 +492,46 @@ const tip = (text) => () => el('span', '', text);
 
 function drawDepot() {
   layers.depot.clearLayers();
+  if (state.planDepot) {
+    // Where the routes of the shown plan start: the depot as it was when the plan was
+    // made (D21). Drawn fainter than the depot there is now, and under it.
+    L.circleMarker(point(state.planDepot.location), {
+      pane: 'depot', radius: 9, color: '#6b7280', weight: 3, dashArray: '4 3', fillColor: '#fff', fillOpacity: 1,
+    }).bindTooltip(tip(`The depot of this plan: ${state.planDepot.name}`)).addTo(layers.depot);
+  }
   if (!state.depot) return;
   L.circleMarker(point(state.depot.location), {
     pane: 'depot', radius: 9, color: '#111', weight: 3, fillColor: '#fff', fillOpacity: 1,
   }).bindTooltip(tip(`Depot: ${state.depot.name}`)).addTo(layers.depot);
+}
+
+/**
+ * Where the routes of the shown plan start and end: the depot the plan was made for
+ * (D21). That is the depot as it is now, unless the depot was moved since. Then it is
+ * the one the plan names, once the page has read it, and nothing until then: a route
+ * drawn from the wrong place would be a wrong route.
+ */
+function depotOfPlan() {
+  const plan = state.plan;
+  if (!plan || (state.depot && plan.depot_id === state.depot.id)) return state.depot;
+  return state.planDepot && state.planDepot.id === plan.depot_id ? state.planDepot : null;
+}
+
+/** Reads the depot of the shown plan, if that is no longer the depot there is. */
+async function loadPlanDepot() {
+  const plan = state.plan;
+  if (!plan || (state.depot && plan.depot_id === state.depot.id)) return;
+  if (state.planDepot && state.planDepot.id === plan.depot_id) return;
+  const depot = await api('GET', `/api/depots/${plan.depot_id}`);
+  // Another plan was picked while this was read.
+  if (!state.plan || state.plan.depot_id !== depot.id) return;
+  state.planDepot = depot;
+  drawDepot();
+  drawRoutes();
+  for (const job of state.jobs) {
+    const announced = state.progress.get(job.job_id);
+    if (announced && job.status === 'running') drawProvisional(job, announced);
+  }
 }
 
 /** Which courier each order of the shown plan is with: by its routes, and by its jobs. */
@@ -537,7 +607,8 @@ function dropAllProvisional() {
 
 /** The route a search has so far, as a dashed line that moves while the search goes on. */
 function drawProvisional(job, progress) {
-  if (!state.depot || !progress.order) return;
+  const depot = depotOfPlan();
+  if (!depot || !progress.order) return;
   const stops = [];
   for (const place of progress.order) {
     const order = state.orders.get(job.order_ids[place]);
@@ -548,7 +619,7 @@ function drawProvisional(job, progress) {
     }
     stops.push(point(order.location));
   }
-  const round = [point(state.depot.location), ...stops, point(state.depot.location)];
+  const round = [point(depot.location), ...stops, point(depot.location)];
   const line = provisional.get(job.job_id);
   if (line) {
     line.setLatLngs(round);
@@ -562,11 +633,13 @@ function drawProvisional(job, progress) {
 
 function drawRoutes() {
   layers.routes.clearLayers();
-  if (!state.depot) return;
+  const depot = depotOfPlan();
+  if (!depot) return;
   for (const route of state.routes) {
     const stops = route.stops.map((stop) => point(stop.location));
-    const round = [point(state.depot.location), ...stops, point(state.depot.location)];
-    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)}, ${route.stops.length} stops`;
+    const round = [point(depot.location), ...stops, point(depot.location)];
+    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)} ${along(route)}, `
+      + `${route.stops.length} stops, ${carried(route)}`;
     L.polyline(round, { renderer: lines, color: colourOf(route.courier_id), weight: 3, opacity: 0.95 })
       .bindTooltip(tip(words), { sticky: true })
       .addTo(layers.routes);
@@ -579,6 +652,7 @@ function drawRoutes() {
 function fit() {
   const points = [];
   if (state.depot) points.push(point(state.depot.location));
+  if (state.planDepot) points.push(point(state.planDepot.location));
   for (const order of state.orders.values()) {
     if (order.status !== 'cancelled') points.push(point(order.location));
   }
@@ -670,6 +744,7 @@ function renderRoutes() {
     let numbers = '';
     if (route) {
       numbers = km(route.distance_m);
+      stands += `, ${along(route)}, ${carried(route)}`;
     } else if (progress && job.status === 'running') {
       numbers = km(progress.best_cost_m);
       stands += `, ${moves(progress.iterations)}`;
@@ -683,10 +758,21 @@ function renderRoutes() {
     list.append(row);
   }
   $('routes').hidden = state.jobs.length === 0;
-  const total = state.routes.reduce((sum, route) => sum + route.distance_m, 0);
-  $('routes-total').textContent = state.routes.length > 0
-    ? `${km(total)} over ${state.routes.length} ${state.routes.length === 1 ? 'route' : 'routes'}.`
-    : '';
+  $('routes-total').textContent = totalOf(state.routes);
+}
+
+/**
+ * What the stored routes come to. A solver that is given a routing service measures by
+ * road, and falls back on great circles for a route the service gave nothing for
+ * (D66). So the routes of a plan may differ in that, and the sum says if they do.
+ */
+function totalOf(routes) {
+  if (routes.length === 0) return '';
+  const total = km(routes.reduce((sum, route) => sum + route.distance_m, 0));
+  const count = `${routes.length} ${routes.length === 1 ? 'route' : 'routes'}`;
+  const byRoad = routes.filter((route) => route.distances === 'road').length;
+  if (byRoad === routes.length || byRoad === 0) return `${total} ${along(routes[0])} over ${count}.`;
+  return `${total} over ${count}: ${byRoad} by road, ${routes.length - byRoad} as the crow flies.`;
 }
 
 function renderSystem() {
@@ -773,10 +859,12 @@ function forgetPlan() {
   routesAsked += 1;
   state.planId = null;
   state.plan = null;
+  state.planDepot = null;
   state.jobs = [];
   state.routes = [];
   state.progress.clear();
   dropAllProvisional();
+  drawDepot();
   drawRoutes();
   colourStops();
   renderPlan();
@@ -790,6 +878,7 @@ function showPlan(planId) {
   state.plan = state.plans.find((plan) => plan.id === planId) || null;
   renderPlans();
   renderPlan();
+  loadPlanDepot().catch((error) => state.session && say(describe(error), true));
   const shown = () => state.planId === planId;
   stopWatchingPlan = watch(`/api/plans/${planId}/events`, {
     plan: (plan) => shown() && planChanged(plan),
@@ -917,10 +1006,12 @@ async function generateOrders() {
 /**
  * A depot and four vans, through the endpoints an admin would use by hand.
  *
- * A demo order has a demand of 1 to 3, so a day of them asks for twice its number. The
- * vans are sized to take that between the four of them with a tenth to spare. So the
- * day that is generated next gives every van a route, and with it every one of four
- * solvers something to search for, whether it is of 300 orders or of 2000.
+ * A demo order has a demand of 1 to 3, and four in five are deliveries. So a day of
+ * them sends 1.6 times its number out of the depot, which is what the vans need room
+ * for: what is picked up comes on board when deliveries are off it (D65). The vans are
+ * sized to take that between the four of them with a tenth to spare. So the day that
+ * is generated next gives every van a route, and with it every one of four solvers
+ * something to search for, whether it is of 300 orders or of 2000.
  */
 async function setUpDemoCity() {
   if (!state.depot) {
@@ -929,7 +1020,7 @@ async function setUpDemoCity() {
   }
   if (state.couriers.length === 0) {
     const orders = Number($('demo-count').value) || 300;
-    const capacity = Math.ceil(orders * 2 * 1.1 / VANS);
+    const capacity = Math.ceil(orders * 2 * DELIVERED * 1.1 / VANS);
     for (let number = 1; number <= VANS; number += 1) {
       await api('POST', '/api/couriers', { name: `Van ${number}`, capacity });
     }
@@ -992,7 +1083,7 @@ function leave(why) {
     // Nothing was kept there, then.
   }
   Object.assign(state, {
-    session: null, depot: null, couriers: [], orders: new Map(), plans: [], planId: null,
+    session: null, depot: null, planDepot: null, couriers: [], orders: new Map(), plans: [], planId: null,
     plan: null, jobs: [], routes: [], stats: null,
   });
   state.progress.clear();

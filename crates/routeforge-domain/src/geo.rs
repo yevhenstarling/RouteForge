@@ -4,8 +4,20 @@ use std::convert::Infallible;
 
 use serde::{Deserialize, Serialize};
 
+use crate::text::text_enum;
+
 /// The mean radius of the Earth in metres, as the IUGG defines it.
 pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
+
+text_enum! {
+    /// What a distance was measured along (D66).
+    Distances {
+        /// Great circles from stop to stop: as the crow flies.
+        GreatCircle => "great_circle",
+        /// Roads, as a routing service knows them.
+        Road => "road",
+    }
+}
 
 /// A position on Earth in degrees.
 ///
@@ -200,6 +212,10 @@ impl DistanceTable {
 pub trait DistanceProvider {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// What the distances of this provider are measured along. A route says it of its
+    /// length, so that a length by road is not taken for one as the crow flies (D66).
+    fn measures(&self) -> Distances;
+
     /// The distance from each position to each other, in the order they were given.
     fn table(
         &self,
@@ -213,6 +229,10 @@ pub struct Haversine;
 
 impl DistanceProvider for Haversine {
     type Error = Infallible;
+
+    fn measures(&self) -> Distances {
+        Distances::GreatCircle
+    }
 
     async fn table(&self, positions: &[LatLon]) -> Result<DistanceTable, Infallible> {
         Ok(DistanceTable::haversine(positions))
@@ -450,5 +470,13 @@ mod tests {
         assert_eq!(table, DistanceTable::haversine(&positions));
         // Some 8 km between the first two.
         assert!((7_000..9_000).contains(&table.get(0, 1)));
+        assert_eq!(Haversine.measures(), Distances::GreatCircle);
+    }
+
+    #[test]
+    fn what_a_distance_is_measured_along_has_one_text_everywhere() {
+        crate::text::testing::assert_text_round_trips(Distances::ALL);
+        assert_eq!(Distances::ALL, [Distances::GreatCircle, Distances::Road]);
+        assert_eq!(Distances::Road.to_string(), "road");
     }
 }

@@ -26,6 +26,7 @@ fn bot() -> Command {
         "BOT_SERVICE_KEY",
         "BOT_API_URL",
         "TELEGRAM_API_URL",
+        "GEOCODER_URL",
         "LOG_FORMAT",
         "RUST_LOG",
     ] {
@@ -118,7 +119,7 @@ fn with_a_token_and_no_key_it_ends_and_names_what_it_misses() {
 
 #[test]
 fn a_setting_that_is_no_address_ends_it_by_name() {
-    for setting in ["BOT_API_URL", "TELEGRAM_API_URL"] {
+    for setting in ["BOT_API_URL", "TELEGRAM_API_URL", "GEOCODER_URL"] {
         let ended = run(bot().env(setting, "the API"));
         assert_eq!(ended.status.code(), Some(1), "{setting}: {ended:?}");
         let said = String::from_utf8_lossy(&ended.stderr);
@@ -140,9 +141,9 @@ async fn telegram_answers(server: &MockServer, bot_method: &str, with: impl Resp
         .await;
 }
 
-/// Hands out one message, `/orders`, and then nothing: as `getUpdates` does, from the
-/// offset on that it is asked for.
-struct OneMessage;
+/// Hands out one message with this text, and then nothing: as `getUpdates` does, from
+/// the offset on that it is asked for.
+struct OneMessage(&'static str);
 
 impl Respond for OneMessage {
     fn respond(&self, request: &Request) -> ResponseTemplate {
@@ -157,7 +158,7 @@ impl Respond for OneMessage {
                 "date": 1_760_000_000,
                 "chat": { "id": 4_242, "type": "private", "first_name": "Ada" },
                 "from": { "id": 4_242, "is_bot": false, "first_name": "Ada" },
-                "text": "/orders",
+                "text": self.0,
             },
         }]))
     }
@@ -173,10 +174,9 @@ fn header<'a>(request: &'a Request, name: &str) -> &'a str {
     value.and_then(|value| value.to_str().ok()).unwrap_or("")
 }
 
-/// The whole of it through `main`: the token goes to Telegram, the key and the
-/// person's token go to the API, each where it belongs.
-#[tokio::test(flavor = "multi_thread")]
-async fn given_its_settings_it_talks_to_the_telegram_and_the_api_they_name() {
+/// A server in the place of Telegram. It knows the bot of [`TOKEN`], hands it one
+/// message from Ada with this text, and takes what the bot sends.
+async fn a_telegram_where_ada_writes(text: &'static str) -> MockServer {
     let telegram = MockServer::start().await;
     telegram_answers(
         &telegram,
@@ -198,7 +198,7 @@ async fn given_its_settings_it_talks_to_the_telegram_and_the_api_they_name() {
         json!({ "url": "", "has_custom_certificate": false, "pending_update_count": 0 });
     telegram_answers(&telegram, "getWebhookInfo", ok(no_webhook)).await;
     telegram_answers(&telegram, "setMyCommands", ok(json!(true))).await;
-    telegram_answers(&telegram, "getUpdates", OneMessage).await;
+    telegram_answers(&telegram, "getUpdates", OneMessage(text)).await;
     let sent = json!({
         "message_id": 100,
         "date": 1_760_000_000,
@@ -206,8 +206,12 @@ async fn given_its_settings_it_talks_to_the_telegram_and_the_api_they_name() {
         "text": "what the bot said",
     });
     telegram_answers(&telegram, "sendMessage", ok(sent)).await;
+    telegram
+}
 
-    // The API, as its document describes what it sends.
+/// A server in the place of the API, which knows Ada for a client: as the API's
+/// document describes what it sends.
+async fn an_api_that_knows_ada() -> MockServer {
     let api = MockServer::start().await;
     let session = json!({
         "token": SESSION,
@@ -225,11 +229,35 @@ async fn given_its_settings_it_talks_to_the_telegram_and_the_api_they_name() {
         .respond_with(ResponseTemplate::new(200).set_body_json(session))
         .mount(&api)
         .await;
+    api
+}
+
+/// Has a server in the place of the API answer a `GET` at a path with this.
+async fn api_gives(api: &MockServer, at: &str, answer: Value) {
     Mock::given(method("GET"))
-        .and(path("/api/orders"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&api)
+        .and(path(at))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        .mount(api)
         .await;
+}
+
+/// What the bot sent to the chat, once it has.
+async fn said_to_the_chat(telegram: &MockServer) -> Request {
+    until("the bot to answer the chat", async || {
+        let said = asked(telegram).await;
+        said.into_iter()
+            .find(|request| request.url.path().ends_with("/SendMessage"))
+    })
+    .await
+}
+
+/// The whole of it through `main`: the token goes to Telegram, the key and the
+/// person's token go to the API, each where it belongs.
+#[tokio::test(flavor = "multi_thread")]
+async fn given_its_settings_it_talks_to_the_telegram_and_the_api_they_name() {
+    let telegram = a_telegram_where_ada_writes("/orders").await;
+    let api = an_api_that_knows_ada().await;
+    api_gives(&api, "/api/orders", json!([])).await;
 
     let child = bot()
         .env("TELEGRAM_BOT_TOKEN", TOKEN)
@@ -242,12 +270,7 @@ async fn given_its_settings_it_talks_to_the_telegram_and_the_api_they_name() {
     let _started = Started(child);
 
     // It answers the chat, having asked the API on the person's behalf.
-    let said = until("the bot to answer the chat", async || {
-        let said = asked(&telegram).await;
-        said.into_iter()
-            .find(|request| request.url.path().ends_with("/SendMessage"))
-    })
-    .await;
+    let said = said_to_the_chat(&telegram).await;
     // To Telegram as the bot of its token, and of no other.
     assert_eq!(said.url.path(), format!("/bot{TOKEN}/SendMessage"));
     let said: Value = said.body_json().unwrap_or_default();
@@ -269,6 +292,89 @@ async fn given_its_settings_it_talks_to_the_telegram_and_the_api_they_name() {
     );
     assert_eq!(header(&asked[0], "x-request-id"), "tg-1");
     assert_eq!(header(&asked[1], "x-request-id"), "tg-1");
+}
+
+/// What a person writes goes to a geocoding service only where the bot was started
+/// with one (D72). Started without, it sends the words to nobody.
+#[tokio::test(flavor = "multi_thread")]
+async fn it_asks_where_an_address_is_only_of_the_service_it_was_started_with() {
+    const PLACE: &str = "22, Хрещатик вулиця, Липки, Київ, 01001, Україна";
+    let depot = json!({
+        "id": "0199d3c2-7b1e-7f6a-9c0d-2f4b8a1e6d36",
+        "name": "Depot",
+        "location": { "lat": 50.45, "lon": 30.52 },
+        "created_at": "2026-10-12T08:00:00Z",
+    });
+    // The service, which answers as Nominatim does.
+    let places = MockServer::start().await;
+    let found = json!([{ "lat": "50.4476532", "lon": "30.5222416", "display_name": PLACE }]);
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(found))
+        .mount(&places)
+        .await;
+
+    // Without the setting: the words are words, and nobody is asked about them.
+    let telegram = a_telegram_where_ada_writes("Хрещатик 22").await;
+    let api = an_api_that_knows_ada().await;
+    api_gives(&api, "/api/depot", depot.clone()).await;
+    let child = bot()
+        .env("TELEGRAM_BOT_TOKEN", TOKEN)
+        .env("TELEGRAM_API_URL", telegram.uri())
+        .env("BOT_API_URL", api.uri())
+        .env("BOT_SERVICE_KEY", KEY)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("the binary of the bot runs");
+    let started = Started(child);
+    let said: Value = said_to_the_chat(&telegram)
+        .await
+        .body_json()
+        .unwrap_or_default();
+    let text = said["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("I take no free text."), "{text}");
+    drop(started);
+    assert!(asked(&places).await.is_empty());
+    assert!(asked(&api).await.is_empty());
+
+    // With it: the service is asked where that is, and the place is shown.
+    let telegram = a_telegram_where_ada_writes("Хрещатик 22").await;
+    let child = bot()
+        .env("TELEGRAM_BOT_TOKEN", TOKEN)
+        .env("TELEGRAM_API_URL", telegram.uri())
+        .env("BOT_API_URL", api.uri())
+        .env("BOT_SERVICE_KEY", KEY)
+        .env("GEOCODER_URL", places.uri())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("the binary of the bot runs");
+    let _started = Started(child);
+    let said: Value = said_to_the_chat(&telegram)
+        .await
+        .body_json()
+        .unwrap_or_default();
+    assert_eq!(
+        said["text"],
+        format!("Is it this place?\n{PLACE}\n\nPlaces: © OpenStreetMap contributors.")
+    );
+
+    let searched = asked(&places).await;
+    assert_eq!(searched.len(), 1, "{searched:#?}");
+    let words = searched[0].url.query_pairs().find(|(name, _)| name == "q");
+    assert_eq!(
+        words.map(|(_, words)| words.into_owned()).as_deref(),
+        Some("Хрещатик 22")
+    );
+    // It says who it is, and nothing of whose address this is.
+    assert!(header(&searched[0], "user-agent").starts_with("routeforge-bot/"));
+    assert_eq!(header(&searched[0], "authorization"), "");
+    // Where the depot is it asked the API, as Ada.
+    let paths: Vec<String> = asked(&api)
+        .await
+        .iter()
+        .map(|request| request.url.path().to_owned())
+        .collect();
+    assert_eq!(paths, ["/api/auth/telegram", "/api/depot"]);
 }
 
 /// A token that Telegram does not know ends the process, with the reason and a

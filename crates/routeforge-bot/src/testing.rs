@@ -8,14 +8,15 @@ use std::time::Duration;
 
 use chrono::{NaiveDate, Utc};
 use routeforge_domain::{
-    DepotId, LatLon, Order, OrderFilter, OrderId, OrderKind, OrderRequest, OrderStatus, Plan,
-    PlanId, PlanRequest, PlanStatus, Role, RouteBudget, Session, User, UserId,
+    Depot, DepotId, LatLon, Order, OrderFilter, OrderId, OrderKind, OrderRequest, OrderStatus,
+    Plan, PlanId, PlanRequest, PlanStatus, Role, RouteBudget, Session, User, UserId,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use crate::api::{Api, Caller, Failure};
+use crate::geocode::{Found, Geocoder, Unfound};
 
 /// A day in October 2026.
 pub(crate) fn date(day: u32) -> NaiveDate {
@@ -65,6 +66,64 @@ pub(crate) fn a_delivery(day: NaiveDate, parcels: u32) -> OrderRequest {
         location: LatLon::new(50.45, 30.52).unwrap(),
         address: None,
         demand: parcels,
+    }
+}
+
+/// The depot, in Kyiv, as the API gives it.
+pub(crate) fn a_depot() -> Depot {
+    Depot {
+        id: DepotId::generate(),
+        name: "Depot".to_owned(),
+        location: LatLon::new(50.45, 30.52).unwrap(),
+        created_at: Utc::now(),
+    }
+}
+
+/// In the place of a geocoding service, for the tests of the dialogue.
+///
+/// It notes what it was asked and near where, and answers with what the test gave it
+/// for that text: places, none, or a failure. A text it was given nothing for is one
+/// that nothing is found for.
+#[derive(Clone, Default)]
+pub(crate) struct FakeGeocoder(Arc<Mutex<Places>>);
+
+#[derive(Default)]
+struct Places {
+    known: Vec<(String, Result<Vec<Found>, Unfound>)>,
+    asked: Vec<(String, Option<LatLon>)>,
+}
+
+impl FakeGeocoder {
+    /// From now on a search for `text` is answered with this.
+    pub(crate) fn answers(&self, text: &str, with: Result<Vec<Found>, Unfound>) {
+        self.0.lock().unwrap().known.push((text.to_owned(), with));
+    }
+
+    /// What was searched for so far, and near where, oldest first.
+    pub(crate) fn asked(&self) -> Vec<(String, Option<LatLon>)> {
+        self.0.lock().unwrap().asked.clone()
+    }
+}
+
+/// A place a search might find, so far north of Kyiv's Khreshchatyk.
+pub(crate) fn a_place(name: &str, north: f64) -> Found {
+    Found {
+        location: LatLon::new(50.4477 + north, 30.5222).unwrap(),
+        name: name.to_owned(),
+    }
+}
+
+impl Geocoder for FakeGeocoder {
+    fn is_on(&self) -> bool {
+        true
+    }
+
+    async fn find(&self, text: &str, near: Option<LatLon>) -> Result<Vec<Found>, Unfound> {
+        let mut places = self.0.lock().unwrap();
+        places.asked.push((text.to_owned(), near));
+        // What was said last of a text is what counts.
+        let known = places.known.iter().rev().find(|(known, _)| known == text);
+        known.map_or(Ok(Vec::new()), |(_, with)| with.clone())
     }
 }
 
@@ -121,6 +180,9 @@ pub(crate) enum Asked {
         token: String,
         day: NaiveDate,
     },
+    GetDepot {
+        token: String,
+    },
 }
 
 /// In the place of the API, for the tests of the dialogue.
@@ -136,6 +198,8 @@ struct Fake {
     logins: u32,
     orders: Vec<Order>,
     plans: Vec<Plan>,
+    /// The depot as it is now, if one has been set.
+    depot: Option<Depot>,
     asked: Vec<Asked>,
     /// What the next logins are answered with, in place of a session.
     no_login: VecDeque<Failure>,
@@ -151,10 +215,16 @@ impl FakeApi {
             logins: 0,
             orders: Vec::new(),
             plans: Vec::new(),
+            depot: Some(a_depot()),
             asked: Vec::new(),
             no_login: VecDeque::new(),
             no_answer: VecDeque::new(),
         })))
+    }
+
+    /// The API of a city that no admin has given a depot yet.
+    pub(crate) fn has_no_depot(&self) {
+        self.fake().depot = None;
     }
 
     fn fake(&self) -> std::sync::MutexGuard<'_, Fake> {
@@ -395,6 +465,14 @@ impl Api for FakeApi {
         // Newest first.
         listed.sort_by_key(|plan| std::cmp::Reverse(plan.id));
         Ok(listed)
+    }
+
+    async fn get_depot(&self, who: &Caller<'_>) -> Result<Option<Depot>, Failure> {
+        let mut fake = self.fake();
+        fake.take(Asked::GetDepot {
+            token: who.token.to_owned(),
+        })?;
+        Ok(fake.depot.clone())
     }
 }
 

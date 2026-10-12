@@ -28,6 +28,10 @@ Confirmed with the project owner:
 - **A Telegram user gets an account of their own, the first time they write to the bot.** A client's, with no address and no password, which an admin can make an operator's. Tying a Telegram user to an account that is there already, by a code, was offered beside it and not taken (D59).
 - **Phase 7 has two things beyond its list:** an order shows on the map as it is placed, and the bot takes coordinates that are typed where a location cannot be shared (D61, D63).
 - **Phase 7 was merged before it was tried against Telegram.** There was no token for a bot while it was built. It was built and tried against a stand-in for Telegram (D64), and the try with a real bot is the one step of it that is open.
+- **Phase 8 is OSRM, the real load, addresses for the bot, and four items of hardening,** beside the README, the architecture pass and `cargo audit` in CI. The four are: a limit on logins, a content security policy for the page, a warning when the API runs on the demonstration's keys, and a plan drawn from its own depot (D68 to D71). The rest of what earlier phases left out stays out, and is among the known limits in the README.
+- **The bot looks addresses up only where it is given a service to ask.** The public Nominatim was the other choice. It is named in `.env.example`, with its usage policy, and is nobody's default (D72).
+- **A route says what it was measured along, and the map draws it straight.** Lines along the streets were offered beside the label and not taken (D66).
+- **There will be no token from Telegram, and there was no key for the Claude API.** So Phase 8 tried the bot as Phase 7 did, against stand-ins, and did not build free text (D58). The bootcamp holds the project to nothing formal beyond the approved description.
 
 Derived from the description:
 
@@ -36,12 +40,12 @@ Derived from the description:
   - `routeforge-domain`: domain types and request/response DTOs, geo helpers, the `DistanceProvider` trait with its Haversine implementation, and, behind a `db` feature, the sqlx repositories, migrations and job queue. Persistence lives here because both `api` and `solver` need it and the workspace is fixed at five crates.
   - `routeforge-api`: depends on `domain` only. It never links solver code.
   - `routeforge-solver`: depends on `domain` and `tsp`; owns the OSRM client.
-  - `routeforge-bot`: talks to `api` over HTTP only; uses `domain` without `db` for the DTOs.
+  - `routeforge-bot`: reaches the system through `api` over HTTP only; uses `domain` without `db` for the DTOs. Since Phase 8 it also asks a geocoding service where an address is, if it is given one (D72).
 - **Costs are integer metres** (`u32` matrix). Move deltas are exact, local search cannot loop on float noise, and property tests can assert that incremental cost equals recomputed cost.
 - **Anytime and deterministic.** The RNG is a named seeded generator (ChaCha8). Annealing cools by iteration count, in fixed-length epochs with reheats; the deadline and the cancel flag only cut that trajectory short. Same seed plus same iteration budget gives an identical route. Tests use iteration budgets, not wall-clock time.
 - **Queue guarantee.** Delivery is at-least-once: a lease can expire and the job is retried. Completion is fenced: results are written in the same transaction that marks the job done, and only if the worker still holds the lease. Lease times use the database clock, never the worker's.
-- **Capacity, version 1.** A route is feasible when the sum of all its demands, pickups and deliveries together, fits the courier's capacity. This is stricter than mixed routes need and always safe. Tracking the real load along the route is in Phase 8.
-- **Offline.** Haversine by default, Leaflet vendored into the repo, map tiles optional (routes still draw without them), and the bot idles when its Telegram token is absent.
+- **Capacity.** Until Phase 8 a route was feasible when the sum of all its demands, pickups and deliveries together, fitted the courier's capacity (D7). That was stricter than mixed routes need and always safe. Since Phase 8 the load is followed along the route: a courier leaves with its deliveries and comes back with its pickups, and is within its capacity at every stop (D65).
+- **Offline.** Haversine by default, Leaflet vendored into the repo, map tiles optional (routes still draw without them), and the bot idles when its Telegram token is absent. OSRM and the bot's search for an address are off until they are turned on (D67, D72).
 - **Bot authority.** The bot calls the API with the Telegram user's own short-lived JWT, so it can never do more than that user's role allows. Anything with a side effect needs a button confirmation handled in code.
 
 ## Target layout
@@ -58,9 +62,10 @@ RouteForge/
 │  ├─ routeforge-solver/    worker binary
 │  └─ routeforge-bot/       teloxide binary
 ├─ web/                     index.html, vendor/leaflet
-├─ scripts/                 sqlx-prepare and demo, each as .ps1 and .sh
+├─ scripts/                 sqlx-prepare, demo and osrm-prepare, each as .ps1 and .sh
 ├─ docs/                    description.md, plan.md, architecture.md
-└─ .sqlx/                   offline query metadata (committed)
+├─ .sqlx/                   offline query metadata (committed)
+└─ osrm/                    the roads scripts/osrm-prepare fetched (not committed)
 ```
 
 ## Phases at a glance
@@ -75,9 +80,9 @@ RouteForge/
 | 5 | Live updates and map | Routes appearing and improving live in the browser | M | done |
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | done |
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | built; not tried against Telegram yet |
-| 8 | OSRM, hardening, presentation | Road distances, benchmark report | M | todo |
+| 8 | OSRM, hardening, presentation | Road distances, benchmark report | L | done; free text for the bot was not built |
 
-**Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58).
+**Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58). In the end one thing was dropped there: the LLM part, for which there was no key.
 
 ## Phase 0: skeleton and tooling
 
@@ -358,16 +363,105 @@ What later phases need from it:
 
 ## Phase 8: OSRM, hardening, presentation
 
-- `OsrmProvider` in the solver using OSRM's table service, falling back to Haversine on error; an `osrm` compose profile.
-- Real load tracking for mixed pickup and delivery routes.
-- Address geocoding for the bot.
-- Optional, and only with an Anthropic API key to try it with (D58): free text for the bot.
-  - A Claude client over `reqwest` against the Messages API (there is no official Rust SDK), with a hand-written tool loop: capped iterations, all tool results of a turn returned in one message, assistant content echoed back unchanged, `refusal` and `max_tokens` stop reasons handled.
-  - The tools, with strict schemas, are the operations the bot has from Phase 7. A side effect is still confirmed with a button (D9). Bounded per-chat history in memory.
-  - Model id from env, default `claude-opus-5-5`. Running a cheaper model is a config change and the owner's call.
-  - Tests: the tool loop against a scripted fake model; request and response shapes with wiremock.
-  - Left out, the README says that the bot takes no free text, and why.
-- README with benchmark numbers, quality against time, and the scaling table; final architecture doc; `cargo audit` in CI.
+Built, but for one item. The bot's free text was not built, because there was no key for the Claude API to try it with (D58). And one step of Phase 7 is as open as it was: the bot has not been tried against Telegram itself.
+
+What the phase was to hold was settled with the project owner on 2026-10-12, and is among the decisions at the top of this plan.
+
+Delivered:
+
+- **What a courier has on board is followed along the route (D65).**
+  - In `routeforge-tsp`: a stop asks for a delivery or for a pickup. The sweep gives a courier room for what it carries out and room for what it carries back. `Loads` is what a route asks of its courier, and `optimize_route_within` searches as `optimize_route` does and takes up no tour that overloads the courier. A benchmark measures the whole search with loads and without.
+  - In the solver: an order is a delivery or a pickup to the clustering and to the search, and a route is checked once more before it is stored.
+  - On the page and in the demo scripts: the vans are sized for what they deliver, and the page says for each route how much its van has on board at the most.
+- **Distances by road (D66, D67).**
+  - In `routeforge-domain`: `Distances`, `DistanceProvider::measures`, and migration `0006_route_distances.sql` with `routes.distances`.
+  - In the solver: `osrm.rs`, which asks OSRM's table service; the settings `OSRM_URL` and `OSRM_TIMEOUT_SECS`; and in the route job, the table waited for with the heartbeat beside it, great circles where there is no table, the search on the mean of the two directions, and the route stored the shorter way round, measured as it is driven.
+  - In compose: the service `osrm` behind a profile, and `osrm-tools`. `scripts/osrm-prepare.ps1` and `.sh` fetch the roads of Kyiv and prepare them.
+  - On the page: `by road` or `as the crow flies` beside the length of each route.
+- **Hardening (D68 to D71).**
+  - A limit on the logins for one address, and on the passwords hashed at one time: `API_LOGIN_ATTEMPTS` and `API_HASHES_AT_ONCE`, a `429` and a `503`, each with a `Retry-After`.
+  - A content security policy for the page, with the hashes of its script and its style.
+  - A warning in the log when the API starts on the demonstration's key, password or bot key.
+  - `GET /api/depots/{id}`, and the page drawing a plan from the depot it was made for.
+- **Addresses for the bot (D72).** `geocode.rs`, which asks a service that speaks as Nominatim does, behind a trait; the setting `GEOCODER_URL`, with nothing to fall back on; the dialogue that shows the places a search found and begins an order at the one that is picked; `Api::get_depot`.
+- **Numbers and documents.** The example `quality` in `routeforge-tsp`, which prints the length of a route against the moves its search was given. The README, with what the moves buy, what a stage takes, the scaling table made again, distances by road, addresses in the bot and the known limits. D65 to D72 in the decision log, with D7 marked as replaced. `cargo audit` in CI, as a job of its own.
+- In the solver, where a solver takes its distances from is decided in `Provider::of` and no longer in `main`, and the bot's binary has a test that starts it with a geocoding service. Both came of asking what a test would say to a fault in `main`.
+
+What the free text was to be, for whoever builds it with a key:
+
+- A Claude client over `reqwest` against the Messages API (there is no official Rust SDK), with a hand-written tool loop: capped iterations, all tool results of a turn returned in one message, assistant content echoed back unchanged, `refusal` and `max_tokens` stop reasons handled.
+- The tools, with strict schemas, are the operations the bot has from Phase 7. A side effect is still confirmed with a button (D9). Bounded per-chat history in memory.
+- Model id from env, default `claude-opus-5-5`. Running a cheaper model is a config change and the owner's call.
+- Tests: the tool loop against a scripted fake model; request and response shapes with wiremock.
+- It goes into `Chats::handle`, where a text that is no command arrives. Today such a text is an address, to a bot that has a geocoding service, and nothing to one that has not (D72). A model would be asked before either.
+
+Tests: 117 more, and a doctest. 35 are in `routeforge-tsp`, which has 100 now beside its two TSPLIB tests; 28 in the solver (69); 21 in the API (132); 31 in the bot (78), six of which run the binary; and 2 in the domain crate (124). They hold:
+
+- the sweep to the two kinds of room, and every stage of the search to tours the courier can drive, for random routes and loads;
+- the search within loads to the shortest tour the courier can drive, on routes small enough to try every order, and to the very tour of the search without loads where nothing can overload the courier;
+- the client of OSRM to what OSRM takes, longitude first, and to each way it can fail;
+- the route job to the fallback and its label, to the mean of the two directions, to the way round that is shorter and can be driven, and to keeping its lease while it waits;
+- the login to its count, its window and its turn, and both refusals to the OpenAPI document;
+- the page to its policy, made from the page as it is on disk;
+- the bot's client to its pace, to the name it gives and to what it says of a failure, and the dialogue to what it sends, shows and keeps;
+- and each of the three services to a compose file that hands on every setting the service reads. The solver's holds the OSRM server to its profile as well, and the bot's the geocoder to having nothing to fall back on.
+
+The tests were tried against 108 faults put into the code and into the compose file on purpose: 16 in `routeforge-tsp`, 24 for the solver, 4 in the domain crate, one of them in the migration, 31 for the API and 33 for the bot. Eight of them were in the compose file. Each made a test fail but four, and each of the four was a test that looked at too little:
+
+- With the shape of OSRM's table not looked at, rows of the wrong lengths that add up to the right count were taken for a table. The test had only tables that the next check refused anyway.
+- With a login counted after its password was checked, the login over the limit was refused all the same, one hash too late. The test now takes every turn there is to hash, and holds the refusal to coming at once.
+- With the "No" of a search not asked which search it is of, the button of an old search dropped the new one. The test that was to catch it had ended the search itself, with its first press: a button that named a place the search did not have. That was a fault in the bot and not in the test. Such a press ends nothing now, and the test goes on to pick the place that is there.
+- With `/cancel` leaving a search alone, the test passed, because it had an order open as well, which `/cancel` dropped. It has a test of its own.
+
+Before the faults were run, three were plain from reading: nothing would have failed for a solver that ignores `OSRM_URL` in `main`, for a bot that ignores `GEOCODER_URL` there, or for a compose file that hands a setting on to nobody. Each has its test now, and the faults were then caught.
+
+Among the others: a pickup that takes no room; loads that are never, or always, minded; a van that may not be full; each of the three stages making a move that overloads; a route stored without its last check; a route turned round although that overloads, and one never turned; the search on one direction alone; a fallback labelled as by road, and a route by road labelled as the crow flies; a table waited for with no heartbeat; latitude first; `null` taken for nought; a login never refused, never cleared, never taken back, counted by how it was typed, refused for ever, and one that puts the wait off by asking; a refusal without its `Retry-After`; a policy that allows inline script, any image or any host, and one made from the wrong part of the page; a depot read without a token, and the newest given for any id; the words of a person left in an error; requests with no pause between them; a search with no name for the bot; the box round the depot with its corners swapped; equal names not folded; a command that is none sent to the service; an old button picking from a new search; a place picked twice; and a geocoder that compose falls back to.
+
+Tried by hand, with the development database left alone. The stack ran in a project of its own, on other ports, from images that were built from the phase branch:
+
+- **The stack, as a clone has it.** Up with four solvers, the API healthy and the bot idling, 9.5 seconds after `docker compose up` on a new volume. The API's log began with the warning that it runs on the demonstration's key, password and bot key. `docker compose down` took 3 seconds, with an OSRM server among what it stopped.
+- **The demonstration,** with `scripts/demo.ps1` in PowerShell 7 on a new database: a depot, four vans of 132 and 300 orders. With one, two, four and eight solvers the plan took 15.5, 8.3, 4.5 and 4.8 seconds, and a second round 15.4, 8.2, 4.5 and 4.5, with the same four routes every time: 73, 73, 81 and 73 stops, 126.13 km. In the failure run the killed solver's route was taken over 27.9 seconds after the kill, and the plan was done after 40.5, with every order on exactly one route. At the very end both runs were made once more in Windows PowerShell 5.1, on a new database and with the images of the last commit. They gave the same routes, the job that was taken over was logged with `attempt=2`, and the request id of the plan was in the log of the API and of the solvers. The machine had just built the images then, and one solver took 17.5 seconds where it had taken 15.5.
+- **The load.** Of those four vans, three left the depot with 132 of 132 on board, and the fourth had 118 at the most. Each route asked for more in all than D7 would have let its van take: 148, 155, 161 and 155. Before that, on a stack on the host, days of 100, 300, 1200 and 2000 orders each gave four routes and left no order out.
+- **The roads.** `scripts/osrm-prepare.ps1` and, under dash, the `.sh` one each fetched the extract and prepared it. That took 16 seconds and left 106 MB in `osrm/`, and the preparing used half a gigabyte of memory at the most. With the profile on, the same day came to 475.92 km by road, the same routes with one solver and with four. A script outside the stack asked the server for the same legs and got 475.91 km. The routes that were found on great circles are 603.61 km by road. The numbers are in D66, with what explains them.
+- **The server stopped in the middle of a plan,** while the first of four routes was searched for by one solver. It was gone in 0.9 seconds. The plan was done: one route by road, three as the crow flies, each saying which. The solver logged a warning for each of the three, with the reason.
+- **The page,** in a headless Edge driven over the DevTools protocol, with the pictures looked at. On the stack with the roads: the day above, with `by road` on one route and `as the crow flies` on three, and `at most 132 of 132 on board`. Then a day that was generated and planned on the page, with four seconds a route: four dashed lines while it was searched, and four routes stored by road, 470.61 km. Twenty tiles were loaded, the console stayed empty, the browser held nothing against the page, and the only hosts it asked were the API and the tile server. Earlier in the phase, against an API on the host: an inline script that was added later, a script from another host, a handler in an attribute, `eval`, a request to another host and a `style` attribute were each refused, and a plan whose depot had been moved was drawn from where the depot was.
+- **The login,** against a release build on the host: five wrong passwords were answered `401` in 37 to 137 ms each, and the sixth `429` in 2 ms, with `Retry-After: 60`. And in the stack, with `API_LOGIN_ATTEMPTS=2` in the shell that started it: two were answered `401` and the third `429`.
+- **The public Nominatim,** through the bot's own client: eight requests in all, a second apart. It took the bot's name, answered over TLS from the roots in the binary, and what it answered was read. `Хрещатик 22` came back as three buildings under one name, which is why the bot now asks for ten places and shows those a person can tell apart. The dialogue round it was tried against stand-ins, as all of the bot is.
+- **The numbers of the README:** `cargo run -p routeforge-tsp --release --example quality`, three minutes on the development machine, `cargo bench -p routeforge-tsp`, two minutes, and the scaling run above.
+- **The tests, on Linux,** as in Phase 7: the whole workspace in a container of the image the `Dockerfile` builds on, 188 seconds with the compiling, all of it green. And once more after the fault pass, on the code as it was committed.
+- **The images:** 140, 133 and 134 MB for the API, the solver and the bot. The solver's has grown by 7 MB with the client it asks OSRM with.
+- **`cargo audit`,** as CI will run it: nothing but the warning that `proc-macro-error2` is unmaintained, which D10 knows of.
+
+Not verified, because it needs something outside the repository:
+
+- **The bot against Telegram,** as at the end of Phase 7. That takes a token, and "Needed from the project owner" says what to do with it.
+- **The new job in CI.** `cargo audit` was run on the development machine. What CI makes of the workflow cannot be seen from there.
+- **`scripts/demo.sh` from end to end.** Two lines of it changed in this phase, the ones that size the vans and count the orders, and the machine it would be run on has no `jq`. Its syntax was checked under dash, and the two sums are the ones `scripts/demo.ps1` and the page make, which were run. `scripts/osrm-prepare.sh` needs no `jq`, and was run.
+
+Where it differs from what this plan first said:
+
+- The fallback on great circles is a route's and not a solver's, and every route says what it was measured along. A plan can have routes of both kinds (D66).
+- `OsrmProvider` is `Osrm`, one of the two things a `Provider` can be. The other is great circles.
+- Geocoding is off until the bot is given a service to ask. This plan said "address geocoding for the bot" and no more (D72).
+- "Hardening" is four items, which the project owner picked from what the earlier phases had left out. The others are the known limits of the README.
+- `cargo audit` is a job of its own in CI and not a step, so that an advisory that is published tomorrow fails nothing else.
+- The page was changed, which is Phase 5's, and so were the demo scripts, which are Phase 6's: for the load, the roads and the depot of a plan.
+- This phase was sized M and came out L. It was committed in parts, one for each of the five items above.
+
+Found while it was tried, and guarded against since:
+
+- **The words of a person in an error.** reqwest names the address it asked in its errors. The bot's search has the words in that address, so a search that failed would have logged them. They are taken out, and a test fails if they come back.
+- **One address, three times.** The public service gave the same name for three buildings, and the bot would have asked which of three equal lines was meant. Found only against the real service: every stand-in had answered with places that differ.
+- **A command that is none.** `/oder Хрещатик 22` would have been looked up as an address. A text that begins with a slash is not sent now.
+- **OSRM over `POST`.** The server refused `"annotations": "distance"` in a body, where its documentation for an address has the word. A list is what it takes there. The first tag that was tried for its image does not exist. Both are among the traps.
+- **A port that was taken.** Another program on the development machine listens on 5001. Docker started the OSRM server that was to be published there without the port, and said nothing. That is among the traps too.
+
+What is left, for whoever goes on:
+
+- The try with Telegram, and free text with a key: both as "Needed from the project owner" says.
+- The known limits in the README. Each is a thing that was looked at and left.
+- Lines along the streets on the map. The routes are found by road and drawn straight (D66).
+- A route that is searched through tours which overload its courier. The search takes up none, which can keep it from a shorter one where the loads are tight (D65).
 
 ## Known traps
 
@@ -376,7 +470,7 @@ What later phases need from it:
 - **`localhost` on Windows with Docker Desktop.** It resolves to `::1` first, and a connection to the published port hangs there for about 20 seconds before the client falls back to IPv4. `DATABASE_URL` therefore says `127.0.0.1`.
 - **Native build tools.** The development machine has no CMake or NASM. Phase 0 chose features that need neither (D12); a new dependency must not bring OpenSSL or aws-lc back in.
 - **Recent major releases.** sqlx 0.9, utoipa 6, rand 0.10, jsonwebtoken 11, argon2 0.6 and criterion 0.8 are all newer than most tutorials. Read docs.rs for the pinned version.
-- **2-opt assumes a symmetric matrix**, and OSRM road distances are not symmetric. `DistanceMatrix` rejects an asymmetric table (D14), so the solver symmetrizes for the search and reports the real directed length itself.
+- **2-opt assumes a symmetric matrix**, and OSRM road distances are not symmetric. `DistanceMatrix` rejects an asymmetric table (D14), so the solver symmetrizes for the search and reports the real directed length itself (D66).
 - **Two route jobs finishing at once** must not each see the other as unfinished. The plan row's counter update serializes them; Phase 2 has a test for it.
 - **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well, and so do the event streams of the API (D50). A payload has to be shorter than 8000 bytes. A change to a plan is announced by its id alone, and the progress of a search leaves its route out when it would not fit (D48, D49).
 - **Browser `EventSource` cannot send an `Authorization` header.** The page reads the SSE stream with `fetch`.
@@ -414,11 +508,25 @@ What later phases need from it:
 - **cargo does not see that a migration has changed.** The migrations are read when the domain crate is compiled, and a change to a `.sql` file alone does not compile it again. A change to any source file of the crate does.
 - **On Windows a connection to a port nobody listens on takes two seconds to be refused.** A test that wants something to fail at once should have something there that answers wrongly.
 - **wiremock asks its mocks in the order they were mounted,** the first that matches. To have a later one count, mount it with a lower `with_priority`.
+- **OSRM's image has no tag `v26.10.0`.** The release is published as `v26.10.0-debian`, and the bare version ends a pull with `manifest unknown` (D67).
+- **OSRM's `annotations` is a list in a body.** In an address it is a word, `annotations=distance`. Sent as a word in the body of a `POST`, it is refused with `InvalidQuery`: "annotations must be a boolean or an array of strings" (D66).
+- **OSRM and Nominatim take longitude first.** OSRM's coordinates are `[lon, lat]`, and Nominatim's `viewbox` is two corners as `lon,lat`. `LatLon` says latitude first, as people do. Each client has a test that would fail for the other order.
+- **OSRM answers a table of a hundred positions and no more, unless it is started for more.** Beyond `--max-table-size` it refuses with `TooBig`. An answer for 2001 positions is 28 MB (D66).
+- **The extract of Kyiv is called `Kiew`** at BBBike, where the cities have their German names: `https://download.bbbike.org/osm/bbbike/Kiew/Kiew.osm.pbf`.
+- **A reqwest error names the address it asked.** `error.to_string()` ends in `for url (...)`, with the whole query. Where the query holds what a person wrote, as the bot's search for an address does, `error.without_url()` comes before the error goes anywhere (D72).
+- **Nominatim gives one address several times.** `Хрещатик 22` came back as three buildings under one name, and with `limit=3` that was all. The bot asks for ten and shows the first three that differ by name (D72).
+- **The page's policy names one script and one style.** `page.rs` hashes what stands between the first `<script>` and `</script>` of the page, and between the first `<style>` and `</style>`, to the byte. A second element of either kind, one with an attribute, a `style` attribute and a handler in an attribute are all refused by the browser, and the page then does nothing or looks wrong, with the reason in the browser's console alone (D69).
+- **In Windows PowerShell 5.1, `2>$null` on a native command can end a script.** With `$ErrorActionPreference = 'Stop'`, what the command writes to its error stream becomes an error. `scripts/osrm-prepare.ps1` sets the preference to `Continue` round such a call and pipes `2>&1` to `Out-Null`.
+- **`wsl.exe -- sh -c "..."` from PowerShell loses its quoting.** Write the commands into a file and have `sh` run the file.
+- **Docker Desktop starts a container whose port is taken, and says nothing.** On the development machine another program listens on `127.0.0.1:5001`. An OSRM server that was to be published there came up, was reported as started, and had no port: `docker ps` shows `5000/tcp` with nothing in front of it, and what answers on the port is the other program, with a `404`. `OSRM_PORT`, `API_PORT` and `POSTGRES_PORT` move the ports.
+- **PowerShell rounds a fraction away in `[math]::Min(1, 0.5)`.** With a whole number among its arguments it takes the function for whole numbers, and the answer is `0`. Write `1.0`. It made every great-circle length nought in a script that checked the lengths of Phase 8, and none of the repository's scripts has it: `scripts/demo.ps1` takes the least of whole numbers.
 
 ## Needed from the project owner
 
 - `sqlx-cli` on any machine where a query or a migration is changed. The command that installs it is at the top of `scripts/sqlx-prepare`.
-- `curl` and `jq` on a machine where `scripts/demo.sh` is run. `scripts/demo.ps1` needs neither.
+- `curl` and `jq` on a machine where `scripts/demo.sh` is run, and `curl` where `scripts/osrm-prepare.sh` is. The `.ps1` of each needs neither.
+- For distances by road: nothing but the network, once. `scripts/osrm-prepare` fetches the roads and OSRM's image, and the README says which two lines then go into `.env`.
+- For addresses in the bot: a geocoding service to name in `GEOCODER_URL`. `.env.example` names the public one, and what using it takes on.
 - To close Phase 7: a Telegram bot token from @BotFather, and a few minutes with a phone. It is the one step of the phase that could not be made without it:
   1. In Telegram, ask @BotFather for a new bot with `/newbot`, and put the token it gives into `.env` as `TELEGRAM_BOT_TOKEN=...`. Add `TZ=Europe/Kyiv`, or your own zone, so that the bot's "tomorrow" is yours.
   2. `docker compose up -d --build --scale solver=4`, and `docker compose logs bot`: it says that Telegram knows the bot.
@@ -427,9 +535,10 @@ What later phases need from it:
   5. To try the operator's side: `/start` says the id of your account. In Swagger UI, as the admin, `PUT /api/users/{id}/role` with `{"role": "operator"}`. Then `/pending`, `/plan` and `/status` in the chat.
 
   If something that Telegram answers differs from what the stand-in answered (D64), it shows in `docker compose logs bot` as a warning with Telegram's own words.
-- For the optional free text of the bot in Phase 8: an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58).
-- If the bootcamp holds the result to the approved description: whether the bot may come without its LLM part (D58).
-- If the bootcamp grades against a rubric (coverage, report, presentation format), it gets folded into Phase 8.
+
+  With `GEOCODER_URL` set as well, step 4 has a second way in: write an address where the location was shared, and press the button of the place.
+- For the free text of the bot, which Phase 8 left out: an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58). The item is described under Phase 8 as it was planned.
+- The owner said on 2026-10-12 that the bootcamp holds the project to nothing formal: no rubric, and no word on whether the bot may come without its LLM part. If that changes, the README's paragraph on the bot is where the difference from the approved description is said.
 
 ## Verification
 
@@ -441,3 +550,6 @@ What later phases need from it:
 6. Tracing: take the `X-Request-Id` of the plan request and find it in the logs of the API and of every solver that worked on that plan. The demo scripts print the one they sent.
 7. Offline: disconnect the network and repeat step 2 without `--build`, which asks the registry (D54). Routes draw without map tiles. The bot idles if it has no token, and with one it says that it cannot reach Telegram and goes on trying (D62).
 8. Bot: place an order by chat and see it on the map, as "Needed from the project owner" says step by step. Without a token: `cargo test -p routeforge-bot` places the same order against a stand-in for Telegram (D64), and an order placed through the API appears on an open page without Refresh (D63).
+9. Roads: `scripts/osrm-prepare`, the two lines in `.env`, and step 2 again. Every route says `by road`, and the day is several times as long as it was. `docker compose stop osrm` in the middle of a plan leaves the plan done, with the routes that came after it `as the crow flies` (D66).
+10. Load: on the page, each route says the most its van has on board, and none says more than the van carries. With the demo city's vans, three of four leave the depot full (D65).
+11. Numbers: `cargo run -p routeforge-tsp --release --example quality` and `cargo bench -p routeforge-tsp` print what the README's tables were made from.

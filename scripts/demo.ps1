@@ -301,11 +301,13 @@ try {
     }
     $couriers = @(Api GET '/api/couriers')
     if ($couriers.Count -eq 0) {
-        # As the page sets up its demo city. A demo order has a demand of 1 to 3, so a
-        # day asks for twice its number, and four vans take that with a tenth to spare.
+        # As the page sets up its demo city. A demo order has a demand of 1 to 3, and
+        # four in five are deliveries, so a day sends 1.6 times its number out of the
+        # depot. That is what a van needs room for: a pickup comes on board when
+        # deliveries are off (D65). Four vans take it with a tenth to spare.
         $sizedFor = 300
         if ($Orders -gt 0) { $sizedFor = $Orders }
-        $capacity = [int][math]::Ceiling($sizedFor * 2 * 1.1 / 4)
+        $capacity = [int][math]::Ceiling($sizedFor * 2 * 0.8 * 1.1 / 4)
         foreach ($van in 1..4) {
             Api POST '/api/couriers' @{ name = "Van $van"; capacity = $capacity } | Out-Null
         }
@@ -318,7 +320,7 @@ try {
             # That sum turned round: as many orders as the couriers carry with a tenth to
             # spare. Then every courier gets a route, and every solver has one to search for.
             $carried = ($couriers | Where-Object { $_.active } | Measure-Object capacity -Sum).Sum
-            $count = [int][math]::Max(1, [math]::Min(2000, [math]::Floor($carried / 2.2)))
+            $count = [int][math]::Max(1, [math]::Min(2000, [math]::Floor($carried / 1.76)))
         }
         $made = Api POST '/api/demo/orders' @{ service_date = $Day; count = $count; seed = $Seed }
         Write-Host "Generated $($made.created) orders for $Day, with seed $Seed."

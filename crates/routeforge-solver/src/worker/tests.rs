@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use routeforge_domain::db::queue::{MAX_ATTEMPTS, PLANS_CHANNEL, PROGRESS_CHANNEL};
 use routeforge_domain::db::{orders, plans, routes};
 use routeforge_domain::{
-    CourierId, Job, JobKind, JobStatus, Order, OrderId, OrderStatus, Plan, PlanCounts, PlanId,
-    PlanStatus, RouteProgress,
+    CourierId, Job, JobKind, JobStatus, Order, OrderId, OrderKind, OrderStatus, Plan, PlanCounts,
+    PlanId, PlanStatus, RouteProgress,
 };
 use sqlx::postgres::PgListener;
 
@@ -54,9 +54,11 @@ async fn a_route_being_searched(pool: &PgPool, plan_id: PlanId) -> Job {
 
 #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
 async fn three_workers_route_every_order_once_within_capacity(pool: PgPool) {
-    let city = testing::city(&pool, &[40, 40, 40, 40, 40]).await;
+    // Sixty orders of two parcels or so, two in three of them deliveries: some eighty
+    // parcels leave the depot, on couriers that carry twenty-five.
+    let city = testing::city(&pool, &[25, 25, 25, 25, 25]).await;
     let placed = city.mixed_orders(&pool, date(12), 60, 7).await;
-    let too_large = city.order(&pool, date(12), 41).await;
+    let too_large = city.order(&pool, date(12), 26).await;
     let tomorrow = city.orders(&pool, date(13), 3, 8).await;
 
     // Workers that would not look at the queue by themselves for most of a minute.
@@ -97,6 +99,38 @@ async fn three_workers_route_every_order_once_within_capacity(pool: PgPool) {
         assert_eq!((job.status, job.attempt), (JobStatus::Done, 1));
         assert_eq!(job.request_id.as_deref(), Some("req-e2e"));
     }
+    fleet.stop().await;
+}
+
+/// What the plan job clusters by and what the route job searches within is one
+/// reckoning of the load (D65). A courier takes a delivery and pickups that would not
+/// fit it together, and calls so that they never are on board together.
+#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+async fn a_courier_that_leaves_full_delivers_before_it_picks_up(pool: PgPool) {
+    // On the corners of a rectangle, for a courier that carries two: the order
+    // opposite the depot is a delivery of two, and its neighbours a pickup of one each.
+    let city = testing::city(&pool, &[2]).await;
+    let mut placed = Vec::new();
+    for (off, kind, demand) in [
+        ((0.0, 0.01), OrderKind::Pickup, 1),
+        ((0.01, 0.01), OrderKind::Delivery, 2),
+        ((0.01, 0.0), OrderKind::Pickup, 1),
+    ] {
+        placed.push(city.order_at(&pool, date(12), off, kind, demand).await);
+    }
+
+    let fleet = Fleet::with_workers(&pool, testing::config(), 1);
+    let new = city.new_plan(date(12), moves(1_000));
+    let plan = plans::submit(&pool, &new, None).await.unwrap();
+    let plan = done(&pool, plan.id).await;
+
+    // Four parcels in all, and one route: two go out, and two come back.
+    assert_eq!((plan.orders_unassigned, plan.routes_total), (0, 1));
+    assert_routed_once(&pool, &city, plan.id, &placed).await;
+    let stored = routes::list_for_plan(&pool, plan.id).await.unwrap();
+    // Round the rectangle would be shorter, and would begin with a pickup.
+    assert_eq!(stored[0].stops[0].order_id, placed[1].id);
+    assert_eq!(testing::most_on_board(&stored[0].stops), 2);
     fleet.stop().await;
 }
 

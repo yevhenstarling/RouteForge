@@ -348,11 +348,13 @@ if [ "$depot" = 404 ]; then
 fi
 couriers=$(api GET /api/couriers)
 if [ "$(json "$couriers" length)" = 0 ]; then
-    # As the page sets up its demo city. A demo order has a demand of 1 to 3, so a day
-    # asks for twice its number, and four vans take that with a tenth to spare.
+    # As the page sets up its demo city. A demo order has a demand of 1 to 3, and four in
+    # five are deliveries, so a day sends 1.6 times its number out of the depot. That is
+    # what a van needs room for: a pickup comes on board when deliveries are off (D65).
+    # Four vans take it with a tenth to spare.
     sized_for=300
     if [ "$orders" -gt 0 ]; then sized_for=$orders; fi
-    capacity=$(jq -n --argjson orders "$sized_for" '$orders * 2 * 1.1 / 4 | ceil')
+    capacity=$(jq -n --argjson orders "$sized_for" '$orders * 2 * 0.8 * 1.1 / 4 | ceil')
     for van in 1 2 3 4; do
         api POST /api/couriers "$(jq -n --arg name "Van $van" --argjson capacity "$capacity" \
             '{name: $name, capacity: $capacity}')" >/dev/null
@@ -366,7 +368,7 @@ if [ "$(json "$existing" length)" = 0 ]; then
     if [ "$count" -le 0 ]; then
         # That sum turned round: as many orders as the couriers carry with a tenth to
         # spare. Then every courier gets a route, and every solver has one to search for.
-        count=$(json "$couriers" '[.[] | select(.active) | .capacity] | add // 0 | . / 2.2 | floor
+        count=$(json "$couriers" '[.[] | select(.active) | .capacity] | add // 0 | . / 1.76 | floor
             | if . < 1 then 1 elif . > 2000 then 2000 else . end')
     fi
     made=$(api POST /api/demo/orders "$(jq -n --arg day "$day" --argjson count "$count" --argjson seed "$seed" \

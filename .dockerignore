@@ -5,6 +5,8 @@ target/
 .claude/
 .idea/
 .vscode/
+# The roads of the `osrm` profile: hundreds of megabytes that no image is built from.
+osrm/
 
 # Not needed to build an image. Left out, a change to them rebuilds nothing.
 .github/

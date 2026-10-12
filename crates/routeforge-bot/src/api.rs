@@ -18,8 +18,8 @@ use anyhow::Context;
 use chrono::NaiveDate;
 use reqwest::{Client, RequestBuilder};
 use routeforge_domain::{
-    Order, OrderFilter, OrderId, OrderRequest, Plan, PlanFilter, PlanRequest, Problem, Session,
-    TelegramLogin,
+    Depot, Order, OrderFilter, OrderId, OrderRequest, Plan, PlanFilter, PlanRequest, Problem,
+    Session, TelegramLogin,
 };
 use serde::de::DeserializeOwned;
 
@@ -100,6 +100,13 @@ pub(crate) trait Api: Send + Sync + 'static {
         who: &Caller<'_>,
         day: NaiveDate,
     ) -> impl Future<Output = Result<Vec<Plan>, Failure>> + Send;
+
+    /// The depot as it is now, which anyone who is logged in may read. `None` if none
+    /// has been set yet.
+    fn get_depot(
+        &self,
+        who: &Caller<'_>,
+    ) -> impl Future<Output = Result<Option<Depot>, Failure>> + Send;
 }
 
 /// The API over HTTP.
@@ -245,6 +252,16 @@ impl Api for HttpApi {
         let filter = PlanFilter { service_date: day };
         let asked = self.client.get(self.url("/api/plans")).query(&filter);
         self.answer(asked, who.token, who.request_id).await
+    }
+
+    async fn get_depot(&self, who: &Caller<'_>) -> Result<Option<Depot>, Failure> {
+        let asked = self.client.get(self.url("/api/depot"));
+        match self.answer(asked, who.token, who.request_id).await {
+            Ok(depot) => Ok(Some(depot)),
+            // The API's word for a depot that has not been set yet.
+            Err(Failure::Refused { status: 404, .. }) => Ok(None),
+            Err(failure) => Err(failure),
+        }
     }
 }
 

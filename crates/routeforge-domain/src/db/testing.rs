@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 use super::queue::{self, ClaimedJob};
 use super::{couriers, depots, orders, plans, routes, users};
-use crate::geo::LatLon;
+use crate::geo::{Distances, LatLon};
 use crate::ids::{CourierId, JobId, OrderId, UserId};
 use crate::job::JobPayload;
 use crate::model::{
@@ -180,6 +180,7 @@ pub(crate) async fn complete_route(pool: &PgPool, job: &ClaimedJob) -> Option<Pl
         plan_id: *plan_id,
         courier_id: *courier_id,
         distance_m: 1_000,
+        distances: Distances::GreatCircle,
         stops: order_ids.clone(),
     };
     routes::insert(completion.conn(), &route).await.unwrap();

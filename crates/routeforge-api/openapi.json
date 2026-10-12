@@ -8,7 +8,7 @@
             "type": "boolean"
           },
           "capacity": {
-            "description": "How much demand one route of this courier may carry (D7).",
+            "description": "How much the courier can have on board at one time. A route may ask for more\nthan that in all: what is delivered is off before what is picked up comes on\n(D65).",
             "format": "int32",
             "minimum": 0,
             "type": "integer"
@@ -127,6 +127,14 @@
       "DepotId": {
         "description": "One version of the depot's name and position.",
         "format": "uuid",
+        "type": "string"
+      },
+      "Distances": {
+        "description": "What a distance was measured along (D66).",
+        "enum": [
+          "great_circle",
+          "road"
+        ],
         "type": "string"
       },
       "FieldError": {
@@ -654,6 +662,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "distances": {
+            "$ref": "#/components/schemas/Distances",
+            "description": "What that length was measured along. Roads, where the solver has a routing\nservice to ask and was answered, and great circles otherwise (D66)."
+          },
           "id": {
             "$ref": "#/components/schemas/RouteId"
           },
@@ -673,6 +685,7 @@
           "plan_id",
           "courier_id",
           "distance_m",
+          "distances",
           "stops"
         ],
         "type": "object"
@@ -1022,7 +1035,7 @@
   "paths": {
     "/api/auth/login": {
       "post": {
-        "description": "The token of the answer goes with every later request, as\n`Authorization: Bearer <token>`. It says who the user is and what their role was at\nthis moment, and is good for `expires_in` seconds.",
+        "description": "The token of the answer goes with every later request, as\n`Authorization: Bearer <token>`. It says who the user is and what their role was at\nthis moment, and is good for `expires_in` seconds.\n\nOnly so many logins are taken for one address within a minute. After that the next\nis refused, right password or wrong, until the minute is over. A login that\nsucceeds clears the count.",
         "operationId": "login",
         "requestBody": {
           "content": {
@@ -1054,6 +1067,26 @@
               }
             },
             "description": "The address or the password is wrong"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too many logins were tried for this address. `Retry-After` says in how many seconds the next may be"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The server has too many passwords to check at this moment. `Retry-After` says when to try again"
           }
         },
         "summary": "Log in",
@@ -1106,6 +1139,16 @@
               }
             },
             "description": "Something in the request cannot be accepted. `errors` names the fields, where it is known which"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The server has too many passwords to check at this moment. `Retry-After` says when to try again"
           }
         },
         "summary": "Open an account",
@@ -1613,6 +1656,64 @@
           }
         ],
         "summary": "Set the depot",
+        "tags": [
+          "depot"
+        ]
+      }
+    },
+    "/api/depots/{id}": {
+      "get": {
+        "description": "One version of the depot, by its id: the depot a plan was made for, which its\n`depot_id` names. It is the depot as it is now, unless the depot was moved since.\nAnyone who is logged in may read it, like the depot itself.",
+        "operationId": "get_depot_version",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Depot"
+                }
+              }
+            },
+            "description": "The depot, as it was set then"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No token was sent, or the one sent is not valid or has expired"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "There is no such thing, or none the caller may know of"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Read the depot as it was",
         "tags": [
           "depot"
         ]

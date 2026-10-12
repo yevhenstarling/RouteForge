@@ -19,7 +19,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use super::*;
 use crate::chat::Press;
 use crate::testing::{
-    ADA, BOT_TOKEN, SENT, Telegram, a_user, an_order, documented, message_update,
+    ADA, BOT_TOKEN, SENT, Telegram, a_depot, a_user, an_order, documented, message_update,
     message_update_in, press_update, soon, telegram_says_no,
 };
 
@@ -41,8 +41,13 @@ struct Running {
 }
 
 fn start(telegram: &Telegram, api_url: &str) -> Running {
+    start_with(telegram, api_url, None)
+}
+
+/// The same bot, given something to ask where an address is, or nothing (D72).
+fn start_with(telegram: &Telegram, api_url: &str, geocoder: Option<Nominatim>) -> Running {
     let bot = bot(BOT_TOKEN, Some(telegram.url())).unwrap();
-    let chats = Arc::new(Chats::new(HttpApi::new(api_url, KEY).unwrap()));
+    let chats = Arc::new(Chats::new(HttpApi::new(api_url, KEY).unwrap(), geocoder));
     let (stop, stopping) = watch::channel(false);
     Running {
         stop,
@@ -281,6 +286,105 @@ async fn a_venue_is_a_place_and_what_is_neither_a_place_nor_words_is_told_so() {
     assert!(api.received_requests().await.unwrap().is_empty());
 }
 
+/// A bot that was given a geocoding service takes an address in words (D72): the
+/// words go to that service and to nobody else, the place it found is shown with a
+/// button, and the press of it begins the order.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_in_words_is_asked_of_the_service_the_bot_was_given() {
+    const KHRESHCHATYK: &str = "22, Хрещатик вулиця, Липки, Київ, 01001, Україна";
+    let telegram = Telegram::with(vec![
+        message_update(1, 10, json!({ "text": "Хрещатик 22" })),
+        press_update(2, SENT, &Press::Found(10, 0).data()),
+    ])
+    .await;
+    let api = an_api().await;
+    let (verb, at) = documented("get_depot");
+    Mock::given(method(verb.as_str()))
+        .and(path(at))
+        .respond_with(ResponseTemplate::new(200).set_body_json(a_depot()))
+        .mount(&api)
+        .await;
+    // The service, answering as Nominatim does: the two numbers as text.
+    let places = MockServer::start().await;
+    let found = json!([{
+        "lat": "50.4476532",
+        "lon": "30.5222416",
+        "display_name": KHRESHCHATYK,
+    }]);
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(found))
+        .mount(&places)
+        .await;
+    let geocoder = Nominatim::new(&places.uri().parse().unwrap()).unwrap();
+    let running = start_with(&telegram, &api.uri(), Some(geocoder));
+
+    // The place is shown under the address, with where it is from, and the press
+    // puts the first question of an order where the place stood.
+    let changed = telegram.until_asked("editMessageText", 1).await;
+    let said = telegram.asked("sendMessage").await;
+    assert_eq!(said.len(), 1, "{said:#?}");
+    assert_eq!(
+        text_of(&said[0]),
+        format!("Is it this place?\n{KHRESHCHATYK}\n\nPlaces: © OpenStreetMap contributors.")
+    );
+    assert_eq!(
+        said[0]["reply_markup"]["inline_keyboard"],
+        json!([
+            [{ "text": "Yes, an order there", "callback_data": "f:10:0" }],
+            [{ "text": "No", "callback_data": "fx:10" }],
+        ])
+    );
+    assert_eq!(
+        text_of(&changed[0]),
+        format!(
+            "An order at {KHRESHCHATYK} (50.44765, 30.52224).\n\
+             Is it a delivery to there, or a pickup from there?"
+        )
+    );
+    assert_eq!(changed[0]["message_id"], SENT);
+    running.stopped().await.0.unwrap();
+
+    // The service was asked once: for the words, near the depot, by the bot under
+    // its own name. Whose address it is, it was not told: nothing of Ada's is sent,
+    // and neither is the bot's key.
+    let asked = places.received_requests().await.unwrap();
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    let query: Vec<(String, String)> = asked[0]
+        .url
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    let expected = [
+        ("q", "Хрещатик 22"),
+        ("format", "jsonv2"),
+        ("limit", "10"),
+        ("viewbox", "29.7348,49.9500,31.3052,50.9500"),
+    ]
+    .map(|(name, value)| (name.to_owned(), value.to_owned()));
+    assert_eq!(query, expected);
+    assert!(header(&asked[0], "user-agent").starts_with("routeforge-bot/"));
+    for (name, _) in &asked[0].headers {
+        let any_request_has_it = ["accept", "accept-encoding", "host", "user-agent"];
+        assert!(any_request_has_it.contains(&name.as_str()), "{name}");
+    }
+    assert!(asked[0].body.is_empty(), "{:?}", asked[0].body);
+
+    // The API was asked who Ada is and, as Ada, where the depot is: to look round
+    // it. Both by the message, and nothing by the press.
+    let asked = api.received_requests().await.unwrap();
+    let paths: Vec<&str> = asked.iter().map(|request| request.url.path()).collect();
+    assert_eq!(paths, ["/api/auth/telegram", "/api/depot"]);
+    assert_eq!(header(&asked[0], "authorization"), format!("Bearer {KEY}"));
+    assert_eq!(
+        header(&asked[1], "authorization"),
+        format!("Bearer {TOKEN}")
+    );
+    for request in &asked {
+        assert_eq!(header(request, "x-request-id"), "tg-1");
+    }
+}
+
 /// `/start` shows the button that shares a location, and says who the person is.
 #[tokio::test(flavor = "multi_thread")]
 async fn start_offers_the_button_that_shares_a_location() {
@@ -393,7 +497,8 @@ async fn told_to_stop_while_telegram_is_away_the_bot_stops_at_once() {
         .parse()
         .unwrap();
     drop(nobody);
-    let chats = Arc::new(Chats::new(HttpApi::new("http://127.0.0.1:9", KEY).unwrap()));
+    let api = HttpApi::new("http://127.0.0.1:9", KEY).unwrap();
+    let chats = Arc::new(Chats::new(api, None));
     let (stop, stopping) = watch::channel(false);
     // A bot that would wait a minute between its attempts.
     let patient = Pace {

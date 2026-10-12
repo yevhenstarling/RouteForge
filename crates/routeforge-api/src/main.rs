@@ -24,6 +24,8 @@
 //! | `API_BUDGET_MAX_MS` | 300000 | The longest a plan may ask for, for each route. |
 //! | `API_BUDGET_MAX_ITERATIONS` | 10000000000 | The most candidate moves a plan may ask for, for each route. |
 //! | `API_WORKER_ALIVE_SECS` | 15 | A worker seen within this long counts as alive. |
+//! | `API_LOGIN_ATTEMPTS` | 5 | How many logins are taken for one address within a minute. |
+//! | `API_HASHES_AT_ONCE` | 4 | How many passwords are hashed at the same time. Each takes 19 MiB. |
 //! | `LOG_FORMAT` | `text` | `json` for one JSON object per line. |
 //! | `RUST_LOG` | `info` | What to log, in the syntax of `tracing`'s `EnvFilter`. |
 //!
@@ -38,6 +40,7 @@ mod auth;
 mod config;
 mod error;
 mod events;
+mod logins;
 mod page;
 mod probe;
 mod request_id;
@@ -59,6 +62,7 @@ use crate::app::{AppState, app};
 use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::{Config, Secrets};
 use crate::events::Events;
+use crate::logins::Logins;
 use crate::stream::Pace;
 
 /// How long the requests in hand are given to finish once the API is told to stop.
@@ -90,11 +94,15 @@ async fn serve() -> anyhow::Result<()> {
         ?config,
         "the API is starting"
     );
+    // Said every time it starts so: the API cannot tell who reaches its port (D70).
+    if let Some(warning) = secrets.demo_warning() {
+        warn!("{warning}");
+    }
 
     let pool = startup::connect(&secrets.database_url).await?;
     startup::migrate(&pool).await?;
     info!("the database has the schema");
-    let passwords = Passwords::new()?;
+    let passwords = Passwords::new(config.hashes_at_once)?;
     if let Some(admin) = &secrets.admin {
         startup::seed_admin(&pool, &passwords, admin).await?;
     }
@@ -106,6 +114,7 @@ async fn serve() -> anyhow::Result<()> {
         pool: pool.clone(),
         tokens: Tokens::new(secrets.jwt_secret.as_bytes(), config.token_ttl),
         passwords,
+        logins: Logins::new(config.login_attempts, logins::WINDOW),
         bot_key: secrets.bot_key.as_deref().map(ServiceKey::new),
         bot_token_ttl: config.bot_token_ttl,
         limits: config.limits,

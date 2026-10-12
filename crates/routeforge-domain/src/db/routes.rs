@@ -31,17 +31,18 @@ pub async fn insert(executor: impl PgExecutor<'_>, new: &NewRoute) -> Result<Rou
     let order_ids: Vec<Uuid> = new.stops.iter().map(|order| order.0).collect();
     sqlx::query!(
         "WITH route AS (
-             INSERT INTO routes (id, plan_id, courier_id, distance_m)
-             VALUES ($1, $2, $3, $4)
+             INSERT INTO routes (id, plan_id, courier_id, distance_m, distances)
+             VALUES ($1, $2, $3, $4, $5)
              RETURNING id
          )
          INSERT INTO route_stops (route_id, position, order_id)
          SELECT route.id, (stop.number - 1)::integer, stop.order_id
-         FROM route, unnest($5::uuid[]) WITH ORDINALITY AS stop (order_id, number)",
+         FROM route, unnest($6::uuid[]) WITH ORDINALITY AS stop (order_id, number)",
         id.0,
         new.plan_id.0,
         new.courier_id.0,
         distance_m,
+        new.distances.as_str(),
         &order_ids,
     )
     .execute(executor)
@@ -56,7 +57,7 @@ pub async fn list_for_plan(
 ) -> Result<Vec<Route>, DbError> {
     // One row per stop, and one row with nulls for a route without stops.
     let rows = sqlx::query!(
-        r#"SELECT routes.id, routes.courier_id, routes.distance_m,
+        r#"SELECT routes.id, routes.courier_id, routes.distance_m, routes.distances,
                   stops.order_id AS "order_id?", orders.kind AS "kind?",
                   orders.lat AS "lat?", orders.lon AS "lon?", orders.demand AS "demand?"
            FROM routes
@@ -81,6 +82,7 @@ pub async fn list_for_plan(
                 plan_id,
                 courier_id: row.courier_id.into(),
                 distance_m,
+                distances: parsed(&row.distances)?,
                 stops: Vec::new(),
             });
         }
@@ -108,8 +110,61 @@ mod tests {
     use super::*;
     use crate::db::testing::{self, date};
     use crate::db::{couriers, orders};
+    use crate::geo::Distances;
     use crate::ids::{CourierId, OrderId};
     use crate::model::{OrderKind, Role};
+
+    /// The schema repeats the values of the enumeration in a check (D19). Each of them
+    /// is stored and read back, so the two cannot drift apart unnoticed.
+    #[sqlx::test]
+    async fn a_route_says_what_its_length_was_measured_along(pool: PgPool) {
+        let plan = testing::plan(&pool, date(12)).await;
+        let mut stored = Vec::new();
+        for &distances in Distances::ALL {
+            let courier = testing::courier(&pool, 10).await;
+            let route = NewRoute {
+                plan_id: plan.id,
+                courier_id: courier.id,
+                distance_m: 100,
+                distances,
+                stops: Vec::new(),
+            };
+            insert(&pool, &route).await.unwrap();
+            stored.push((courier.id, distances));
+        }
+        let listed: Vec<(CourierId, Distances)> = list_for_plan(&pool, plan.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|route| (route.courier_id, route.distances))
+            .collect();
+        assert_eq!(listed, stored);
+
+        // A route from before the column was there was measured along great circles.
+        let courier = testing::courier(&pool, 10).await;
+        sqlx::query(
+            "INSERT INTO routes (id, plan_id, courier_id, distance_m) VALUES ($1, $2, $3, 7)",
+        )
+        .bind(RouteId::generate().0)
+        .bind(plan.id.0)
+        .bind(courier.id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let listed = list_for_plan(&pool, plan.id).await.unwrap();
+        assert_eq!(listed.last().unwrap().distances, Distances::GreatCircle);
+
+        // And nothing else is stored there.
+        let error = sqlx::query("UPDATE routes SET distances = 'by_rail' WHERE plan_id = $1")
+            .bind(plan.id.0)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            is_violation_of(&DbError::from(error), "routes_distances_check"),
+            "another check refused it"
+        );
+    }
 
     fn is_violation_of(error: &DbError, constraint: &str) -> bool {
         matches!(error, DbError::Sqlx(sqlx::Error::Database(database))
@@ -134,6 +189,7 @@ mod tests {
                 plan_id: plan.id,
                 courier_id: courier.id,
                 distance_m: 12_345,
+                distances: Distances::GreatCircle,
                 stops: calling_order.clone(),
             },
         )
@@ -175,6 +231,7 @@ mod tests {
                 plan_id: plan.id,
                 courier_id: courier.id,
                 distance_m: 1_000 * stops as u64,
+                distances: Distances::GreatCircle,
                 stops: order_ids.clone(),
             };
             insert(&pool, &new).await.unwrap();
@@ -187,6 +244,7 @@ mod tests {
             plan_id: other_plan.id,
             courier_id: courier.id,
             distance_m: 5,
+            distances: Distances::GreatCircle,
             stops: vec![stranger.id],
         };
         insert(&pool, &elsewhere).await.unwrap();
@@ -219,6 +277,7 @@ mod tests {
             plan_id: plan.id,
             courier_id: courier,
             distance_m: 100,
+            distances: Distances::GreatCircle,
             stops,
         };
         let first = testing::courier(&pool, 10).await.id;
@@ -257,6 +316,7 @@ mod tests {
             plan_id: plan.id,
             courier_id: courier.id,
             distance_m: 0,
+            distances: Distances::GreatCircle,
             stops: Vec::new(),
         };
         insert(&pool, &route).await.unwrap();
@@ -302,6 +362,7 @@ mod tests {
             plan_id: plan.id,
             courier_id: courier.id,
             distance_m: u64::MAX,
+            distances: Distances::GreatCircle,
             stops: Vec::new(),
         };
         let error = insert(&pool, &route).await.unwrap_err();

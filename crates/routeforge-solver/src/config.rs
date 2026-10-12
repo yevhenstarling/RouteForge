@@ -1,8 +1,10 @@
 //! The solver's settings, read from the environment.
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
+use reqwest::Url;
 
 /// No span of time is set longer than a day. That keeps the arithmetic on them far
 /// from overflowing, and a longer one would be a mistake anyway.
@@ -36,6 +38,30 @@ pub(crate) struct Config {
     /// How often, at most, a route search under way announces how far it has got and
     /// with which route, to whoever watches its plan (D49).
     pub(crate) progress: Duration,
+    /// The OSRM server to ask for road distances, if there is one. Without it the
+    /// distances are great circles, which need nothing outside the process (D8, D66).
+    pub(crate) roads: Option<Roads>,
+}
+
+/// An OSRM server and how long it is waited for.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Roads {
+    /// Where the server is. It carries no password, so it can be logged.
+    pub(crate) url: Url,
+    /// How long the server is given to answer for one route. After that the route is
+    /// searched for on great circles.
+    pub(crate) within: Duration,
+}
+
+// Written by hand so that the address is logged as it is written, and not taken apart
+// into the nine things an address is made of.
+impl fmt::Debug for Roads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Roads")
+            .field("url", &self.url.as_str())
+            .field("within", &self.within)
+            .finish()
+    }
 }
 
 impl Config {
@@ -80,12 +106,21 @@ impl Config {
             PROGRESS_MS.start(),
             PROGRESS_MS.end()
         );
+        // How long the server may take is read only where there is a server.
+        let roads = match address(&var, "OSRM_URL")? {
+            Some(url) => Some(Roads {
+                url,
+                within: seconds("OSRM_TIMEOUT_SECS", 20)?,
+            }),
+            None => None,
+        };
         let config = Self {
             concurrency,
             lease: seconds("SOLVER_LEASE_SECS", 30)?,
             heartbeat: seconds("SOLVER_HEARTBEAT_SECS", 5)?,
             poll: seconds("SOLVER_POLL_SECS", 5)?,
             progress: Duration::from_millis(progress),
+            roads,
         };
         // One heartbeat that does not get through must not cost the job.
         ensure!(
@@ -103,6 +138,31 @@ impl Config {
     pub(crate) fn connections(&self) -> u32 {
         1 + 3 * self.concurrency
     }
+}
+
+/// The address a setting names, of something that is spoken to over HTTP. `None` if
+/// the variable is missing or empty.
+///
+/// What was given is not repeated when it is refused. An address can carry a password,
+/// and this ends in a log. For the same reason one that does carry a user or a
+/// password is refused: the settings are logged when the solver starts.
+fn address(var: &impl Fn(&str) -> Option<String>, name: &str) -> anyhow::Result<Option<Url>> {
+    let Some(value) = var(name).filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let url = Url::parse(value.trim())
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        .with_context(|| format!("{name} must be an address like http://127.0.0.1:5000"))?;
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "{name} must not carry a user or a password"
+    );
+    ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "{name} must be an address, with nothing after its path"
+    );
+    Ok(Some(url))
 }
 
 /// Where the database is. Kept out of [`Config`], which is logged, because it holds
@@ -134,9 +194,65 @@ mod tests {
                 heartbeat: Duration::from_secs(5),
                 poll: Duration::from_secs(5),
                 progress: Duration::from_millis(250),
+                // No routing service: great circles, which need nothing (D8).
+                roads: None,
             }
         );
         assert_eq!(config.connections(), 4);
+    }
+
+    #[test]
+    fn a_routing_service_is_an_address_and_a_time_to_wait() {
+        let config = from(&[("OSRM_URL", " http://osrm:5000 ")]).unwrap();
+        let roads = config.roads.unwrap();
+        assert_eq!(roads.url.as_str(), "http://osrm:5000/");
+        assert_eq!(roads.within, Duration::from_secs(20));
+        // As it is logged when the solver starts.
+        assert_eq!(
+            format!("{roads:?}"),
+            r#"Roads { url: "http://osrm:5000/", within: 20s }"#
+        );
+
+        let config = from(&[
+            ("OSRM_URL", "http://127.0.0.1:5001/roads"),
+            ("OSRM_TIMEOUT_SECS", "3"),
+        ])
+        .unwrap();
+        let roads = config.roads.unwrap();
+        assert_eq!(roads.url.as_str(), "http://127.0.0.1:5001/roads");
+        assert_eq!(roads.within, Duration::from_secs(3));
+
+        // Docker Compose passes a variable that is not set as an empty one.
+        assert_eq!(from(&[("OSRM_URL", "")]).unwrap().roads, None);
+        // How long to wait says nothing without a service to wait for, mistyped or not.
+        assert_eq!(from(&[("OSRM_TIMEOUT_SECS", "soon")]).unwrap().roads, None);
+    }
+
+    #[test]
+    fn an_address_that_is_none_is_refused_and_not_repeated() {
+        for (value, what) in [
+            ("osrm:5000", "an address like"),
+            ("ftp://osrm:5000", "an address like"),
+            ("http://", "an address like"),
+            ("not an address", "an address like"),
+            ("http://solver:hunter2@osrm:5000", "a user or a password"),
+            ("http://solver@osrm:5000", "a user or a password"),
+            ("http://osrm:5000/?profile=car", "nothing after its path"),
+            ("http://osrm:5000/#table", "nothing after its path"),
+        ] {
+            let error = from(&[("OSRM_URL", value)]).unwrap_err().to_string();
+            assert!(error.contains("OSRM_URL"), "{value}: {error}");
+            assert!(error.contains(what), "{value}: {error}");
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+        for value in ["0", "86401", "a while"] {
+            let set = [
+                ("OSRM_URL", "http://osrm:5000"),
+                ("OSRM_TIMEOUT_SECS", value),
+            ];
+            let error = from(&set).unwrap_err().to_string();
+            assert!(error.contains("OSRM_TIMEOUT_SECS"), "{value}: {error}");
+        }
     }
 
     #[test]
@@ -157,6 +273,7 @@ mod tests {
                 heartbeat: Duration::from_secs(2),
                 poll: Duration::from_secs(1),
                 progress: Duration::from_secs(1),
+                roads: None,
             }
         );
         assert_eq!(config.connections(), 10);
@@ -198,5 +315,104 @@ mod tests {
         assert!(error.to_string().contains("at least twice"), "{error}");
 
         from(&[("SOLVER_LEASE_SECS", "10"), ("SOLVER_HEARTBEAT_SECS", "5")]).unwrap();
+    }
+
+    /// The lines of one service in `docker-compose.yml`, as they are on a clone that
+    /// has no `.env`: every `${VARIABLE:-fallback}` replaced by its fallback.
+    fn service_of_the_stack(name: &str) -> Vec<String> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docker-compose.yml");
+        let compose = std::fs::read_to_string(path).unwrap();
+        let opening = format!("  {name}:");
+        compose
+            .lines()
+            .skip_while(|line| *line != opening)
+            .skip(1)
+            // The service ends where a line is indented as little as its own name.
+            .take_while(|line| line.starts_with("    ") || line.trim().is_empty())
+            .map(|line| fallbacks(line.trim()))
+            .collect()
+    }
+
+    /// `text` with every `${VARIABLE:-fallback}` replaced by its fallback. A variable
+    /// without one would be empty on a fresh clone, which is what must not be.
+    fn fallbacks(text: &str) -> String {
+        let mut resolved = String::new();
+        let mut rest = text;
+        while let Some((before, variable)) = rest.split_once("${") {
+            let (variable, after) = variable.split_once('}').expect("a `${` is closed");
+            let (_, fallback) = variable
+                .split_once(":-")
+                .unwrap_or_else(|| panic!("${{{variable}}} has nothing to fall back on"));
+            resolved.push_str(before);
+            resolved.push_str(fallback);
+            rest = after;
+        }
+        resolved + rest
+    }
+
+    /// What a service is given for a variable, on a clone that has no `.env`.
+    fn given(service: &[String], name: &str) -> Option<String> {
+        service.iter().find_map(|line| {
+            let (key, value) = line.split_once(": ")?;
+            (key == name).then(|| value.to_owned())
+        })
+    }
+
+    /// A fresh clone has no `.env` (D54), and on one the stack asks nobody for
+    /// anything (D8). So the solvers are started with no routing service to ask, and
+    /// the one in the compose file stays out until somebody asks for it (D67).
+    #[test]
+    fn the_stack_starts_its_solvers_with_nobody_to_ask_for_distances() {
+        let solver = service_of_the_stack("solver");
+        let on_a_clone = |name: &str| given(&solver, name);
+
+        assert_eq!(Config::from_vars(on_a_clone).unwrap(), from(&[]).unwrap());
+        // On the compose network, where the database is `db`.
+        let database = on_a_clone("DATABASE_URL").expect("a database to work on");
+        assert!(database.ends_with("@db:5432/routeforge"), "{database}");
+
+        // The routing service is in the file, behind a profile, and nothing waits
+        // for it: a solver that gets no answer falls back, route by route (D66).
+        let osrm = service_of_the_stack("osrm");
+        assert!(
+            osrm.contains(&"profiles: [\"osrm\"]".to_owned()),
+            "{osrm:#?}"
+        );
+        assert!(!solver.contains(&"osrm:".to_owned()), "{solver:#?}");
+        // Given its roads to read and no more, and open to this machine alone.
+        assert!(osrm.contains(&"- ./osrm:/data:ro".to_owned()), "{osrm:#?}");
+        let published = "- \"127.0.0.1:5000:5000\"".to_owned();
+        assert!(osrm.contains(&published), "{osrm:#?}");
+    }
+
+    /// A setting that compose does not hand on is one that `.env` cannot set: the
+    /// container never sees it. So every variable the solver reads is named in its
+    /// service.
+    #[test]
+    fn every_setting_the_solver_reads_is_one_compose_hands_on() {
+        let solver = service_of_the_stack("solver");
+        let read = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        // With a routing service named, so that how long to wait for it is read too.
+        let noting = |name: &str| {
+            read.borrow_mut().insert(name.to_owned());
+            match name {
+                "OSRM_URL" => Some("http://osrm:5000".to_owned()),
+                other => given(&solver, other),
+            }
+        };
+        let config = Config::from_vars(noting).unwrap();
+        assert!(config.roads.is_some());
+
+        let read = read.into_inner();
+        assert!(read.len() >= 7, "{read:?}");
+        for name in read {
+            let handed_on = solver
+                .iter()
+                .any(|line| line.split_once(':').is_some_and(|(key, _)| key == name));
+            assert!(
+                handed_on,
+                "the solver reads {name}, and compose does not hand it on"
+            );
+        }
     }
 }
