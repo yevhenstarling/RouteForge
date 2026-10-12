@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use routeforge_tsp::{
-    Control, DistanceMatrix, Point, Problem, Stop, anneal, cluster, local_search,
+    Control, Demand, DistanceMatrix, Point, Problem, Stop, anneal, cluster, local_search,
     nearest_neighbour, two_opt,
 };
 
@@ -119,17 +119,24 @@ fn argument(position: usize, name: &str, default: u64) -> Result<u64, String> {
     }
 }
 
-/// A depot in the middle of the square, stops scattered over it with a demand of one to
-/// three, and couriers that together have a tenth more capacity than the day needs.
+/// A depot in the middle of the square, stops scattered over it with one to three
+/// parcels to deliver to each, and couriers that together have a tenth more capacity
+/// than the day needs.
+///
+/// Nothing is picked up, so every order of a route's stops is one its courier can
+/// drive, and the stages below search without loads to mind.
 fn random_day(stops: usize, couriers: usize, seed: u64) -> Problem {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let stops: Vec<Stop> = (0..stops)
         .map(|_| Stop {
             point: Point::new(rng.random_range(0.0..SIDE), rng.random_range(0.0..SIDE)),
-            demand: rng.random_range(1..=3),
+            demand: Demand::delivery(rng.random_range(1..=3)),
         })
         .collect();
-    let demand: u64 = stops.iter().map(|stop| u64::from(stop.demand)).sum();
+    let demand: u64 = stops
+        .iter()
+        .map(|stop| u64::from(stop.demand.delivery))
+        .sum();
     let capacity = (demand * 11).div_ceil(10 * couriers.max(1) as u64);
     Problem {
         depot: Point::new(SIDE / 2.0, SIDE / 2.0),

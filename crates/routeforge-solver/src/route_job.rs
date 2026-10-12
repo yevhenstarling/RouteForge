@@ -1,10 +1,11 @@
 //! The `route` job: finds the order in which one courier calls at its stops (D2, D34).
 //!
-//! It has three parts. The first reads what the search needs and builds the distance
-//! matrix. The second runs the search on a blocking thread. Beside it a heartbeat keeps
-//! the lease and stores the progress, and an announcer tells whoever watches the plan
-//! how far the search has got and with which route (D49). The third writes the route
-//! in the transaction that marks the job done.
+//! It has three parts. The first reads what the search needs: it builds the distance
+//! matrix, and reckons what the courier has on board along the route (D65). The second
+//! runs the search on a blocking thread. Beside it a heartbeat keeps the lease and
+//! stores the progress, and an announcer tells whoever watches the plan how far the
+//! search has got and with which route (D49). The third writes the route in the
+//! transaction that marks the job done.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -13,14 +14,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use routeforge_domain::db::queue::{self, Heartbeat, Lease};
-use routeforge_domain::db::{depots, orders, plans, routes};
+use routeforge_domain::db::{couriers, depots, orders, plans, routes};
 use routeforge_domain::{
-    CourierId, Depot, DistanceProvider, DistanceTable, JobProgress, LatLon, NewRoute, Order,
-    OrderId, PlanId, RouteBudget,
+    CourierId, DistanceProvider, DistanceTable, JobProgress, LatLon, NewRoute, Order, OrderId,
+    PlanId, RouteBudget,
 };
-use routeforge_tsp::{Control, DistanceMatrix, StopReason, Tour, optimize_route};
+use routeforge_tsp::{
+    Control, Demand, DistanceMatrix, Loads, StopReason, Tour, optimize_route_within,
+};
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -28,6 +31,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::plan_job;
 use crate::worker::{Context, Outcome};
 
 /// What a route job is to do, as its payload says it.
@@ -49,12 +53,17 @@ pub(crate) async fn run<P>(
 where
     P: DistanceProvider + Sync,
 {
-    let (matrix, budget) = prepare(context, route).await?;
+    let Prepared {
+        matrix,
+        loads,
+        budget,
+    } = prepare(context, route).await?;
     let Some(found) = solve(
         &context.pool,
         &context.config,
         lease,
         matrix,
+        loads.clone(),
         route.seed,
         budget,
     )
@@ -62,14 +71,22 @@ where
     else {
         return Ok(Outcome::Gone);
     };
-    complete(&context.pool, lease, route, &found).await
+    complete(&context.pool, lease, route, &loads, &found).await
 }
 
-/// Reads the depot and the stops, and asks for the distances between them.
-async fn prepare<P>(
-    context: &Context<P>,
-    route: &Route<'_>,
-) -> anyhow::Result<(DistanceMatrix, RouteBudget)>
+/// What the search for a route works on.
+#[derive(Debug)]
+struct Prepared {
+    /// Node 0 is the depot, and node `n` is stop `n - 1` of the job's list (D14).
+    matrix: DistanceMatrix,
+    /// What the courier has on board along the route, and how much it carries (D65).
+    loads: Loads,
+    budget: RouteBudget,
+}
+
+/// Reads the depot, the courier and the stops, asks for the distances between them,
+/// and reckons what the courier carries from stop to stop.
+async fn prepare<P>(context: &Context<P>, route: &Route<'_>) -> anyhow::Result<Prepared>
 where
     P: DistanceProvider + Sync,
 {
@@ -80,30 +97,47 @@ where
     let depot = depots::get(pool, plan.depot_id)
         .await?
         .with_context(|| format!("depot {} of the plan does not exist", plan.depot_id))?;
-    let stops = orders::list_by_ids(pool, route.order_ids).await?;
+    let courier = couriers::get(pool, route.courier_id)
+        .await?
+        .with_context(|| format!("courier {} of the route does not exist", route.courier_id))?;
+    let stored = orders::list_by_ids(pool, route.order_ids).await?;
+    let stops = in_the_order_of_the_job(route.order_ids, &stored)?;
 
-    let positions = positions(&depot, route.order_ids, &stops)?;
+    // Clustering gave the courier no more than it carries out, and no more than it
+    // carries back (D65). A route that asks for more is not one to search for.
+    let asked: Vec<Demand> = stops.iter().map(|order| plan_job::demand(order)).collect();
+    let loads = Loads::new(courier.capacity, &asked)
+        .with_context(|| format!("courier {} cannot drive this route", courier.id))?;
+
+    let positions: Vec<LatLon> = iter::once(depot.location)
+        .chain(stops.iter().map(|order| order.location))
+        .collect();
     let table = context
         .distances
         .table(&positions)
         .await
         .context("could not get the distances between the stops")?;
-    Ok((search_matrix(table)?, plan.budget))
+    Ok(Prepared {
+        matrix: search_matrix(table)?,
+        loads,
+        budget: plan.budget,
+    })
 }
 
-/// The depot, then the stops in the order the job lists them.
-fn positions(depot: &Depot, order_ids: &[OrderId], stops: &[Order]) -> anyhow::Result<Vec<LatLon>> {
-    let location: HashMap<OrderId, LatLon> = stops
-        .iter()
-        .map(|order| (order.id, order.location))
-        .collect();
-    let of_the_stops = order_ids.iter().map(|id| {
-        location
+/// The stops in the order the job lists them, which is the order of the search's
+/// nodes: the database returns them in the order of their ids.
+fn in_the_order_of_the_job<'a>(
+    order_ids: &[OrderId],
+    stored: &'a [Order],
+) -> anyhow::Result<Vec<&'a Order>> {
+    let by_id: HashMap<OrderId, &Order> = stored.iter().map(|order| (order.id, order)).collect();
+    let stop = |id: &OrderId| {
+        by_id
             .get(id)
             .copied()
             .with_context(|| format!("order {id} of the route does not exist"))
-    });
-    iter::once(Ok(depot.location)).chain(of_the_stops).collect()
+    };
+    order_ids.iter().map(stop).collect()
 }
 
 /// The distances as the search takes them.
@@ -149,12 +183,12 @@ struct Search {
 }
 
 impl Search {
-    fn start(matrix: DistanceMatrix, seed: u64, budget: RouteBudget) -> Self {
+    fn start(matrix: DistanceMatrix, loads: Loads, seed: u64, budget: RouteBudget) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let (progress, latest) = watch::channel(None);
         let found = tokio::task::spawn_blocking({
             let cancel = Arc::clone(&cancel);
-            move || search(&matrix, seed, budget, &cancel, &progress)
+            move || search(&matrix, &loads, seed, budget, &cancel, &progress)
         });
         Self {
             found,
@@ -184,10 +218,11 @@ async fn solve(
     config: &Config,
     lease: &Lease,
     matrix: DistanceMatrix,
+    loads: Loads,
     seed: u64,
     budget: RouteBudget,
 ) -> anyhow::Result<Option<Found>> {
-    let mut search = Search::start(matrix, seed, budget);
+    let mut search = Search::start(matrix, loads, seed, budget);
     // Beside the search and not in tasks of their own: the lease is kept, and the
     // search is announced, for exactly as long as this future lives. A job that is
     // dropped can go on doing neither.
@@ -211,9 +246,11 @@ async fn solve(
     }
 }
 
-/// The search itself, on a blocking thread.
+/// The search itself, on a blocking thread. Every route it reports, and the one it
+/// returns, is one the courier can drive with what it carries (D65).
 fn search(
     matrix: &DistanceMatrix,
+    loads: &Loads,
     seed: u64,
     budget: RouteBudget,
     cancel: &AtomicBool,
@@ -248,7 +285,7 @@ fn search(
         control = control.with_deadline(deadline);
     }
 
-    let tour = optimize_route(matrix, seed, &mut control);
+    let tour = optimize_route_within(matrix, loads, seed, &mut control);
     Found {
         tour,
         iterations: control.iterations(),
@@ -323,8 +360,15 @@ async fn complete(
     pool: &PgPool,
     lease: &Lease,
     route: &Route<'_>,
+    loads: &Loads,
     found: &Found,
 ) -> anyhow::Result<Outcome> {
+    // The search makes no move that overloads the courier. A route that did all the
+    // same is refused here, where it would be stored, and not driven.
+    ensure!(
+        loads.fits(found.tour.stops()),
+        "the route that was found has more on board than its courier carries"
+    );
     let new = NewRoute {
         plan_id: route.plan_id,
         courier_id: route.courier_id,
@@ -367,8 +411,8 @@ mod tests {
     use std::time::Duration;
 
     use routeforge_domain::db::queue::PROGRESS_CHANNEL;
-    use routeforge_domain::{Haversine, JobPayload, RouteProgress, WorkerId};
-    use routeforge_tsp::Point;
+    use routeforge_domain::{Haversine, JobPayload, OrderKind, RouteProgress, WorkerId};
+    use routeforge_tsp::{Point, optimize_route};
     use sqlx::postgres::PgListener;
 
     use super::*;
@@ -440,7 +484,14 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let (progress, latest) = watch::channel(None);
 
-        let found = search(&matrix, 7, moves(50_000), &cancel, &progress);
+        let found = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            moves(50_000),
+            &cancel,
+            &progress,
+        );
         assert_eq!(found.stopped_by, Some(StopReason::Budget));
         assert!(found.iterations <= 50_000);
         let reported = latest.borrow().clone().unwrap();
@@ -467,7 +518,14 @@ mod tests {
         assert_eq!(length, reported.progress.best_cost_m);
 
         // The same seed and budget give the same route, as the plan promises (D5).
-        let again = search(&matrix, 7, moves(50_000), &cancel, &progress);
+        let again = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            moves(50_000),
+            &cancel,
+            &progress,
+        );
         assert_eq!(again.tour, found.tour);
     }
 
@@ -478,17 +536,31 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
-        let found = search(&matrix, 7, testing::millis(50), &cancel, &progress);
+        let found = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            testing::millis(50),
+            &cancel,
+            &progress,
+        );
         assert_eq!(found.stopped_by, Some(StopReason::Deadline));
         assert!(started.elapsed() >= Duration::from_millis(50));
 
         // Both limits: the one that is reached first ends the search.
         let both = RouteBudget::new(Some(60_000), Some(10_000)).unwrap();
-        let found = search(&matrix, 7, both, &cancel, &progress);
+        let found = search(&matrix, &Loads::none(12), 7, both, &cancel, &progress);
         assert_eq!(found.stopped_by, Some(StopReason::Budget));
 
         cancel.store(true, Ordering::Relaxed);
-        let found = search(&matrix, 7, testing::millis(60_000), &cancel, &progress);
+        let found = search(
+            &matrix,
+            &Loads::none(12),
+            7,
+            testing::millis(60_000),
+            &cancel,
+            &progress,
+        );
         assert_eq!(found.stopped_by, Some(StopReason::Cancelled));
         assert_eq!(found.iterations, 0);
     }
@@ -502,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn a_search_that_is_told_to_stop_returns_what_it_has() {
         // A minute is longer than this test waits for anything.
-        let mut search = Search::start(scattered(12), 7, testing::millis(60_000));
+        let mut search = Search::start(scattered(12), Loads::none(12), 7, testing::millis(60_000));
         let mut progress = search.progress.clone();
         soon(progress.changed()).await.unwrap();
 
@@ -516,7 +588,7 @@ mod tests {
     /// that future ends, the thread does not go on searching.
     #[tokio::test]
     async fn a_search_that_is_dropped_stops() {
-        let search = Search::start(scattered(12), 7, testing::millis(60_000));
+        let search = Search::start(scattered(12), Loads::none(12), 7, testing::millis(60_000));
         let mut progress = search.progress.clone();
         soon(progress.changed()).await.unwrap();
 
@@ -526,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_that_is_aborted_takes_its_search_with_it() {
-        let search = Search::start(scattered(12), 7, testing::millis(60_000));
+        let search = Search::start(scattered(12), Loads::none(12), 7, testing::millis(60_000));
         let progress = search.progress.clone();
         // A task that owns the search, as a job's does, and never gets to its end.
         let job = tokio::spawn(async move {
@@ -557,9 +629,15 @@ mod tests {
         };
         let context = testing::context(&pool, testing::config());
 
-        let (matrix, budget) = prepare(&context, &route).await.unwrap();
+        let Prepared {
+            matrix,
+            loads,
+            budget,
+        } = prepare(&context, &route).await.unwrap();
 
         assert_eq!(budget, moves(10));
+        // Four deliveries of one, on a courier that carries ten.
+        assert_eq!(loads, Loads::new(10, &[Demand::delivery(1); 4]).unwrap());
         assert_eq!(matrix.len(), 5);
         let expected: Vec<LatLon> = iter::once(city.depot.location)
             .chain(listed.iter().map(|order| order.location))
@@ -591,6 +669,168 @@ mod tests {
 
         let error = prepare(&context, &route).await.unwrap_err();
         assert!(error.to_string().contains(&missing.to_string()), "{error}");
+    }
+
+    /// The depot and three orders on the corners of a rectangle, for a courier that
+    /// carries two: the order opposite the depot is a delivery of two, and its
+    /// neighbours are a pickup of one each.
+    async fn rectangle(pool: &PgPool) -> (testing::City, Vec<Order>) {
+        let city = testing::city(pool, &[2]).await;
+        let mut placed = Vec::new();
+        for (off, kind, demand) in [
+            ((0.0, 0.01), OrderKind::Pickup, 1),
+            ((0.01, 0.01), OrderKind::Delivery, 2),
+            ((0.01, 0.0), OrderKind::Pickup, 1),
+        ] {
+            placed.push(city.order_at(pool, date(12), off, kind, demand).await);
+        }
+        (city, placed)
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_is_searched_within_what_its_courier_carries(pool: PgPool) {
+        let (city, placed) = rectangle(&pool).await;
+        let plan = plans::create(&pool, &city.new_plan(date(12), moves(1_000)))
+            .await
+            .unwrap();
+        let order_ids: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        let route = Route {
+            plan_id: plan.id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let context = testing::context(&pool, testing::config());
+
+        let Prepared {
+            matrix,
+            loads,
+            budget,
+        } = prepare(&context, &route).await.unwrap();
+        // What each order asks for, in the order of the job.
+        let asked = [Demand::pickup(1), Demand::delivery(2), Demand::pickup(1)];
+        assert_eq!(loads, Loads::new(2, &asked).unwrap());
+
+        let cancel = AtomicBool::new(false);
+        let (progress, latest) = watch::channel(None);
+        let found = search(&matrix, &loads, 1, budget, &cancel, &progress);
+
+        // Round the rectangle is the shortest way, and it comes to a pickup first
+        // whichever way it is driven. The courier leaves full, with the delivery.
+        let round = optimize_route(&matrix, 1, &mut Control::max_iterations(1_000));
+        assert!(!loads.fits(round.stops()));
+        assert!(loads.fits(found.tour.stops()));
+        assert!(found.tour.cost() > round.cost());
+        let called = calling_order(&found.tour, &order_ids).unwrap();
+        assert_eq!(called[0], placed[1].id, "the delivery comes first");
+        // What was announced on the way is a route the courier can drive as well.
+        let reported = latest.borrow().clone().unwrap();
+        let nodes: Vec<usize> = reported
+            .order
+            .unwrap()
+            .iter()
+            .map(|&place| place as usize + 1)
+            .collect();
+        assert!(loads.fits(&nodes));
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_its_courier_cannot_carry_is_an_error(pool: PgPool) {
+        // Three deliveries of one for a courier that carries two. Clustering never
+        // gives a courier that much, so a job that says so is not to be believed.
+        let city = testing::city(&pool, &[2]).await;
+        let placed = city.orders(&pool, date(12), 3, 1).await;
+        let plan = plans::create(&pool, &city.new_plan(date(12), moves(10)))
+            .await
+            .unwrap();
+        let order_ids: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        let route = Route {
+            plan_id: plan.id,
+            courier_id: city.couriers[0].id,
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let context = testing::context(&pool, testing::config());
+
+        let error = prepare(&context, &route).await.unwrap_err();
+        let said = format!("{error:#}");
+        assert!(said.contains("deliveries"), "{said}");
+        assert!(said.contains(&city.couriers[0].id.to_string()), "{said}");
+
+        // Two pickups of two are as much too much, the other way.
+        let mut heavy = Vec::new();
+        for _ in 0..2 {
+            let order = city
+                .order_at(&pool, date(13), (0.01, 0.01), OrderKind::Pickup, 2)
+                .await;
+            heavy.push(order.id);
+        }
+        let route = Route {
+            order_ids: &heavy,
+            ..route
+        };
+        let error = prepare(&context, &route).await.unwrap_err();
+        assert!(format!("{error:#}").contains("pickups"), "{error:#}");
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_for_a_courier_that_does_not_exist_is_an_error(pool: PgPool) {
+        let city = testing::city(&pool, &[10]).await;
+        let placed = city.orders(&pool, date(12), 2, 1).await;
+        let plan = plans::create(&pool, &city.new_plan(date(12), moves(10)))
+            .await
+            .unwrap();
+        let order_ids: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        let nobody = CourierId::generate();
+        let route = Route {
+            plan_id: plan.id,
+            courier_id: nobody,
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let context = testing::context(&pool, testing::config());
+
+        let error = prepare(&context, &route).await.unwrap_err();
+        assert!(error.to_string().contains(&nobody.to_string()), "{error}");
+    }
+
+    /// The last line of defence: a route that has the courier over its capacity is
+    /// not stored, whatever found it.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_that_overloads_its_courier_is_not_stored(pool: PgPool) {
+        let lease = claimed_route(&pool, 3).await;
+        // A tour over three stops, and loads it does not fit: the first stop it calls
+        // at is a pickup, on a courier that leaves full.
+        let matrix = line(3);
+        let tour = optimize_route(&matrix, 1, &mut Control::max_iterations(100));
+        let first = tour.stops()[0];
+        let mut asked = [Demand::delivery(1); 3];
+        asked[first - 1] = Demand::pickup(2);
+        let loads = Loads::new(2, &asked).unwrap();
+        assert!(!loads.fits(tour.stops()));
+
+        let found = Found {
+            tour,
+            iterations: 0,
+            stopped_by: None,
+        };
+        let order_ids = ids(3);
+        let route = Route {
+            plan_id: lease.plan_id,
+            courier_id: CourierId::generate(),
+            order_ids: &order_ids,
+            seed: 1,
+        };
+        let error = complete(&pool, &lease, &route, &loads, &found)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("more on board"), "{error}");
+        assert!(
+            routes::list_for_plan(&pool, lease.plan_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A route job of `stops` stops, claimed, for the lease a search is kept under.
@@ -641,10 +881,18 @@ mod tests {
 
         let started = Instant::now();
         let budget = testing::millis(1_000);
-        let found = solve(&pool, &config, &lease, scattered(12), 7, budget)
-            .await
-            .unwrap()
-            .expect("the job is this worker's throughout");
+        let found = solve(
+            &pool,
+            &config,
+            &lease,
+            scattered(12),
+            Loads::none(12),
+            7,
+            budget,
+        )
+        .await
+        .unwrap()
+        .expect("the job is this worker's throughout");
         let took = started.elapsed();
         let said = announced_within(&mut listener, Duration::from_millis(300)).await;
 
@@ -689,7 +937,18 @@ mod tests {
         let job = tokio::spawn({
             let pool = pool.clone();
             let budget = testing::millis(60_000);
-            async move { solve(&pool, &config, &lease, scattered(12), 7, budget).await }
+            async move {
+                solve(
+                    &pool,
+                    &config,
+                    &lease,
+                    scattered(12),
+                    Loads::none(12),
+                    7,
+                    budget,
+                )
+                .await
+            }
         });
         soon(listener.recv()).await.unwrap();
 

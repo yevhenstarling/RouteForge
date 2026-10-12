@@ -127,12 +127,13 @@ pub(crate) async fn city(pool: &PgPool, capacities: &[u32]) -> City {
 }
 
 impl City {
-    /// One order of the given demand, a kilometre or so north-east of the depot.
+    /// One delivery of the given demand, a kilometre or so north-east of the depot.
     pub(crate) async fn order(&self, pool: &PgPool, date: NaiveDate, demand: u32) -> Order {
-        self.order_at(pool, date, (0.01, 0.01), demand).await
+        self.order_at(pool, date, (0.01, 0.01), OrderKind::Delivery, demand)
+            .await
     }
 
-    /// `count` orders of demand 1, scattered up to five kilometres from the depot.
+    /// `count` deliveries of demand 1, scattered up to five kilometres from the depot.
     /// The same seed gives the same places, whatever the date.
     pub(crate) async fn orders(
         &self,
@@ -141,10 +142,11 @@ impl City {
         count: usize,
         seed: u64,
     ) -> Vec<Order> {
-        self.scatter(pool, date, count, seed, 1).await
+        self.scatter(pool, date, count, seed, 1, false).await
     }
 
-    /// Like [`orders`](Self::orders), with demands of 1 to 3.
+    /// Like [`orders`](Self::orders), as a day's orders are: with demands of 1 to 3,
+    /// and one in three a pickup.
     pub(crate) async fn mixed_orders(
         &self,
         pool: &PgPool,
@@ -152,7 +154,7 @@ impl City {
         count: usize,
         seed: u64,
     ) -> Vec<Order> {
-        self.scatter(pool, date, count, seed, 3).await
+        self.scatter(pool, date, count, seed, 3, true).await
     }
 
     async fn scatter(
@@ -162,6 +164,7 @@ impl City {
         count: usize,
         seed: u64,
         largest: u32,
+        with_pickups: bool,
     ) -> Vec<Order> {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut placed = Vec::new();
@@ -172,22 +175,29 @@ impl City {
                 rng.random_range(-0.07..0.07),
             );
             let demand = rng.random_range(1..=largest);
-            placed.push(self.order_at(pool, date, off, demand).await);
+            let kind = if with_pickups && rng.random_range(0..3) == 0 {
+                OrderKind::Pickup
+            } else {
+                OrderKind::Delivery
+            };
+            placed.push(self.order_at(pool, date, off, kind, demand).await);
         }
         placed
     }
 
-    async fn order_at(
+    /// An order so many degrees north and east of the depot.
+    pub(crate) async fn order_at(
         &self,
         pool: &PgPool,
         date: NaiveDate,
         (north, east): (f64, f64),
+        kind: OrderKind,
         demand: u32,
     ) -> Order {
         let depot = self.depot.location;
         let new = NewOrder {
             client_id: self.client.id,
-            kind: OrderKind::Delivery,
+            kind,
             service_date: date,
             location: LatLon::new(depot.lat() + north, depot.lon() + east).unwrap(),
             address: None,
@@ -278,9 +288,32 @@ impl Fleet {
     }
 }
 
+/// The most a courier has on board along a route, reckoned here, apart from the
+/// solver: it leaves the depot with every delivery, each delivery comes off at its
+/// stop, and each pickup comes on at its own (D65).
+pub(crate) fn most_on_board(stops: &[RouteStop]) -> u64 {
+    let of = |kind: OrderKind| {
+        stops
+            .iter()
+            .filter(move |stop| stop.kind == kind)
+            .map(|stop| u64::from(stop.demand))
+            .sum::<u64>()
+    };
+    let mut on_board = of(OrderKind::Delivery);
+    let mut most = on_board;
+    for stop in stops {
+        match stop.kind {
+            OrderKind::Delivery => on_board -= u64::from(stop.demand),
+            OrderKind::Pickup => on_board += u64::from(stop.demand),
+        }
+        most = most.max(on_board);
+    }
+    most
+}
+
 /// What the system is judged by. The plan is done, every one of `expected` is on
-/// exactly one of its routes and nothing else is, no courier carries more than it
-/// can, and every route is as long as it says.
+/// exactly one of its routes and nothing else is, no courier has more on board at any
+/// stop than it can carry, and every route is as long as it says.
 pub(crate) async fn assert_routed_once(
     pool: &PgPool,
     city: &City,
@@ -302,7 +335,7 @@ pub(crate) async fn assert_routed_once(
             .iter()
             .find(|courier| courier.id == route.courier_id)
             .expect("a route is for a courier of the city");
-        let load: u64 = route.stops.iter().map(|stop| u64::from(stop.demand)).sum();
+        let load = most_on_board(&route.stops);
         assert!(
             load <= u64::from(courier.capacity),
             "a load of {load} on a courier that carries {}",

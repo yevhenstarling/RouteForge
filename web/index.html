@@ -205,6 +205,8 @@ const COLOURS = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf
 const NO_COURIER = '#8a8f98';
 // How many vans the demo city has: one for each solver of the stack as it is shown.
 const VANS = 4;
+// The share of the demo orders that are deliveries: four in five (D46).
+const DELIVERED = 0.8;
 const SESSION = 'routeforge.session';
 // How often the orders of the day are read again without anybody having said that one
 // was placed. Whoever places one says so, but a word like that can be lost.
@@ -273,6 +275,30 @@ function say(text, isError = false) {
 function colourOf(courierId) {
   const at = state.couriers.findIndex((courier) => courier.id === courierId);
   return at < 0 ? NO_COURIER : COLOURS[at % COLOURS.length];
+}
+
+/**
+ * The most a courier has on board along a route (D65). It leaves the depot with every
+ * delivery. A delivery comes off at its stop, and a pickup comes on at its own.
+ */
+function mostOnBoard(stops) {
+  let onBoard = 0;
+  for (const stop of stops) {
+    if (stop.kind === 'delivery') onBoard += stop.demand;
+  }
+  let most = onBoard;
+  for (const stop of stops) {
+    onBoard += stop.kind === 'pickup' ? stop.demand : -stop.demand;
+    most = Math.max(most, onBoard);
+  }
+  return most;
+}
+
+/** What a stored route has its courier carry, in words: `at most 131 of 132 on board`. */
+function carried(route) {
+  const courier = state.couriers.find((known) => known.id === route.courier_id);
+  const most = mostOnBoard(route.stops);
+  return courier ? `at most ${most} of ${courier.capacity} on board` : `at most ${most} on board`;
 }
 
 function nameOf(courierId) {
@@ -566,7 +592,8 @@ function drawRoutes() {
   for (const route of state.routes) {
     const stops = route.stops.map((stop) => point(stop.location));
     const round = [point(state.depot.location), ...stops, point(state.depot.location)];
-    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)}, ${route.stops.length} stops`;
+    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)}, ${route.stops.length} stops, `
+      + carried(route);
     L.polyline(round, { renderer: lines, color: colourOf(route.courier_id), weight: 3, opacity: 0.95 })
       .bindTooltip(tip(words), { sticky: true })
       .addTo(layers.routes);
@@ -670,6 +697,7 @@ function renderRoutes() {
     let numbers = '';
     if (route) {
       numbers = km(route.distance_m);
+      stands += `, ${carried(route)}`;
     } else if (progress && job.status === 'running') {
       numbers = km(progress.best_cost_m);
       stands += `, ${moves(progress.iterations)}`;
@@ -917,10 +945,12 @@ async function generateOrders() {
 /**
  * A depot and four vans, through the endpoints an admin would use by hand.
  *
- * A demo order has a demand of 1 to 3, so a day of them asks for twice its number. The
- * vans are sized to take that between the four of them with a tenth to spare. So the
- * day that is generated next gives every van a route, and with it every one of four
- * solvers something to search for, whether it is of 300 orders or of 2000.
+ * A demo order has a demand of 1 to 3, and four in five are deliveries. So a day of
+ * them sends 1.6 times its number out of the depot, which is what the vans need room
+ * for: what is picked up comes on board when deliveries are off it (D65). The vans are
+ * sized to take that between the four of them with a tenth to spare. So the day that
+ * is generated next gives every van a route, and with it every one of four solvers
+ * something to search for, whether it is of 300 orders or of 2000.
  */
 async function setUpDemoCity() {
   if (!state.depot) {
@@ -929,7 +959,7 @@ async function setUpDemoCity() {
   }
   if (state.couriers.length === 0) {
     const orders = Number($('demo-count').value) || 300;
-    const capacity = Math.ceil(orders * 2 * 1.1 / VANS);
+    const capacity = Math.ceil(orders * 2 * DELIVERED * 1.1 / VANS);
     for (let number = 1; number <= VANS; number += 1) {
       await api('POST', '/api/couriers', { name: `Van ${number}`, capacity });
     }

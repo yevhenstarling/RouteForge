@@ -149,7 +149,9 @@ pub struct NewDepot {
 pub struct Courier {
     pub id: CourierId,
     pub name: String,
-    /// How much demand one route of this courier may carry (D7).
+    /// How much the courier can have on board at one time. A route may ask for more
+    /// than that in all: what is delivered is off before what is picked up comes on
+    /// (D65).
     pub capacity: u32,
     /// Only active couriers get routes.
     pub active: bool,

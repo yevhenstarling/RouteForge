@@ -10,9 +10,9 @@ use anyhow::{Context, ensure};
 use routeforge_domain::db::queue::{self, ClaimedJob};
 use routeforge_domain::db::{couriers, depots, orders, plans};
 use routeforge_domain::{
-    Courier, Depot, JobPayload, Order, OrderId, Plan, PlanCounts, PlanId, Projection,
+    Courier, Depot, JobPayload, Order, OrderId, OrderKind, Plan, PlanCounts, PlanId, Projection,
 };
-use routeforge_tsp::{Cluster, Clustering, Point, Problem, Stop, cluster};
+use routeforge_tsp::{Cluster, Clustering, Demand, Point, Problem, Stop, cluster};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -82,13 +82,24 @@ fn problem(depot: &Depot, couriers: &[Courier], orders: &[Order]) -> Problem {
         let at = map.project(order.location);
         Stop {
             point: Point::new(at.x, at.y),
-            demand: order.demand,
+            demand: demand(order),
         }
     });
     Problem {
         depot: Point::new(0.0, 0.0),
         stops: stops.collect(),
         capacities: couriers.iter().map(|courier| courier.capacity).collect(),
+    }
+}
+
+/// What an order asks of the courier that calls: room on the way out for a delivery,
+/// which comes from the depot, and on the way back for a pickup, which goes to it
+/// (D1, D65). The route job reckons the same way, so a cluster that fits a courier
+/// here is a route that courier can drive there.
+pub(crate) fn demand(order: &Order) -> Demand {
+    match order.kind {
+        OrderKind::Delivery => Demand::delivery(order.demand),
+        OrderKind::Pickup => Demand::pickup(order.demand),
     }
 }
 
@@ -245,6 +256,59 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// What is delivered is off the courier before what is picked up comes on, so the
+    /// two do not take each other's room (D65).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_courier_takes_as_many_deliveries_and_as_many_pickups_as_it_carries(pool: PgPool) {
+        let city = testing::city(&pool, &[4, 4]).await;
+        // Four parcels to deliver and four to pick up, for couriers that carry four.
+        let mut placed = city.orders(&pool, date(12), 4, 1).await;
+        for at in 1..=4 {
+            let off = (0.01 * f64::from(at), -0.01);
+            let pickup = city.order_at(&pool, date(12), off, OrderKind::Pickup, 1);
+            placed.push(pickup.await);
+        }
+        let (plan, job) = claimed_plan(&pool, &city, 12).await;
+
+        assert_eq!(run(&pool, &job, plan.id).await.unwrap(), Outcome::Done);
+
+        let plan = plans::get(&pool, plan.id).await.unwrap().unwrap();
+        assert_eq!(
+            (plan.orders_total, plan.orders_unassigned, plan.routes_total),
+            (8, 0, 1),
+            "one courier takes all eight"
+        );
+        let jobs = queue::list_for_plan(&pool, plan.id).await.unwrap();
+        let JobPayload::Route { order_ids, .. } = &jobs[1].payload else {
+            panic!("{:?} is not a route job", jobs[1].payload);
+        };
+        let mut routed = order_ids.clone();
+        routed.sort_unstable();
+        let expected: Vec<OrderId> = placed.iter().map(|order| order.id).collect();
+        assert_eq!(routed, expected);
+    }
+
+    /// One pickup more than a courier carries back opens the route of the next, with
+    /// nothing to deliver at all.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_pickup_too_many_goes_to_the_next_courier(pool: PgPool) {
+        let city = testing::city(&pool, &[4, 4]).await;
+        for at in 1..=5 {
+            let off = (0.01 * f64::from(at), -0.01);
+            city.order_at(&pool, date(12), off, OrderKind::Pickup, 1)
+                .await;
+        }
+        let (plan, job) = claimed_plan(&pool, &city, 12).await;
+
+        assert_eq!(run(&pool, &job, plan.id).await.unwrap(), Outcome::Done);
+
+        let plan = plans::get(&pool, plan.id).await.unwrap().unwrap();
+        assert_eq!(
+            (plan.orders_total, plan.orders_unassigned, plan.routes_total),
+            (5, 0, 2)
         );
     }
 

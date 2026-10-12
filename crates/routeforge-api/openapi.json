@@ -8,7 +8,7 @@
             "type": "boolean"
           },
           "capacity": {
-            "description": "How much demand one route of this courier may carry (D7).",
+            "description": "How much the courier can have on board at one time. A route may ask for more\nthan that in all: what is delivered is off before what is picked up comes on\n(D65).",
             "format": "int32",
             "minimum": 0,
             "type": "integer"
