@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n         RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,\n                   plan_id, created_at",
+  "query": "WITH placed AS (\n               INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n               RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,\n                         plan_id, created_at\n           )\n           SELECT id AS \"id!\", client_id AS \"client_id!\", kind AS \"kind!\", status AS \"status!\",\n                  service_date AS \"service_date!\", lat AS \"lat!\", lon AS \"lon!\", address,\n                  demand AS \"demand!\", plan_id, created_at AS \"created_at!\",\n                  pg_notify($9, to_char(service_date, 'YYYY-MM-DD')) AS watchers\n           FROM placed",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "client_id",
+        "name": "client_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "kind",
+        "name": "kind!",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "status",
+        "name": "status!",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "service_date",
+        "name": "service_date!",
         "type_info": "Date",
         "origin": {
           "Table": {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 5,
-        "name": "lat",
+        "name": "lat!",
         "type_info": "Float8",
         "origin": {
           "Table": {
@@ -71,7 +71,7 @@
       },
       {
         "ordinal": 6,
-        "name": "lon",
+        "name": "lon!",
         "type_info": "Float8",
         "origin": {
           "Table": {
@@ -93,7 +93,7 @@
       },
       {
         "ordinal": 8,
-        "name": "demand",
+        "name": "demand!",
         "type_info": "Int8",
         "origin": {
           "Table": {
@@ -115,7 +115,7 @@
       },
       {
         "ordinal": 10,
-        "name": "created_at",
+        "name": "created_at!",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -123,6 +123,12 @@
             "name": "created_at"
           }
         }
+      },
+      {
+        "ordinal": 11,
+        "name": "watchers",
+        "type_info": "Void",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -134,7 +140,8 @@
         "Float8",
         "Float8",
         "Text",
-        "Int8"
+        "Int8",
+        "Text"
       ]
     },
     "nullable": [
@@ -148,8 +155,9 @@
       true,
       false,
       true,
-      false
+      false,
+      null
     ]
   },
-  "hash": "b58185b40e95fc01873d1202f20c7571aa06006c1e1732328b66c65b00480457"
+  "hash": "7c4bbe6a2a1e50149279b0c20e3eecbf97b8825aaaded44c58c83c68d8deb848"
 }

@@ -1,9 +1,10 @@
 //! What the API hears from the database, passed on to its event streams (D50).
 //!
-//! One connection listens on the two channels the queue notifies (D48): that a plan
-//! has changed, and how far the search for a route has got. What it hears goes into a
-//! broadcast channel, and every open stream holds a receiver of that. So the API has
-//! one listening connection however many streams are open.
+//! One connection listens on the two channels the queue notifies (D48), that a plan
+//! has changed and how far the search for a route has got, and on the one the orders
+//! notify, that an order of a day was placed or withdrawn (D63). What it hears goes
+//! into a broadcast channel, and every open stream holds a receiver of that. So the
+//! API has one listening connection however many streams are open.
 //!
 //! A notification is a hint and can be missed (D26). When the listener has had to
 //! reconnect it says [`Signal::Missed`], and a stream that fell behind is told as much
@@ -12,6 +13,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::NaiveDate;
+use routeforge_domain::db::orders::ORDERS_CHANNEL;
 use routeforge_domain::db::queue::{PLANS_CHANNEL, PROGRESS_CHANNEL};
 use routeforge_domain::{PlanId, RouteProgress};
 use sqlx::PgPool;
@@ -36,6 +39,8 @@ pub(crate) enum Signal {
     Plan(PlanId),
     /// How far the search for a route has got.
     Progress(Arc<RouteProgress>),
+    /// An order of this day was placed or withdrawn (D63).
+    Orders(NaiveDate),
     /// Notifications may have been lost, so whatever a stream shows may be out of date.
     Missed,
 }
@@ -132,7 +137,7 @@ async fn listener(pool: PgPool, signals: broadcast::Sender<Signal>) {
 async fn subscribe(pool: &PgPool) -> Result<PgListener, sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener
-        .listen_all([PLANS_CHANNEL, PROGRESS_CHANNEL])
+        .listen_all([PLANS_CHANNEL, PROGRESS_CHANNEL, ORDERS_CHANNEL])
         .await?;
     Ok(listener)
 }
@@ -147,6 +152,8 @@ fn read(channel: &str, payload: &str) -> Option<Signal> {
         PROGRESS_CHANNEL => serde_json::from_str(payload)
             .ok()
             .map(|progress| Signal::Progress(Arc::new(progress))),
+        // The day, written as `2026-10-12`.
+        ORDERS_CHANNEL => payload.parse().ok().map(Signal::Orders),
         _ => None,
     };
     if signal.is_none() {
@@ -157,7 +164,7 @@ fn read(channel: &str, payload: &str) -> Option<Signal> {
 
 #[cfg(test)]
 mod tests {
-    use routeforge_domain::db::{plans, queue};
+    use routeforge_domain::db::{orders, plans, queue};
     use routeforge_domain::{JobId, JobProgress, WorkerId};
     use serde_json::json;
 
@@ -186,13 +193,22 @@ mod tests {
             Some(Signal::Progress(Arc::new(progress)))
         );
 
+        assert_eq!(
+            read(ORDERS_CHANNEL, "2026-10-12"),
+            Some(Signal::Orders(testing::date(12)))
+        );
+
         // What a newer build might send, and what was never meant for the API.
         let from_a_newer_build = json!({ "plan_id": plan_id, "moves": 7 }).to_string();
         for (channel, payload) in [
             (PLANS_CHANNEL, "not an id"),
             (PLANS_CHANNEL, ""),
+            (PLANS_CHANNEL, "2026-10-12"),
             (PROGRESS_CHANNEL, from_a_newer_build.as_str()),
             (PROGRESS_CHANNEL, "progress"),
+            (ORDERS_CHANNEL, "12.10.2026"),
+            (ORDERS_CHANNEL, "2026-13-01"),
+            (ORDERS_CHANNEL, ""),
             ("routeforge_jobs", "route"),
         ] {
             assert_eq!(read(channel, payload), None, "{channel}: {payload}");
@@ -241,6 +257,15 @@ mod tests {
             .unwrap();
         assert!(queue::cancel_plan(&pool, plan.id).await.unwrap());
         assert_eq!(soon(first.signals.recv()).await, Ok(Signal::Plan(plan.id)));
+
+        // An order that is placed, and withdrawn again, says which day it is of.
+        let order = orders::create(&pool, &testing::new_order(new.created_by, 13))
+            .await
+            .unwrap();
+        let of_the_day = Ok(Signal::Orders(testing::date(13)));
+        assert_eq!(soon(first.signals.recv()).await, of_the_day);
+        assert!(orders::cancel(&pool, order.id).await.unwrap());
+        assert_eq!(soon(first.signals.recv()).await, of_the_day);
 
         listening.abort();
         let _ = listening.await;

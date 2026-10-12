@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
 use crate::app::{AppState, app};
-use crate::auth::{Passwords, Tokens};
+use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::Limits;
 use crate::events::{Events, Signal};
 use crate::stream::{EVENT_STREAM, Pace};
@@ -38,8 +38,14 @@ pub(crate) const LIMITS: Limits = Limits {
 
 const SECRET: &[u8] = b"the key of the tests, 32 bytes..";
 
+/// The key the bot shows in a test.
+pub(crate) const BOT_KEY: &str = "the key of the bot in the tests..";
+
 /// How long a login is good for in a test.
 pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(3_600);
+
+/// How long a token is good for in a test that the bot was given.
+pub(crate) const BOT_TOKEN_TTL: Duration = Duration::from_secs(60);
 
 /// A lease no test outlives.
 pub(crate) const LONG: Duration = Duration::from_secs(600);
@@ -85,10 +91,21 @@ pub(crate) fn api(pool: &PgPool) -> Api {
 
 /// The application with event streams that pace themselves as said.
 pub(crate) fn api_at(pool: &PgPool, pace: Pace) -> Api {
+    api_with(pool, pace, Some(BOT_KEY))
+}
+
+/// The application as it is when it was started without a key for the bot.
+pub(crate) fn api_without_a_bot(pool: &PgPool) -> Api {
+    api_with(pool, PACE, None)
+}
+
+fn api_with(pool: &PgPool, pace: Pace, bot_key: Option<&str>) -> Api {
     let state = web::Data::new(AppState {
         pool: pool.clone(),
         tokens: Tokens::new(SECRET, TOKEN_TTL),
         passwords: Passwords::cheap(),
+        bot_key: bot_key.map(ServiceKey::new),
+        bot_token_ttl: BOT_TOKEN_TTL,
         limits: LIMITS,
         worker_alive: Duration::from_secs(15),
         events: Events::new(),
@@ -354,6 +371,17 @@ impl Api {
 
     pub(crate) async fn patch(&self, who: Option<&Actor>, path: &str, body: Value) -> Reply {
         self.with_body("PATCH", who, path, body).await
+    }
+
+    /// Asks for a token of a Telegram user, as the bot does: with the key it shows,
+    /// or with whatever else `key` is.
+    pub(crate) async fn telegram_login(&self, key: Option<&str>, body: Value) -> Reply {
+        let request = request("POST", "/api/auth/telegram", None);
+        let request = match key {
+            Some(key) => request.insert_header((header::AUTHORIZATION, format!("Bearer {key}"))),
+            None => request,
+        };
+        self.send(request.set_json(body)).await
     }
 
     /// A new account with this role, and a token for it.

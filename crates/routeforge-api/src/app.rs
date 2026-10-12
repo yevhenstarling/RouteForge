@@ -10,7 +10,7 @@ use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::middleware::from_fn;
 use actix_web::{App, web};
-use routeforge_domain::{Problem, RouteJob, RouteProgress};
+use routeforge_domain::{OrdersChanged, Problem, RouteJob, RouteProgress};
 use sqlx::PgPool;
 use tracing_actix_web::TracingLogger;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -19,7 +19,7 @@ use utoipa::{IntoResponses, Modify, OpenApi};
 use utoipa_actix_web::AppExt;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::auth::{Passwords, Tokens};
+use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::Limits;
 use crate::error::{self, PROBLEM_JSON};
 use crate::events::Events;
@@ -30,14 +30,20 @@ use crate::{page, routes};
 /// Where the OpenAPI document is served.
 pub(crate) const OPENAPI_PATH: &str = "/api/openapi.json";
 
-/// The name of the security scheme in the OpenAPI document.
+/// The names of the security schemes in the OpenAPI document: a user's token, and the
+/// key of the bot.
 const BEARER: &str = "bearer";
+const SERVICE_KEY: &str = "service_key";
 
 /// What the handlers share.
 pub(crate) struct AppState {
     pub(crate) pool: PgPool,
     pub(crate) tokens: Tokens,
     pub(crate) passwords: Passwords,
+    /// The key the bot shows. An API that has none takes no bot (D60).
+    pub(crate) bot_key: Option<ServiceKey>,
+    /// How long a token is good for that the bot was given for a Telegram user.
+    pub(crate) bot_token_ttl: Duration,
     pub(crate) limits: Limits,
     /// A worker seen within this span counts as alive.
     pub(crate) worker_alive: Duration,
@@ -92,9 +98,10 @@ pub(crate) fn app(
             press **Authorize** and paste it.\n\n\
             The same API is behind the map at `/`."
     ),
-    // `Problem` is what the refusals name, and the other two are what the events of a
-    // stream carry. None of them is the body of a response, where utoipa would find it.
-    components(schemas(Problem, RouteJob, RouteProgress)),
+    // `Problem` is what the refusals name, and the other three are what the events of
+    // a stream carry. None of them is the body of a response, where utoipa would find
+    // it.
+    components(schemas(Problem, RouteJob, RouteProgress, OrdersChanged)),
     modifiers(&BearerToken),
     tags(
         (name = "health", description = "Whether the API is up, and ready"),
@@ -110,22 +117,29 @@ pub(crate) fn app(
 )]
 struct ApiDoc;
 
-/// Declares the scheme the protected routes name: a token sent as a bearer.
+/// Declares the schemes the protected routes name: a user's token sent as a bearer,
+/// and, for the one route that is the bot's, its key sent the same way.
 struct BearerToken;
 
 impl Modify for BearerToken {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        let scheme = HttpBuilder::new()
+        let token = HttpBuilder::new()
             .scheme(HttpAuthScheme::Bearer)
             .bearer_format("JWT")
             .description(Some(
                 "The `token` that `POST /api/auth/login` answers with.",
             ))
             .build();
-        openapi
-            .components
-            .get_or_insert_default()
-            .add_security_scheme(BEARER, SecurityScheme::Http(scheme));
+        let key = HttpBuilder::new()
+            .scheme(HttpAuthScheme::Bearer)
+            .description(Some(
+                "The key of the Telegram bot: what the API was started with as \
+                 `BOT_SERVICE_KEY`. No token of a user's stands in for it.",
+            ))
+            .build();
+        let components = openapi.components.get_or_insert_default();
+        components.add_security_scheme(BEARER, SecurityScheme::Http(token));
+        components.add_security_scheme(SERVICE_KEY, SecurityScheme::Http(key));
     }
 }
 
@@ -162,6 +176,8 @@ macro_rules! refusals {
 refusals! {
     /// `401`, on every route that needs a token.
     NotLoggedIn => "401", "No token was sent, or the one sent is not valid or has expired";
+    /// `401`, on the route that needs the key of the bot.
+    NoKey => "401", "The key of the bot was not sent, is not the one this API has, or this API has none";
     /// `403`, on the routes that need a role.
     NotAllowed => "403", "The caller's role does not allow this";
     /// `404`.

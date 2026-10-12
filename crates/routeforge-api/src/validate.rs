@@ -8,7 +8,7 @@
 //! them all right at once.
 
 use routeforge_domain::{
-    DemoRequest, FieldError, Login, NewCourier, NewDepot, OrderRequest, RouteBudget,
+    DemoRequest, FieldError, Login, NewCourier, NewDepot, OrderRequest, RouteBudget, TelegramLogin,
 };
 
 use crate::config::Limits;
@@ -70,6 +70,13 @@ pub(crate) fn registration(login: &Login) -> Result<(), ApiError> {
         "password",
         format!("must be {PASSWORD_SHORTEST} to {PASSWORD_LONGEST} characters long"),
     );
+    refused.into_result()
+}
+
+/// Who the bot says it is talking to. Telegram counts its users from 1.
+pub(crate) fn telegram(login: &TelegramLogin) -> Result<(), ApiError> {
+    let mut refused = Refused::default();
+    refused.unless(login.telegram_id >= 1, "telegram_id", "must be at least 1");
     refused.into_result()
 }
 
@@ -245,6 +252,16 @@ mod tests {
             refused_fields(registration(&login("ada", "short"))),
             ["email", "password"]
         );
+    }
+
+    #[test]
+    fn a_telegram_user_has_a_positive_id() {
+        let user = |telegram_id| TelegramLogin { telegram_id };
+        assert!(telegram(&user(1)).is_ok());
+        assert!(telegram(&user(i64::MAX)).is_ok());
+        for id in [0, -1, i64::MIN] {
+            assert_eq!(refused_fields(telegram(&user(id))), ["telegram_id"], "{id}");
+        }
     }
 
     #[test]

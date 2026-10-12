@@ -1,6 +1,6 @@
 [package]
 name = "routeforge-bot"
-description = "RouteForge Telegram bot: an LLM agent that places orders through the HTTP API"
+description = "RouteForge Telegram bot: places orders through the HTTP API, by buttons and commands"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,13 +12,18 @@ publish.workspace = true
 routeforge-domain.workspace = true
 
 anyhow.workspace = true
+chrono.workspace = true
 reqwest.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 teloxide.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

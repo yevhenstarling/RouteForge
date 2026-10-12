@@ -74,18 +74,21 @@ impl PlanStatus {
     }
 }
 
-/// Someone who can log in.
+/// Someone who can log in, or who talks to the bot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct User {
     pub id: UserId,
-    /// In lower case.
-    pub email: String,
+    /// In lower case. An account that was made for a Telegram user has none (D59).
+    pub email: Option<String>,
+    /// The id Telegram gives the user, if the account is one the bot reaches.
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
+    pub telegram_id: Option<i64>,
     pub role: Role,
     pub created_at: DateTime<Utc>,
 }
 
-/// What creating a user needs.
+/// What opening an account with an address and a password needs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct NewUser {
     /// Stored in lower case, whatever the case here.
@@ -450,12 +453,13 @@ mod tests {
     fn a_password_hash_does_not_show_in_debug_output() {
         let user = User {
             id: UserId::generate(),
-            email: "ada@example.com".to_owned(),
+            email: Some("ada@example.com".to_owned()),
+            telegram_id: None,
             role: Role::Client,
             created_at: Utc::now(),
         };
         let new = NewUser {
-            email: user.email.clone(),
+            email: "ada@example.com".to_owned(),
             password_hash: "$argon2id$secret".to_owned(),
             role: Role::Client,
         };

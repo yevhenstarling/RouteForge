@@ -391,6 +391,19 @@
         ],
         "type": "string"
       },
+      "OrdersChanged": {
+        "description": "What an `orders` event of the stats stream says: an order of this day was placed or\nwithdrawn, so whoever shows the day reads its orders again (D63).",
+        "properties": {
+          "service_date": {
+            "format": "date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_date"
+        ],
+        "type": "object"
+      },
       "Plan": {
         "description": "One planning run: the orders of a service date turned into courier routes (D2).",
         "properties": {
@@ -883,27 +896,53 @@
         ],
         "type": "object"
       },
+      "TelegramLogin": {
+        "description": "Who the bot is talking to, as Telegram knows them. The bot sends it with its key,\nand is given a `Session` for that user's account (D60).",
+        "properties": {
+          "telegram_id": {
+            "description": "The id Telegram gives the user. At least 1.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "telegram_id"
+        ],
+        "type": "object"
+      },
       "User": {
-        "description": "Someone who can log in.",
+        "description": "Someone who can log in, or who talks to the bot.",
         "properties": {
           "created_at": {
             "format": "date-time",
             "type": "string"
           },
           "email": {
-            "description": "In lower case.",
-            "type": "string"
+            "description": "In lower case. An account that was made for a Telegram user has none (D59).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "$ref": "#/components/schemas/UserId"
           },
           "role": {
             "$ref": "#/components/schemas/Role"
+          },
+          "telegram_id": {
+            "description": "The id Telegram gives the user, if the account is one the bot reaches.",
+            "format": "int64",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
           "id",
-          "email",
           "role",
           "created_at"
         ],
@@ -961,6 +1000,11 @@
       "bearer": {
         "bearerFormat": "JWT",
         "description": "The `token` that `POST /api/auth/login` answers with.",
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "service_key": {
+        "description": "The key of the Telegram bot: what the API was started with as `BOT_SERVICE_KEY`. No token of a user's stands in for it.",
         "scheme": "bearer",
         "type": "http"
       }
@@ -1065,6 +1109,63 @@
           }
         },
         "summary": "Open an account",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/auth/telegram": {
+      "post": {
+        "description": "The Telegram bot is the one caller of this. It shows its key, as\n`Authorization: Bearer <key>`, says which Telegram user it is talking to, and is\ngiven a token for that user's account. With that token it asks what the user asks\nof it, so the bot can do no more than the user may (D9).\n\nA Telegram user the API has not heard of gets an account here and now: a client's,\nwith no address and no password. An admin can make it an operator's.\n\nThe token is good for `expires_in` seconds, which is far less than a login's: the\nbot asks for one whenever it needs one.",
+        "operationId": "telegram_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TelegramLogin"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "The token, and whose account it speaks for"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The key of the bot was not sent, is not the one this API has, or this API has none"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Something in the request cannot be accepted. `errors` names the fields, where it is known which"
+          }
+        },
+        "security": [
+          {
+            "service_key": []
+          }
+        ],
+        "summary": "Log in a Telegram user, for the bot",
         "tags": [
           "auth"
         ]
@@ -2354,7 +2455,7 @@
     },
     "/api/system/stats/events": {
       "get": {
-        "description": "An event stream (`text/event-stream`) that stays open. It opens with a `stats`\nevent, which is what `GET /api/system/stats` gives, and sends another whenever that\nhas changed: at once when a job is queued, claimed or finished, and within a couple\nof seconds when a worker has come or has fallen silent.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
+        "description": "An event stream (`text/event-stream`) that stays open. It opens with a `stats`\nevent, which is what `GET /api/system/stats` gives, and sends another whenever that\nhas changed: at once when a job is queued, claimed or finished, and within a couple\nof seconds when a worker has come or has fallen silent.\n\nIt also sends an `orders` event, an `OrdersChanged`, whenever an order was placed\nor withdrawn. It names the day and no order: whoever shows that day reads its\norders again. Nothing makes up for one that was lost, so a reader also reads now\nand then without being told.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
         "operationId": "watch_system_stats",
         "responses": {
           "200": {

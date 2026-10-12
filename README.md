@@ -35,6 +35,24 @@ It brings the stack up if it is not, and shows two things:
 
 It plans tomorrow, so it stays out of the way of what you do on the page, which opens on today.
 
+## The bot
+
+The stack has a Telegram bot in it. On a clone it has no token, so it says that it idles, and does. To have it take orders:
+
+1. Ask [@BotFather](https://t.me/BotFather) in Telegram for a new bot, and put the token it gives into `.env`: `TELEGRAM_BOT_TOKEN=...`
+2. `docker compose up -d --build`
+3. Open a chat with the bot and send `/start`.
+
+To place an order, share a location: the paperclip, then Location. The bot asks with buttons whether it is a delivery or a pickup, how many parcels, and which day. It shows the order, and places it when you confirm. Where a location cannot be shared, `/order 50.4501 30.5234` begins an order at those coordinates. `/orders` lists your orders, to look at or to withdraw.
+
+With the page open on that day as the admin, the order is on the map as it is placed.
+
+Whoever writes to the bot gets an account of their own, a client's. To plan from the chat, make that account an operator's: `/start` says its id, and `PUT /api/users/{id}/role` in Swagger UI changes its role, as the admin. An operator has `/pending`, `/plan` and `/status` as well.
+
+The bot takes buttons and commands, and no free text. The [approved description](docs/description.md) has it understand sentences, with the help of the Claude API. That part waits for an API key to try it with. It goes on top of this one: what a button does and what a model would ask for is the same request to the API. The reasons are D58 in [docs/architecture.md](docs/architecture.md).
+
+The days the bot offers are those of its clock, which is on UTC in a container unless `TZ` in `.env` says otherwise. The buttons name the day they mean.
+
 ## More
 
 - [docs/description.md](docs/description.md): what the project is to be

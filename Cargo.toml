@@ -48,11 +48,17 @@ sqlx = { version = "0.9", default-features = false, features = [
 # Auth. `rust_crypto` is the pure-Rust backend: nothing to compile with CMake or NASM.
 argon2 = "0.6"
 jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+# For comparing the bot's key in constant time. The crates above bring it in anyway.
+subtle = "2.6"
 
 # Telegram bot and outgoing HTTP. reqwest stays on the 0.12 line because teloxide 0.17
 # is built on it; both use rustls with ring, so there is one HTTP stack and no OpenSSL.
 reqwest = { version = "0.12.28", default-features = false, features = ["charset", "http2", "json", "rustls-tls"] }
-teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler", "macros", "rustls"] }
+# Neither `ctrlc_handler` nor `macros`. The first hears Ctrl-C and no SIGTERM, which is
+# what stops a container, so the bot listens for both itself (D62). The second derives
+# a parser of commands, and the bot reads its commands in the part of it that knows
+# nothing of Telegram (D61).
+teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 
 # Observability
 tracing = "0.1.44"
@@ -75,3 +81,5 @@ rand_chacha = "0.10"
 # Tests and benchmarks
 criterion = "0.8.2"
 proptest = "1.12"
+# A server inside a test, for the bot: in the place of the API, and of Telegram.
+wiremock = "0.6.5"

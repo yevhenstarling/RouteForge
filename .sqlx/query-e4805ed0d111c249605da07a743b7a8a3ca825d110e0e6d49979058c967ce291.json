@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, email, role, created_at, password_hash FROM users WHERE email = $1",
+  "query": "SELECT id, email, telegram_id, role, created_at FROM users WHERE telegram_id = $1",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,17 @@
       },
       {
         "ordinal": 2,
+        "name": "telegram_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "telegram_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
         "name": "role",
         "type_info": "Text",
         "origin": {
@@ -37,7 +48,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -46,31 +57,20 @@
             "name": "created_at"
           }
         }
-      },
-      {
-        "ordinal": 4,
-        "name": "password_hash",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "users",
-            "name": "password_hash"
-          }
-        }
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
       false,
-      false,
-      false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "b3bda1b2ba134be82b269f63d1ae41a6055100dac3f26b7c596e9569e89d1f06"
+  "hash": "e4805ed0d111c249605da07a743b7a8a3ca825d110e0e6d49979058c967ce291"
 }

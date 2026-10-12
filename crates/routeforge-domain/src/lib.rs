@@ -23,8 +23,8 @@ mod model;
 mod text;
 
 pub use dto::{
-    CourierChange, DemoCreated, DemoRequest, FieldError, Login, OrderRequest, PlanRequest, Problem,
-    RoleChange, Session, SystemStats,
+    CourierChange, DemoCreated, DemoRequest, FieldError, Login, OrderRequest, OrdersChanged,
+    PlanRequest, Problem, RoleChange, Session, SystemStats, TelegramLogin,
 };
 pub use geo::{
     DistanceProvider, DistanceTable, EARTH_RADIUS_M, Haversine, InvalidLatLon, LatLon, Planar,

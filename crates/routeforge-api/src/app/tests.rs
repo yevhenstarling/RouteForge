@@ -30,6 +30,8 @@ enum Needs {
     /// An operator or an admin.
     Staff,
     Admin,
+    /// The Telegram bot, by its key. No token opens it, whoever's it is (D60).
+    Bot,
 }
 
 /// Every endpoint, and who may call it. This is the table the API is held to.
@@ -41,6 +43,7 @@ const MATRIX: &[(&str, &str, Needs)] = &[
     ("get", "/readyz", Needs::Nobody),
     ("post", "/api/auth/register", Needs::Nobody),
     ("post", "/api/auth/login", Needs::Nobody),
+    ("post", "/api/auth/telegram", Needs::Bot),
     ("post", "/api/orders", Needs::Anyone),
     ("get", "/api/orders", Needs::Anyone),
     ("get", "/api/orders/{id}", Needs::Anyone),
@@ -71,6 +74,7 @@ impl Needs {
     fn lets_in(self, caller: Option<Role>) -> bool {
         match (self, caller) {
             (Self::Nobody, _) => true,
+            (Self::Bot, _) => false,
             (_, None) => false,
             (Self::Anyone, Some(_)) => true,
             (Self::Staff, Some(role)) => matches!(role, Role::Operator | Role::Admin),
@@ -114,14 +118,15 @@ async fn every_endpoint_has_a_row_in_the_matrix(pool: PgPool) {
     assert_eq!(served, listed);
 
     // The document asks for a token exactly where the API does, so that Swagger UI
-    // sends one there.
+    // sends one there, and for the key of the bot where the API asks for that.
     for (method, path, needs) in MATRIX {
         let operation = &document["paths"][path][method];
-        assert_eq!(
-            operation["security"] == json!([{ "bearer": [] }]),
-            *needs != Needs::Nobody,
-            "{method} {path}"
-        );
+        let asked_for = match needs {
+            Needs::Nobody => Value::Null,
+            Needs::Bot => json!([{ "service_key": [] }]),
+            Needs::Anyone | Needs::Staff | Needs::Admin => json!([{ "bearer": [] }]),
+        };
+        assert_eq!(operation["security"], asked_for, "{method} {path}");
         // And says what a caller who is kept out is answered.
         let documented = |status: &str| operation["responses"].get(status).is_some();
         assert!(
@@ -172,7 +177,9 @@ async fn each_role_gets_in_where_it_may_and_nowhere_else(pool: PgPool) {
                 );
                 assert!(!reply.status.is_server_error(), "{outcome}");
             } else {
-                let kept_out = if role.is_none() {
+                // A token that is good and not enough is a `403`. Where it takes a
+                // key, a token is no key at all, which is a `401` like no token.
+                let kept_out = if role.is_none() || *needs == Needs::Bot {
                     StatusCode::UNAUTHORIZED
                 } else {
                     StatusCode::FORBIDDEN
@@ -458,11 +465,17 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
         document["components"]["securitySchemes"]["bearer"]["scheme"],
         "bearer"
     );
+    // The key of the bot travels the same way, and is told from a token by its name.
+    assert_eq!(
+        document["components"]["securitySchemes"]["service_key"]["scheme"],
+        "bearer"
+    );
 
     let schemas = &document["components"]["schemas"];
     for named in [
         "Order",
         "OrderRequest",
+        "TelegramLogin",
         "Plan",
         "PlanRequest",
         "RouteBudget",
@@ -485,6 +498,7 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
         "RouteProgress",
         "JobProgress",
         "JobStatus",
+        "OrdersChanged",
     ] {
         assert!(schemas.get(named).is_some(), "no schema for {named}");
     }
@@ -697,6 +711,43 @@ async fn what_a_request_logs_carries_its_id_and_who_asked(pool: PgPool) {
         .expect("the failure was logged as an error");
     assert!(cause.to_string().contains("nothing_gets_in"), "{cause}");
     assert!(!failed.text.contains("nothing_gets_in"), "{}", failed.text);
+}
+
+/// The bot is no user, so its key puts nobody into the log. The account it asked a
+/// token for is who the request was about.
+#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+async fn what_the_bot_asks_is_logged_with_the_account_it_asked_for(pool: PgPool) {
+    let log = captured_log();
+    let api = testing::api(&pool);
+    let request_id = format!("{}.bot", Uuid::now_v7());
+    let request = testing::request("POST", "/api/auth/telegram", None)
+        .insert_header((
+            header::AUTHORIZATION,
+            format!("Bearer {}", testing::BOT_KEY),
+        ))
+        .insert_header((X_REQUEST_ID, request_id.as_str()))
+        .set_json(json!({ "telegram_id": 4_242 }));
+    let session = api.send(request).await;
+    assert_eq!(session.status, StatusCode::OK, "{}", session.text);
+
+    let lines = log.lines();
+    let handled = lines
+        .iter()
+        .find(|line| {
+            span(line, "request_id") == Some(json!(request_id))
+                && line["fields"]["message"] == "handled the request"
+        })
+        .expect("the request was logged");
+    assert_eq!(
+        span(handled, "user_id"),
+        Some(session.body["user"]["id"].clone())
+    );
+    assert_eq!(span(handled, "status"), Some(json!(200)));
+
+    // Neither what the bot showed nor what it was given is in any line.
+    let logged = serde_json::to_string(&lines).unwrap();
+    assert!(!logged.contains(testing::BOT_KEY));
+    assert!(!logged.contains(session.body["token"].as_str().unwrap()));
 }
 
 /// The stack asks `/readyz` every two seconds for as long as it is up (D55). An answer

@@ -6,7 +6,7 @@ name: routeforge
 #
 # The page with the map is then at http://127.0.0.1:8080/ and Swagger UI at /docs/.
 #
-# Every setting has a value to fall back on, so a clone needs no .env (D54). Three of
+# Every setting has a value to fall back on, so a clone needs no .env (D54). Four of
 # those values are no secrets at all, and are marked below. They are for showing the
 # system on this machine, which is the only place the ports are open to.
 
@@ -51,8 +51,13 @@ services:
       JWT_SECRET: ${JWT_SECRET:-routeforge-demo-signing-key-not-a-secret}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-routeforge}
+      # The key the bot shows to be given a token of the Telegram user it talks to
+      # (D60). As little a secret as the three above: whoever has read this file can
+      # be given a token of any account the bot reaches.
+      BOT_SERVICE_KEY: ${BOT_SERVICE_KEY:-routeforge-demo-bot-key-not-a-secret}
       # Passed on if set in .env or in the shell, and left to their defaults if not.
       JWT_TTL_SECS:
+      BOT_JWT_TTL_SECS:
       API_BUDGET_DEFAULT_MS:
       API_BUDGET_MAX_MS:
       API_BUDGET_MAX_ITERATIONS:
@@ -99,12 +104,29 @@ services:
       db:
         condition: service_healthy
 
-  # The Telegram bot. It is built in Phase 7. Until then it starts, says so, and idles
-  # (D56). It reaches the system through the API alone, so that is what it waits for.
+  # The Telegram bot. It reaches the system through the API alone, so that is what it
+  # waits for. It asks Telegram for its updates, so it publishes no port.
+  #
+  # Without a token it has nobody to talk to: it says so, and idles (D8). With one in
+  # .env it is a bot, and nothing else has to be set.
   bot:
     build:
       context: .
       target: bot
+    environment:
+      # What @BotFather gave. Passed on if it is set in .env or in the shell.
+      TELEGRAM_BOT_TOKEN:
+      # `api` is the service above, on the compose network.
+      BOT_API_URL: http://api:8080
+      # What the bot shows the API to be given a token of the person it talks to
+      # (D60). It has to be the key the API has, so the two fall back to the same.
+      BOT_SERVICE_KEY: ${BOT_SERVICE_KEY:-routeforge-demo-bot-key-not-a-secret}
+      # Passed on if set in .env or in the shell, and left to their defaults if not.
+      TELEGRAM_API_URL:
+      LOG_FORMAT:
+      RUST_LOG:
+      # The days the bot offers are those of its clock, which is on UTC without this.
+      TZ:
     depends_on:
       api:
         condition: service_healthy

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH withdrawn AS (\n             UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'pending'\n             RETURNING service_date\n         )\n         SELECT pg_notify($2, to_char(service_date, 'YYYY-MM-DD')) FROM withdrawn",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pg_notify",
+        "type_info": "Void",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "be0388e4ee361b18d93a8601b11c1bad0fe9be79f0a893d6c5f834ec8cdbceeb"
+}
