@@ -26,6 +26,7 @@ fn bot() -> Command {
         "BOT_SERVICE_KEY",
         "BOT_API_URL",
         "TELEGRAM_API_URL",
+        "GEOCODER_URL",
         "LOG_FORMAT",
         "RUST_LOG",
     ] {
@@ -118,7 +119,7 @@ fn with_a_token_and_no_key_it_ends_and_names_what_it_misses() {
 
 #[test]
 fn a_setting_that_is_no_address_ends_it_by_name() {
-    for setting in ["BOT_API_URL", "TELEGRAM_API_URL"] {
+    for setting in ["BOT_API_URL", "TELEGRAM_API_URL", "GEOCODER_URL"] {
         let ended = run(bot().env(setting, "the API"));
         assert_eq!(ended.status.code(), Some(1), "{setting}: {ended:?}");
         let said = String::from_utf8_lossy(&ended.stderr);

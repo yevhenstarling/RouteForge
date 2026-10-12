@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicU32;
 use routeforge_domain::{PlanId, UserId};
 
 use super::*;
-use crate::testing::{Asked, FakeApi, a_delivery, a_plan, an_order, date};
+use crate::testing::{Asked, FakeApi, FakeGeocoder, a_delivery, a_place, a_plan, an_order, date};
 
 /// The one person who writes to the bot, and their chat.
 const ADA: i64 = 42;
@@ -17,17 +17,31 @@ const ADA: i64 = 42;
 const TODAY: u32 = 12;
 
 struct Bot {
-    chats: Chats<FakeApi>,
+    chats: Chats<FakeApi, Option<FakeGeocoder>>,
     api: FakeApi,
+    /// What stands in for the geocoding service, for a bot that has one.
+    places: FakeGeocoder,
     /// How many updates the bot has had: each has a request id of its own.
     updates: AtomicU32,
 }
 
+/// The bot as it is on a clone: with nobody to ask where an address is (D72).
 fn bot() -> Bot {
+    bot_with(false)
+}
+
+/// The bot of somebody who gave it a geocoding service.
+fn bot_that_looks_addresses_up() -> Bot {
+    bot_with(true)
+}
+
+fn bot_with(addresses: bool) -> Bot {
     let api = FakeApi::new(ADA);
+    let places = FakeGeocoder::default();
     Bot {
-        chats: Chats::new(api.clone()),
+        chats: Chats::new(api.clone(), addresses.then(|| places.clone())),
         api,
+        places,
         updates: AtomicU32::new(0),
     }
 }
@@ -543,10 +557,20 @@ fn every_button_carries_what_it_means_within_what_telegram_lets_it() {
         Press::PlanYes(day),
         Press::PlanNo,
         Press::Status(day),
+        Press::Found(i32::MIN, u8::MAX),
+        Press::Found(7, 0),
+        Press::NotFound(i32::MIN),
     ] {
         let data = press.data();
         assert!(data.len() <= 64, "{data}");
         assert_eq!(Press::read(&data), Some(press), "{data}");
+    }
+    // What no button carries is no button: a place beyond the last there could be,
+    // a search without a place, and a place without a search.
+    for made_up in [
+        "f:7:256", "f:7:-1", "f:7", "f::1", "fx", "fx:seven", "fx:7:1",
+    ] {
+        assert_eq!(Press::read(made_up), None, "{made_up}");
     }
 }
 
@@ -1201,7 +1225,8 @@ async fn a_role_an_admin_has_changed_applies_to_the_next_thing_that_is_asked() {
             | Asked::GetOrder { token, .. }
             | Asked::CancelOrder { token, .. }
             | Asked::CreatePlan { token, .. }
-            | Asked::ListPlans { token, .. } => token,
+            | Asked::ListPlans { token, .. }
+            | Asked::GetDepot { token } => token,
         };
         assert_eq!(token, format!("token-{logins}"));
         others += 1;
@@ -1355,4 +1380,478 @@ async fn the_orders_that_are_being_put_together_are_not_kept_without_end() {
         assert!(asked.text.ends_with("How many parcels?"), "{chat}");
     }
     assert_eq!(bot.api.asked(), []);
+}
+
+// ------------------------------------------------------------ a place in words (D72)
+
+const KHRESHCHATYK: &str = "22, Хрещатик вулиця, Липки, Київ, 01001, Україна";
+const KHRESHCHATYK_IN_DNIPRO: &str = "22, Хрещатик вулиця, Дніпро, 49000, Україна";
+
+/// Where the depot of the fake API is, which a search is to look round.
+fn the_depot() -> LatLon {
+    LatLon::new(50.45, 30.52).unwrap()
+}
+
+/// An address is asked for, the place that was found is shown, and the press that
+/// picks it begins an order there: the one the buttons then finish as any other.
+#[tokio::test]
+async fn an_address_in_words_is_looked_up_and_the_place_that_is_picked_begins_an_order() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик 22", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+
+    let found = bot.says(10, "  Хрещатик 22 ").await;
+    assert_eq!(
+        found.text,
+        format!("Is it this place?\n{KHRESHCHATYK}\n\n{CREDIT}")
+    );
+    assert_eq!(labels(&found), [vec!["Yes, an order there"], vec!["No"]]);
+    assert!(!found.in_place, "a message of its own, under the address");
+
+    // The service was asked once, for the words without what was round them, and to
+    // prefer what is near the depot. Where that is the API was asked, as the person.
+    assert_eq!(
+        bot.places.asked(),
+        [("Хрещатик 22".to_owned(), Some(the_depot()))]
+    );
+    assert_eq!(
+        bot.api.asked_since(),
+        [
+            Asked::Login {
+                telegram_id: ADA,
+                request_id: bot.last_request(),
+            },
+            Asked::GetDepot {
+                token: "token-1".to_owned(),
+            },
+        ]
+    );
+
+    let asked = bot.presses(&found, "Yes, an order there").await;
+    assert_eq!(
+        asked.text,
+        format!(
+            "An order at {KHRESHCHATYK} (50.44770, 30.52220).\n\
+             Is it a delivery to there, or a pickup from there?"
+        )
+    );
+    assert_eq!(labels(&asked), [vec!["Delivery", "Pickup"], vec!["Cancel"]]);
+    assert!(asked.in_place, "in the place of the question it answers");
+    // Picking a place asks nobody anything: what was found is the bot's to remember.
+    assert_eq!(bot.places.asked().len(), 1);
+    assert_eq!(bot.api.asked_since(), []);
+
+    let mut shown = asked;
+    for label in ["Pickup", "3", "Today, Mon 12 Oct"] {
+        shown = bot.presses(&shown, label).await;
+    }
+    let placed = bot.presses(&shown, "Place the order").await;
+    assert!(
+        placed
+            .text
+            .starts_with("Placed: a pickup of 3 parcels from")
+    );
+    // The order is at the place the service gave, under the name it gave it.
+    let order = OrderRequest {
+        kind: OrderKind::Pickup,
+        service_date: date(12),
+        location: LatLon::new(50.4477, 30.5222).unwrap(),
+        address: Some(KHRESHCHATYK.to_owned()),
+        demand: 3,
+    };
+    let created: Vec<Asked> = bot
+        .api
+        .asked()
+        .into_iter()
+        .filter(|asked| matches!(asked, Asked::CreateOrder { .. }))
+        .collect();
+    assert_eq!(
+        created,
+        [Asked::CreateOrder {
+            token: bot.api.last_token(),
+            request_id: bot.last_request(),
+            order,
+        }]
+    );
+}
+
+/// A street has its name in many towns. The places are listed, each with a number,
+/// and the number that is pressed is the place.
+#[tokio::test]
+async fn of_several_places_the_one_whose_number_is_pressed_is_taken() {
+    let bot = bot_that_looks_addresses_up();
+    let places = vec![
+        a_place(KHRESHCHATYK, 0.0),
+        a_place(KHRESHCHATYK_IN_DNIPRO, -2.0),
+        a_place("Хрещатик, Черкаси, Україна", -1.0),
+    ];
+    bot.places.answers("Хрещатик 22", Ok(places));
+
+    let found = bot.says(10, "Хрещатик 22").await;
+    assert_eq!(
+        found.text,
+        format!(
+            "Which of these is it?\n1. {KHRESHCHATYK}\n2. {KHRESHCHATYK_IN_DNIPRO}\n\
+             3. Хрещатик, Черкаси, Україна\n\n{CREDIT}"
+        )
+    );
+    assert_eq!(labels(&found), [vec!["1", "2", "3"], vec!["None of these"]]);
+
+    let asked = bot.presses(&found, "2").await;
+    assert!(
+        asked.text.starts_with(&format!(
+            "An order at {KHRESHCHATYK_IN_DNIPRO} (48.44770, 30.52220)."
+        )),
+        "{}",
+        asked.text
+    );
+    // The search is over with that. Its other buttons went with the message they
+    // were under, and one that is pressed all the same picks nothing.
+    let late = bot.presses(&found, "1").await;
+    assert_eq!((late.text.as_str(), late.in_place), (STALE_SEARCH, true));
+    // The order that was begun is still the one that is being put together.
+    let still = bot.presses(&asked, "Delivery").await;
+    assert!(
+        still
+            .text
+            .starts_with("A delivery to 22, Хрещатик вулиця, Дніпро")
+    );
+}
+
+#[tokio::test]
+async fn an_address_that_nothing_is_found_for_begins_nothing() {
+    let bot = bot_that_looks_addresses_up();
+
+    let none = bot.says(10, "the house with the green door").await;
+    assert_eq!(
+        none.text,
+        "I found no place by that. Write the street and the number, with the town. \
+         Or: share the location, or write its coordinates: /order 50.4501 30.5234"
+    );
+    assert_eq!(none.keys, Keys::None);
+    // Nothing was begun, so there is nothing to drop.
+    let nothing = bot.says(11, "/cancel").await;
+    assert!(
+        nothing
+            .text
+            .starts_with("You are not putting an order together")
+    );
+}
+
+#[tokio::test]
+async fn none_of_the_places_is_an_answer_too() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+
+    let found = bot.says(10, "Хрещатик").await;
+    let none = bot.presses(&found, "No").await;
+    assert_eq!(
+        none.text,
+        "Then I do not know the place. Write more of its address, with the town. \
+         Or: share the location, or write its coordinates: /order 50.4501 30.5234"
+    );
+    assert_eq!((&none.keys, none.in_place), (&Keys::None, true));
+    // Said once. The buttons are gone, and a press that was on its way finds nothing.
+    for label in ["No", "Yes, an order there"] {
+        let late = bot.presses(&found, label).await;
+        assert_eq!(late.text, STALE_SEARCH, "{label}");
+    }
+    assert!(bot.api.orders().is_empty());
+}
+
+/// A search is the chat's last one. The places of the one before are no longer on
+/// offer, whatever their buttons still say.
+#[tokio::test]
+async fn a_new_search_takes_the_place_of_the_one_before() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик 22", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+    bot.places.answers(
+        "Хрещатик 22 Дніпро",
+        Ok(vec![a_place(KHRESHCHATYK_IN_DNIPRO, -2.0)]),
+    );
+
+    let first = bot.says(10, "Хрещатик 22").await;
+    let second = bot.says(11, "Хрещатик 22 Дніпро").await;
+    let late = bot.presses(&first, "Yes, an order there").await;
+    assert_eq!(late.text, STALE_SEARCH);
+
+    let asked = bot.presses(&second, "Yes, an order there").await;
+    assert!(asked.text.contains("Дніпро"), "{}", asked.text);
+
+    // And /cancel drops a search that waits for its place as it drops an order.
+    bot.says(12, "Хрещатик 22").await;
+    let dropped = bot.says(13, "/cancel").await;
+    assert_eq!(dropped.text, "Dropped: nothing was placed.");
+}
+
+/// A button that names a place the search never had picks nothing.
+#[tokio::test]
+async fn a_place_that_was_not_among_those_found_is_not_taken() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик 22", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+    bot.says(10, "Хрещатик 22").await;
+
+    for made_up in [
+        Press::Found(10, 1),
+        Press::Found(11, 0),
+        Press::NotFound(11),
+    ] {
+        let reply = bot.sends(&made_up.data()).await;
+        assert_eq!(reply.text, STALE_SEARCH, "{made_up:?}");
+    }
+    // Before anything was ever searched for, too.
+    let fresh = bot_that_looks_addresses_up();
+    let reply = fresh.sends(&Press::Found(10, 0).data()).await;
+    assert_eq!(reply.text, STALE_SEARCH);
+}
+
+#[tokio::test]
+async fn a_service_that_is_away_or_busy_is_said_to_be_and_the_other_ways_are_named() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places.answers(
+        "Хрещатик 22",
+        Err(Unfound::Away("it answered 503".to_owned())),
+    );
+    let away = bot.says(10, "Хрещатик 22").await;
+    assert_eq!(
+        away.text,
+        "The address service does not answer right now. Share the location, or write its \
+         coordinates: /order 50.4501 30.5234"
+    );
+    assert_eq!(away.keys, Keys::None);
+
+    bot.places.answers("Хрещатик 22", Err(Unfound::Busy));
+    let busy = bot.says(11, "Хрещатик 22").await;
+    assert_eq!(
+        busy.text,
+        "Too many addresses are being looked up at this moment. Try again in a few seconds."
+    );
+    // What the service said of itself is for the log, and not for the chat.
+    assert!(!away.text.contains("503"));
+}
+
+/// Where the depot is makes a search better and is not what a search needs. An API
+/// that does not answer, or has no depot yet, does not stand in the way of one.
+#[tokio::test]
+async fn an_address_is_looked_up_without_the_depot_when_the_api_does_not_say_where_it_is() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик 22", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+
+    bot.api
+        .fail_login(Failure::Away("connection refused".to_owned()));
+    let found = bot.says(10, "Хрещатик 22").await;
+    assert!(
+        found.text.starts_with("Is it this place?"),
+        "{}",
+        found.text
+    );
+
+    bot.api.fail_next(Failure::Refused {
+        status: 500,
+        detail: "something went wrong on the server".to_owned(),
+    });
+    let found = bot.says(11, "Хрещатик 22").await;
+    assert!(
+        found.text.starts_with("Is it this place?"),
+        "{}",
+        found.text
+    );
+
+    bot.api.has_no_depot();
+    let found = bot.says(12, "Хрещатик 22").await;
+    assert!(
+        found.text.starts_with("Is it this place?"),
+        "{}",
+        found.text
+    );
+
+    let near: Vec<Option<LatLon>> = bot
+        .places
+        .asked()
+        .into_iter()
+        .map(|(_, near)| near)
+        .collect();
+    assert_eq!(near, [None, None, None]);
+}
+
+#[tokio::test]
+async fn after_order_comes_a_pair_of_numbers_or_an_address() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик 22, Київ", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+
+    let found = bot.says(10, "/order Хрещатик 22, Київ").await;
+    assert_eq!(labels(&found), [vec!["Yes, an order there"], vec!["No"]]);
+    assert_eq!(bot.places.asked().len(), 1);
+
+    // Two numbers are a place already, and nobody is asked where they are.
+    let asked = bot.says(11, "/order 50.4501 30.5234").await;
+    assert!(asked.text.starts_with("An order at 50.45010, 30.52340."));
+    assert_eq!(bot.places.asked().len(), 1);
+    // A location that is shared is one as well.
+    let asked = bot.shares(12, 50.4501, 30.5234).await;
+    assert!(asked.text.starts_with("An order at 50.45010, 30.52340."));
+    assert_eq!(bot.places.asked().len(), 1);
+
+    // And /order alone says how an order is begun, with the address among the ways.
+    let how = bot.says(13, "/order").await;
+    assert_eq!(
+        how.text,
+        format!("To place an order, {HOW_TO_BEGIN_BY_ADDRESS}")
+    );
+    assert_eq!(how.keys, Keys::ShareLocation);
+}
+
+/// What is sent to the service is an address a person wrote: not a novel, and not
+/// nothing. A command is never sent, whether it is one the bot knows or not.
+#[tokio::test]
+async fn only_what_could_be_an_address_is_sent_to_the_service() {
+    let bot = bot_that_looks_addresses_up();
+
+    let long = "вулиця ".repeat(40);
+    let refused = bot.says(10, &long).await;
+    assert!(
+        refused
+            .text
+            .starts_with("That is too long for an address: I read up to 200 letters of one."),
+        "{}",
+        refused.text
+    );
+    assert_eq!(bot.places.asked(), []);
+    assert_eq!(
+        bot.api.asked(),
+        [],
+        "and the depot was not asked for either"
+    );
+
+    // Two hundred letters are still an address, counted as letters and not as bytes.
+    let longest = "я".repeat(200);
+    bot.says(11, &longest).await;
+    assert_eq!(bot.places.asked().len(), 1);
+
+    // A sticker, a photograph or a voice is no address.
+    let sender = bot.sender_on(TODAY, 12);
+    let reply = bot.chats.handle(&sender, Event::Other).await;
+    assert_eq!(reply.text, NOT_UNDERSTOOD_BY_ADDRESS);
+    // Nor is a command.
+    for command in ["/help", "/orders", "/cancel", "/start"] {
+        bot.says(13, command).await;
+    }
+    // Nor what was meant as one: a command the bot does not have, or one with a
+    // letter missing, whatever follows it.
+    for mistaken in ["/track", " /oder Хрещатик 22", "/", "/відміна"] {
+        let reply = bot.says(14, mistaken).await;
+        assert_eq!(reply.text, NOT_UNDERSTOOD_BY_ADDRESS, "{mistaken}");
+    }
+    assert_eq!(bot.places.asked().len(), 1);
+}
+
+/// The dialogue has three buttons for places. A service that answers with more is
+/// shown by its first three, the likeliest, and no button names a place beyond them.
+#[tokio::test]
+async fn of_more_places_than_there_are_buttons_for_the_first_are_shown() {
+    let bot = bot_that_looks_addresses_up();
+    let places = (1..=5)
+        .map(|number| a_place(&format!("Place {number}"), f64::from(number) / 100.0))
+        .collect();
+    bot.places.answers("a street", Ok(places));
+
+    let found = bot.says(10, "a street").await;
+    assert_eq!(
+        found.text,
+        format!("Which of these is it?\n1. Place 1\n2. Place 2\n3. Place 3\n\n{CREDIT}")
+    );
+    assert_eq!(labels(&found), [vec!["1", "2", "3"], vec!["None of these"]]);
+    let beyond = bot.sends(&Press::Found(10, 3).data()).await;
+    assert_eq!(beyond.text, STALE_SEARCH);
+}
+
+/// Nor does a name go into a message at any length: Telegram takes 4096 letters of
+/// one, and the API 300 of an address.
+#[tokio::test]
+async fn of_a_name_as_much_is_shown_as_an_address_may_be() {
+    let bot = bot_that_looks_addresses_up();
+    let endless = "вулиця ".repeat(2_000);
+    let places = (0..3)
+        .map(|north| a_place(&format!("{north} {endless}"), f64::from(north) / 100.0))
+        .collect();
+    bot.places.answers("a street", Ok(places));
+
+    let found = bot.says(10, "a street").await;
+    assert!(found.text.chars().count() < 1_000, "{}", found.text.len());
+    let asked = bot.presses(&found, "2").await;
+    let cut: String = format!("1 {endless}").chars().take(300).collect();
+    assert_eq!(
+        asked.text.lines().next().unwrap(),
+        format!("An order at {cut} (50.45770, 30.52220).")
+    );
+}
+
+#[tokio::test]
+async fn help_names_the_address_among_the_ways_to_begin_only_where_addresses_are_looked_up() {
+    let with = bot_that_looks_addresses_up();
+    let help = with.says(1, "/help").await;
+    assert!(help.text.contains("Or write its address"), "{}", help.text);
+    assert!(
+        help.text
+            .starts_with(&format!("To place an order, {HOW_TO_BEGIN_BY_ADDRESS}"))
+    );
+
+    let without = bot();
+    let help = without.says(1, "/help").await;
+    assert!(!help.text.contains("address"), "{}", help.text);
+    // And there, words are still words, and are sent to nobody.
+    let words = without.says(2, "Хрещатик 22").await;
+    assert_eq!(words.text, NOT_UNDERSTOOD);
+    let numbers = without.says(3, "/order Хрещатик 22").await;
+    assert!(
+        numbers
+            .text
+            .starts_with("After /order I read a latitude and a longitude")
+    );
+    assert_eq!(without.places.asked(), []);
+    assert_eq!(
+        without.sends(&Press::Found(10, 0).data()).await.text,
+        STALE_SEARCH
+    );
+}
+
+/// One who searches and never picks leaves a search behind, as one who begins an
+/// order and never ends it leaves a draft. Both are bounded, the oldest going first.
+#[tokio::test]
+async fn the_searches_that_are_kept_are_bounded() {
+    let bot = bot_that_looks_addresses_up();
+    bot.places
+        .answers("Хрещатик 22", Ok(vec![a_place(KHRESHCHATYK, 0.0)]));
+    let search_in = async |chat: i64| {
+        let sender = Sender {
+            chat,
+            telegram_id: ADA,
+            message: 10,
+            today: date(TODAY),
+            request_id: format!("tg-{chat}"),
+        };
+        let asked = Event::Text("Хрещатик 22".to_owned());
+        (sender.clone(), bot.chats.handle(&sender, asked).await)
+    };
+
+    let (first, found) = search_in(1).await;
+    for chat in 2..=MOST_DRAFTS as i64 + 1 {
+        search_in(chat).await;
+    }
+    assert_eq!(bot.chats.searches().len(), MOST_DRAFTS);
+    // The first chat's search was the oldest, and is the one that went.
+    let pick = Event::Pressed(data_of(&found, "Yes, an order there"));
+    assert_eq!(
+        bot.chats.handle(&first, pick.clone()).await.text,
+        STALE_SEARCH
+    );
+    // The second chat's is still there.
+    let second = Sender { chat: 2, ..first };
+    let asked = bot.chats.handle(&second, pick).await;
+    assert!(asked.text.starts_with("An order at 22, Хрещатик вулиця"));
 }

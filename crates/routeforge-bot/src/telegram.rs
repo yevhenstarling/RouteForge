@@ -31,6 +31,11 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::api::HttpApi;
 use crate::chat::{COMMANDS, Chats, Command, Event, Key, Keys, Place, Reply, Sender};
+use crate::geocode::Nominatim;
+
+/// The dialogue as the bot runs it: against the API over HTTP, and with the geocoding
+/// service it was given, if it was given one (D72).
+pub(crate) type Dialogue = Chats<HttpApi, Option<Nominatim>>;
 
 /// How the bot paces itself towards Telegram.
 #[derive(Clone, Copy, Debug)]
@@ -86,7 +91,7 @@ pub(crate) fn bot(token: &str, api_url: Option<Url>) -> anyhow::Result<Bot> {
 /// process that ends says so more clearly than one that goes on trying.
 pub(crate) async fn run(
     bot: Bot,
-    chats: Arc<Chats<HttpApi>>,
+    chats: Arc<Dialogue>,
     pace: Pace,
     mut stopping: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -193,7 +198,7 @@ fn schema() -> UpdateHandler<RequestError> {
 
 async fn on_message(
     bot: Bot,
-    chats: Arc<Chats<HttpApi>>,
+    chats: Arc<Dialogue>,
     update: Update,
     message: Message,
 ) -> Result<(), RequestError> {
@@ -216,7 +221,7 @@ async fn on_message(
 
 async fn on_button(
     bot: Bot,
-    chats: Arc<Chats<HttpApi>>,
+    chats: Arc<Dialogue>,
     update: Update,
     query: CallbackQuery,
 ) -> Result<(), RequestError> {

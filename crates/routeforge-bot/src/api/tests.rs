@@ -14,7 +14,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::*;
-use crate::testing::{a_delivery, a_plan, a_user, an_order, date, documented};
+use crate::testing::{a_delivery, a_depot, a_plan, a_user, an_order, date, documented};
 
 const KEY: &str = "the key the bot shows, in the tests of its requests";
 const TOKEN: &str = "the.token.of-the-person";
@@ -183,6 +183,33 @@ async fn everything_else_is_asked_with_the_token_of_the_person() {
     assert_eq!(api.list_plans(&WHO, date(13)).await.unwrap(), [plan]);
     let request = asked_as_the_person(&server).await;
     assert_eq!(request.url.query(), Some("service_date=2026-10-13"));
+}
+
+/// Where the depot is, which the bot asks so that an address is looked for near it.
+#[tokio::test]
+async fn the_depot_is_read_as_the_person_and_one_that_is_not_set_is_none() {
+    let server = MockServer::start().await;
+    let api = api(&server);
+    let depot = a_depot();
+    answers(&server, "get_depot", None, sent(200, &depot)).await;
+    assert_eq!(api.get_depot(&WHO).await.unwrap(), Some(depot));
+    assert!(asked_as_the_person(&server).await.body.is_empty());
+    server.reset().await;
+
+    // What the API answers before an admin has set one.
+    let not_yet = problem(404, Some("no depot has been set yet"), &[]);
+    answers(&server, "get_depot", None, not_yet).await;
+    assert_eq!(api.get_depot(&WHO).await.unwrap(), None);
+    server.reset().await;
+
+    // Any other refusal is a refusal.
+    let stale = problem(401, Some("the token is not valid"), &[]);
+    answers(&server, "get_depot", None, stale).await;
+    let refused = api.get_depot(&WHO).await.unwrap_err();
+    assert!(
+        matches!(refused, Failure::Refused { status: 401, .. }),
+        "{refused:?}"
+    );
 }
 
 #[tokio::test]

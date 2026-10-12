@@ -19,6 +19,10 @@ pub(crate) struct Config {
     /// Where the Bot API is, if it is not where Telegram has it: a server of one's
     /// own, or what stands in for Telegram in a test.
     pub(crate) telegram_api_url: Option<Url>,
+    /// A geocoding service that speaks as Nominatim does, to ask where an address is.
+    /// Without one the bot asks nobody, and takes a place as a location or as
+    /// coordinates (D72).
+    pub(crate) geocoder_url: Option<Url>,
 }
 
 impl Config {
@@ -38,6 +42,7 @@ impl Config {
         Ok(Self {
             api_url,
             telegram_api_url: address(&var, "TELEGRAM_API_URL")?,
+            geocoder_url: address(&var, "GEOCODER_URL")?,
         })
     }
 }
@@ -143,6 +148,9 @@ mod tests {
             Config {
                 api_url: "http://127.0.0.1:8080".to_owned(),
                 telegram_api_url: None,
+                // Nobody to ask where an address is: the bot asks no third party
+                // unless it is given one (D72).
+                geocoder_url: None,
             }
         );
         assert!(secrets(&[]).unwrap().is_none());
@@ -155,12 +163,17 @@ mod tests {
         let config = config(&[
             ("BOT_API_URL", " http://api:8080/ "),
             ("TELEGRAM_API_URL", "http://127.0.0.1:8081"),
+            ("GEOCODER_URL", "https://nominatim.openstreetmap.org"),
         ])
         .unwrap();
         assert_eq!(config.api_url, "http://api:8080");
         assert_eq!(
             config.telegram_api_url.unwrap().as_str(),
             "http://127.0.0.1:8081/"
+        );
+        assert_eq!(
+            config.geocoder_url.unwrap().as_str(),
+            "https://nominatim.openstreetmap.org/"
         );
         // An API behind a path keeps the path.
         let behind = self::config(&[("BOT_API_URL", "https://example.com/routeforge/")]).unwrap();
@@ -182,6 +195,7 @@ mod tests {
         let empty = [
             ("BOT_API_URL", ""),
             ("TELEGRAM_API_URL", "  "),
+            ("GEOCODER_URL", ""),
             ("TELEGRAM_BOT_TOKEN", ""),
             ("BOT_SERVICE_KEY", KEY),
         ];
@@ -191,7 +205,7 @@ mod tests {
 
     #[test]
     fn an_address_that_is_none_is_refused_by_name_and_not_repeated() {
-        for name in ["BOT_API_URL", "TELEGRAM_API_URL"] {
+        for name in ["BOT_API_URL", "TELEGRAM_API_URL", "GEOCODER_URL"] {
             for value in [
                 "api:8080",
                 "the API",
@@ -287,8 +301,13 @@ mod tests {
             Config {
                 api_url: "http://api:8080".to_owned(),
                 telegram_api_url: None,
+                // And it sends what people write to nobody: a geocoding service is
+                // somebody's own choice (D72).
+                geocoder_url: None,
             }
         );
+        // It is passed on from `.env` when it is there, and has no fallback either.
+        assert!(bot.contains(&"GEOCODER_URL:".to_owned()), "{bot:#?}");
         assert!(Secrets::from_vars(on_a_clone).unwrap().is_none());
         // The token is passed on from `.env` when it is there, and has no fallback.
         assert!(bot.contains(&"TELEGRAM_BOT_TOKEN:".to_owned()), "{bot:#?}");

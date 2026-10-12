@@ -11,6 +11,12 @@
 //! needs beside it, shows what it is about to place, and places it when that is
 //! confirmed. Everything else is a command.
 //!
+//! A bot that was given a geocoding service takes a place in words as well (D72). It
+//! asks the service where that is, shows the places it found, and the one that is
+//! picked begins the order. Words that are no command are then an address. The bot
+//! reads no more into them than that, and never acts on them: what a search finds is
+//! shown, and picked by a button.
+//!
 //! Three things hold throughout:
 //!
 //! - **The bot has no authority of its own (D9).** What it asks of the API it asks
@@ -37,10 +43,16 @@ use routeforge_domain::{
 use tracing::{error, info, warn};
 
 use crate::api::{Api, Caller, Failure};
+use crate::geocode::{Found, Geocoder, MOST_FOUND, Unfound};
 
 /// How many drafts are kept. One who begins an order and never ends it leaves a draft
-/// behind, and nothing else would ever take it away.
+/// behind, and nothing else would ever take it away. As many searches for an address
+/// are kept, for the same reason.
 const MOST_DRAFTS: usize = 1024;
+
+/// The longest text that is looked up as an address. No address is longer, and what
+/// is, is not sent to a service to make something of.
+const ADDRESS_ASKED_LONGEST: usize = 200;
 
 /// The most parcels a button offers.
 const MOST_PARCELS: u32 = 5;
@@ -66,6 +78,18 @@ const HOW_TO_BEGIN: &str = "share its place: the button below, or the paperclip 
 const STALE: &str = "This order is no longer open: it was placed or dropped, or you began \
     another. Share a location to begin a new one.";
 const AWAY: &str = "The service does not answer right now. Try again in a moment.";
+
+// The same two, for a bot that looks addresses up (D72).
+const NOT_UNDERSTOOD_BY_ADDRESS: &str = "An order begins with a location or with an address \
+    in words, and everything else is a command: /help lists them.";
+const HOW_TO_BEGIN_BY_ADDRESS: &str = "share its place: the button below, or the paperclip \
+    and then Location. Or write its address, with the town: Khreshchatyk 22, Kyiv. \
+    Coordinates will do as well: /order 50.4501 30.5234";
+const OTHER_WAYS: &str = "Share the location, or write its coordinates: /order 50.4501 30.5234";
+const STALE_SEARCH: &str = "That search is over: a place was picked, or you searched again. \
+    Write the address once more to look for it.";
+/// Where the places of a search are from. Whoever shows them owes that word.
+const CREDIT: &str = "Places: © OpenStreetMap contributors.";
 
 /// What the bot understands beside a location.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,12 +267,19 @@ pub(crate) enum Press {
     PlanYes(NaiveDate),
     PlanNo,
     Status(NaiveDate),
+    /// One of the places a search for an address found: the search by the message
+    /// that asked it, and the place by where it stands among those found.
+    Found(i32, u8),
+    /// None of them.
+    NotFound(i32),
 }
 
 impl Press {
     /// What the button carries.
     pub(crate) fn data(self) -> String {
         match self {
+            Self::Found(search, place) => format!("f:{search}:{place}"),
+            Self::NotFound(search) => format!("fx:{search}"),
             Self::Kind(draft, kind) => format!("k:{draft}:{kind}"),
             Self::Parcels(draft, parcels) => format!("n:{draft}:{parcels}"),
             Self::Day(draft, day) => format!("d:{draft}:{day}"),
@@ -287,6 +318,10 @@ impl Press {
             ("py", Some(day), None) => Self::PlanYes(day.parse().ok()?),
             ("pn", None, None) => Self::PlanNo,
             ("s", Some(day), None) => Self::Status(day.parse().ok()?),
+            ("f", Some(search), Some(place)) => {
+                Self::Found(search.parse().ok()?, place.parse().ok()?)
+            }
+            ("fx", Some(search), None) => Self::NotFound(search.parse().ok()?),
             _ => return None,
         };
         parts.next().is_none().then_some(press)
@@ -367,20 +402,38 @@ impl Draft {
     }
 }
 
-/// The chats the bot is in, and the API it asks on their behalf.
-pub(crate) struct Chats<A> {
+/// The places a search for an address found, until one of them is picked.
+#[derive(Clone, Debug, PartialEq)]
+struct Search {
+    /// The message that asked, which the buttons of its places name.
+    id: i32,
+    /// When it was made, among all the drafts and searches there are.
+    age: u64,
+    found: Vec<Found>,
+}
+
+/// The chats the bot is in, the API it asks on their behalf, and what it asks where an
+/// address is.
+pub(crate) struct Chats<A, G> {
     api: A,
+    /// What finds where an address is. A bot that has none takes none (D72).
+    geocoder: G,
     /// The order each chat is putting together, if it is.
     drafts: Mutex<HashMap<i64, Draft>>,
-    /// How many drafts were ever begun: the age of the next one.
+    /// The search for an address each chat has made last, if its places still wait
+    /// for one of them to be picked.
+    searches: Mutex<HashMap<i64, Search>>,
+    /// How many drafts and searches were ever begun: the age of the next one.
     begun: AtomicU64,
 }
 
-impl<A: Api> Chats<A> {
-    pub(crate) fn new(api: A) -> Self {
+impl<A: Api, G: Geocoder> Chats<A, G> {
+    pub(crate) fn new(api: A, geocoder: G) -> Self {
         Self {
             api,
+            geocoder,
             drafts: Mutex::new(HashMap::new()),
+            searches: Mutex::new(HashMap::new()),
             begun: AtomicU64::new(0),
         }
     }
@@ -391,16 +444,32 @@ impl<A: Api> Chats<A> {
         match event {
             Event::Text(text) => match Command::read(&text) {
                 Some((command, arguments)) => self.command(sender, command, arguments).await,
-                None => Reply::new(NOT_UNDERSTOOD),
+                None if !self.geocoder.is_on() => Reply::new(NOT_UNDERSTOOD),
+                // What begins as a command and is none was meant as one, and is no
+                // address to ask anybody about.
+                None if text.trim_start().starts_with('/') => Reply::new(NOT_UNDERSTOOD_BY_ADDRESS),
+                // Other words are an address, to a bot that looks addresses up.
+                None => self.look_up(sender, &text).await,
             },
-            Event::Place(place) => self.begin(sender, place),
+            Event::Place(place) => self.begin(sender, place, false),
             Event::Pressed(data) => match Press::read(&data) {
                 Some(press) => self.pressed(sender, press).await,
                 None => Reply::in_place(
                     "That button is not one I know any more. /help lists what I understand.",
                 ),
             },
+            Event::Other if self.geocoder.is_on() => Reply::new(NOT_UNDERSTOOD_BY_ADDRESS),
             Event::Other => Reply::new(NOT_UNDERSTOOD),
+        }
+    }
+
+    /// How an order is begun, in the words for a bot that takes addresses or for one
+    /// that does not.
+    fn how_to_begin(&self) -> &'static str {
+        if self.geocoder.is_on() {
+            HOW_TO_BEGIN_BY_ADDRESS
+        } else {
+            HOW_TO_BEGIN
         }
     }
 
@@ -408,7 +477,7 @@ impl<A: Api> Chats<A> {
         match command {
             Command::Start => self.help(sender, true).await,
             Command::Help => self.help(sender, false).await,
-            Command::Order => self.order(sender, arguments),
+            Command::Order => self.order(sender, arguments).await,
             Command::Orders => self.orders(sender).await,
             Command::Cancel => self.cancel(sender),
             Command::Pending => {
@@ -442,6 +511,8 @@ impl<A: Api> Chats<A> {
             Press::PlanYes(day) => self.plan(sender, day).await,
             Press::PlanNo => Reply::in_place("Nothing was planned."),
             Press::Status(day) => self.status(sender, day).await,
+            Press::Found(search, place) => self.pick(sender, search, place),
+            Press::NotFound(search) => self.pick_none(sender, search),
         }
     }
 
@@ -476,9 +547,10 @@ impl<A: Api> Chats<A> {
             );
         }
         text.push_str(&format!(
-            "To place an order, {HOW_TO_BEGIN}\n\n\
+            "To place an order, {}\n\n\
              /orders shows your orders from today on, to look at or to withdraw.\n\
-             /cancel drops the order you are putting together."
+             /cancel drops the order you are putting together.",
+            self.how_to_begin()
         ));
         // Who is asking decides what else is worth saying. With the API away, what
         // was said so far is true for everybody.
@@ -510,23 +582,25 @@ impl<A: Api> Chats<A> {
 
     // ------------------------------------------------------------ placing an order
 
-    fn order(&self, sender: &Sender, arguments: &str) -> Reply {
+    async fn order(&self, sender: &Sender, arguments: &str) -> Reply {
         if arguments.is_empty() {
             return Reply {
-                text: format!("To place an order, {HOW_TO_BEGIN}"),
+                text: format!("To place an order, {}", self.how_to_begin()),
                 keys: Keys::ShareLocation,
                 in_place: false,
             };
         }
         match coordinates(arguments) {
-            Some((lat, lon)) => self.begin(
-                sender,
-                Place {
+            Some((lat, lon)) => {
+                let place = Place {
                     lat,
                     lon,
                     address: None,
-                },
-            ),
+                };
+                self.begin(sender, place, false)
+            }
+            // What is no pair of numbers is an address, to a bot that looks them up.
+            None if self.geocoder.is_on() => self.look_up(sender, arguments).await,
             None => Reply::new(
                 "After /order I read a latitude and a longitude in degrees, as in \
                  /order 50.4501 30.5234",
@@ -534,8 +608,171 @@ impl<A: Api> Chats<A> {
         }
     }
 
+    // ------------------------------------------------------------ a place in words
+
+    /// Asks where an address is, and shows what was found, each place with a button.
+    /// Nothing is begun here: the press of one of those buttons begins the order.
+    async fn look_up(&self, sender: &Sender, words: &str) -> Reply {
+        let words = words.trim();
+        if words.is_empty() {
+            return Reply::new(NOT_UNDERSTOOD_BY_ADDRESS);
+        }
+        if words.chars().count() > ADDRESS_ASKED_LONGEST {
+            return Reply::new(format!(
+                "That is too long for an address: I read up to {ADDRESS_ASKED_LONGEST} \
+                 letters of one. {OTHER_WAYS}"
+            ));
+        }
+        let near = self.depot(sender).await;
+        let found = match self.geocoder.find(words, near).await {
+            // The service is somebody else's, and what it says goes into a message. So:
+            // as many places as there are buttons for, and of each name as much as
+            // the address of an order may be.
+            Ok(found) => found
+                .into_iter()
+                .take(MOST_FOUND)
+                .map(|place| Found {
+                    name: place.name.chars().take(ADDRESS_LONGEST).collect(),
+                    ..place
+                })
+                .collect::<Vec<_>>(),
+            Err(Unfound::Busy) => {
+                return Reply::new(
+                    "Too many addresses are being looked up at this moment. Try again in a \
+                     few seconds.",
+                );
+            }
+            Err(unfound @ Unfound::Away(_)) => {
+                warn!(%unfound, "could not look an address up");
+                return Reply::new(format!(
+                    "The address service does not answer right now. {OTHER_WAYS}"
+                ));
+            }
+        };
+        if found.is_empty() {
+            return Reply::new(format!(
+                "I found no place by that. Write the street and the number, with the town. \
+                 Or: {}",
+                lower_first(OTHER_WAYS)
+            ));
+        }
+
+        let none = Press::NotFound(sender.message);
+        let place = |at: u8| Press::Found(sender.message, at);
+        let (text, rows) = match found.as_slice() {
+            [only] => (
+                format!("Is it this place?\n{}\n\n{CREDIT}", only.name),
+                vec![key("Yes, an order there", place(0)), key("No", none)],
+            ),
+            many => {
+                // A button carries where its place stands, counted from nought, and
+                // shows the number the list gives it, counted from one.
+                let listed: Vec<String> = (1..)
+                    .zip(many)
+                    .map(|(number, found)| format!("{number}. {}", found.name))
+                    .collect();
+                let numbers = (0..)
+                    .zip(many)
+                    .map(|(at, _)| Key {
+                        label: (u32::from(at) + 1).to_string(),
+                        press: place(at),
+                    })
+                    .collect();
+                (
+                    format!("Which of these is it?\n{}\n\n{CREDIT}", listed.join("\n")),
+                    vec![numbers, key("None of these", none)],
+                )
+            }
+        };
+        self.remember(
+            sender.chat,
+            Search {
+                id: sender.message,
+                age: self.begun.fetch_add(1, Ordering::Relaxed),
+                found,
+            },
+        );
+        Reply::new(text).with(rows)
+    }
+
+    /// Where the depot is, so that an address is looked for round it: a street has
+    /// its name in many towns. `None` when the API does not say, and then nothing is
+    /// preferred.
+    async fn depot(&self, sender: &Sender) -> Option<LatLon> {
+        let session = self
+            .api
+            .telegram_login(sender.telegram_id, &sender.request_id)
+            .await
+            .ok()?;
+        let depot = self.api.get_depot(&caller(&session, sender)).await.ok()??;
+        Some(depot.location)
+    }
+
+    /// Keeps what a search found, in the place of what the chat searched for before.
+    fn remember(&self, chat: i64, search: Search) {
+        let mut searches = self.searches();
+        searches.insert(chat, search);
+        if searches.len() > MOST_DRAFTS {
+            let oldest = searches
+                .iter()
+                .min_by_key(|(_, search)| search.age)
+                .map(|(chat, _)| *chat);
+            if let Some(oldest) = oldest {
+                searches.remove(&oldest);
+            }
+        }
+    }
+
+    /// Begins an order at the place of a search that was picked. The search is over
+    /// with that: its other places go with the message they were listed in.
+    fn pick(&self, sender: &Sender, id: i32, place: u8) -> Reply {
+        let picked = {
+            let mut searches = self.searches();
+            match searches.get(&sender.chat) {
+                Some(search) if search.id == id => searches
+                    .remove(&sender.chat)
+                    .and_then(|search| search.found.into_iter().nth(usize::from(place))),
+                _ => None,
+            }
+        };
+        match picked {
+            Some(found) => {
+                let place = Place {
+                    lat: found.location.lat(),
+                    lon: found.location.lon(),
+                    address: Some(found.name),
+                };
+                self.begin(sender, place, true)
+            }
+            None => Reply::in_place(STALE_SEARCH),
+        }
+    }
+
+    fn pick_none(&self, sender: &Sender, id: i32) -> Reply {
+        let mut searches = self.searches();
+        match searches.get(&sender.chat) {
+            Some(search) if search.id == id => {
+                searches.remove(&sender.chat);
+                Reply::in_place(format!(
+                    "Then I do not know the place. Write more of its address, with the \
+                     town. Or: {}",
+                    lower_first(OTHER_WAYS)
+                ))
+            }
+            _ => Reply::in_place(STALE_SEARCH),
+        }
+    }
+
+    fn searches(&self) -> MutexGuard<'_, HashMap<i64, Search>> {
+        // Nothing is ever done under the lock that could leave the map half changed.
+        self.searches.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Begins an order at a place. An order the chat was putting together gives way.
-    fn begin(&self, sender: &Sender, place: Place) -> Reply {
+    ///
+    /// The first question is a message of its own under a location that was shared,
+    /// and takes the place of the list a place was picked from.
+    fn begin(&self, sender: &Sender, place: Place, in_place: bool) -> Reply {
         let Ok(location) = LatLon::new(place.lat, place.lon) else {
             return Reply::new(
                 "That is no position on Earth: a latitude runs from -90 to 90 and a \
@@ -561,7 +798,7 @@ impl<A: Api> Chats<A> {
             parcels: None,
             day: None,
         };
-        let question = draft.question(sender.today, false);
+        let question = draft.question(sender.today, in_place);
 
         let mut drafts = self.drafts();
         drafts.insert(sender.chat, draft);
@@ -683,11 +920,13 @@ impl<A: Api> Chats<A> {
     }
 
     fn cancel(&self, sender: &Sender) -> Reply {
-        match self.drafts().remove(&sender.chat) {
-            Some(_) => Reply::new("Dropped: nothing was placed."),
-            None => {
-                Reply::new("You are not putting an order together, so there is nothing to drop.")
-            }
+        // A search whose places still wait to be picked is the beginning of an order.
+        let searched = self.searches().remove(&sender.chat).is_some();
+        let drafted = self.drafts().remove(&sender.chat).is_some();
+        if searched || drafted {
+            Reply::new("Dropped: nothing was placed.")
+        } else {
+            Reply::new("You are not putting an order together, so there is nothing to drop.")
         }
     }
 
@@ -1100,6 +1339,15 @@ fn how_far(plan: &Plan) -> String {
             "the plan was discarded. Its orders are pending again, and the day can be planned afresh."
                 .to_owned()
         }
+    }
+}
+
+/// A sentence as it goes on after a colon: without the capital at its start.
+fn lower_first(words: &str) -> String {
+    let mut letters = words.chars();
+    match letters.next() {
+        Some(first) => first.to_lowercase().chain(letters).collect(),
+        None => String::new(),
     }
 }
 
