@@ -50,6 +50,7 @@ pub(crate) fn config() -> Config {
         heartbeat: Duration::from_millis(100),
         poll: Duration::from_millis(100),
         progress: Duration::from_millis(50),
+        roads: None,
     }
 }
 

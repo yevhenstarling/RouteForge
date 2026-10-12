@@ -16,8 +16,9 @@ use chrono::NaiveDate;
 use routeforge_domain::db::queue;
 use routeforge_domain::db::{couriers, depots, orders, plans, routes, users};
 use routeforge_domain::{
-    Courier, Depot, JobPayload, LatLon, NewCourier, NewDepot, NewOrder, NewPlan, NewRoute, NewUser,
-    OrderId, OrderKind, Plan, PlanCounts, Role, RouteBudget, User, UserId, WorkerId,
+    Courier, Depot, Distances, JobPayload, LatLon, NewCourier, NewDepot, NewOrder, NewPlan,
+    NewRoute, NewUser, OrderId, OrderKind, Plan, PlanCounts, Role, RouteBudget, User, UserId,
+    WorkerId,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -556,6 +557,7 @@ pub(crate) async fn work_one(pool: &PgPool) -> bool {
                 plan_id: *plan_id,
                 courier_id: *courier_id,
                 distance_m: 1_000,
+                distances: Distances::GreatCircle,
                 stops,
             };
             routes::insert(completion.conn(), &route).await.unwrap();

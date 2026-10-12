@@ -27,8 +27,8 @@ pub use dto::{
     PlanRequest, Problem, RoleChange, Session, SystemStats, TelegramLogin,
 };
 pub use geo::{
-    DistanceProvider, DistanceTable, EARTH_RADIUS_M, Haversine, InvalidLatLon, LatLon, Planar,
-    Projection, haversine_m,
+    DistanceProvider, DistanceTable, Distances, EARTH_RADIUS_M, Haversine, InvalidLatLon, LatLon,
+    Planar, Projection, haversine_m,
 };
 pub use ids::{CourierId, DepotId, JobId, OrderId, PlanId, RouteId, UserId, WorkerId};
 pub use job::{

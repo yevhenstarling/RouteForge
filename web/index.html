@@ -207,6 +207,8 @@ const NO_COURIER = '#8a8f98';
 const VANS = 4;
 // The share of the demo orders that are deliveries: four in five (D46).
 const DELIVERED = 0.8;
+// What the length of a route was measured along, as the API says it and in words (D66).
+const ALONG = { road: 'by road', great_circle: 'as the crow flies' };
 const SESSION = 'routeforge.session';
 // How often the orders of the day are read again without anybody having said that one
 // was placed. Whoever places one says so, but a word like that can be lost.
@@ -299,6 +301,11 @@ function carried(route) {
   const courier = state.couriers.find((known) => known.id === route.courier_id);
   const most = mostOnBoard(route.stops);
   return courier ? `at most ${most} of ${courier.capacity} on board` : `at most ${most} on board`;
+}
+
+/** What a stored route's length was measured along: `by road`, or `as the crow flies`. */
+function along(route) {
+  return ALONG[route.distances] || String(route.distances);
 }
 
 function nameOf(courierId) {
@@ -592,8 +599,8 @@ function drawRoutes() {
   for (const route of state.routes) {
     const stops = route.stops.map((stop) => point(stop.location));
     const round = [point(state.depot.location), ...stops, point(state.depot.location)];
-    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)}, ${route.stops.length} stops, `
-      + carried(route);
+    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)} ${along(route)}, `
+      + `${route.stops.length} stops, ${carried(route)}`;
     L.polyline(round, { renderer: lines, color: colourOf(route.courier_id), weight: 3, opacity: 0.95 })
       .bindTooltip(tip(words), { sticky: true })
       .addTo(layers.routes);
@@ -697,7 +704,7 @@ function renderRoutes() {
     let numbers = '';
     if (route) {
       numbers = km(route.distance_m);
-      stands += `, ${carried(route)}`;
+      stands += `, ${along(route)}, ${carried(route)}`;
     } else if (progress && job.status === 'running') {
       numbers = km(progress.best_cost_m);
       stands += `, ${moves(progress.iterations)}`;
@@ -711,10 +718,21 @@ function renderRoutes() {
     list.append(row);
   }
   $('routes').hidden = state.jobs.length === 0;
-  const total = state.routes.reduce((sum, route) => sum + route.distance_m, 0);
-  $('routes-total').textContent = state.routes.length > 0
-    ? `${km(total)} over ${state.routes.length} ${state.routes.length === 1 ? 'route' : 'routes'}.`
-    : '';
+  $('routes-total').textContent = totalOf(state.routes);
+}
+
+/**
+ * What the stored routes come to. A solver that is given a routing service measures by
+ * road, and falls back on great circles for a route the service gave nothing for
+ * (D66). So the routes of a plan may differ in that, and the sum says if they do.
+ */
+function totalOf(routes) {
+  if (routes.length === 0) return '';
+  const total = km(routes.reduce((sum, route) => sum + route.distance_m, 0));
+  const count = `${routes.length} ${routes.length === 1 ? 'route' : 'routes'}`;
+  const byRoad = routes.filter((route) => route.distances === 'road').length;
+  if (byRoad === routes.length || byRoad === 0) return `${total} ${along(routes[0])} over ${count}.`;
+  return `${total} over ${count}: ${byRoad} by road, ${routes.length - byRoad} as the crow flies.`;
 }
 
 function renderSystem() {

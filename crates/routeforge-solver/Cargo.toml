@@ -14,7 +14,12 @@ routeforge-tsp.workspace = true
 anyhow.workspace = true
 # For the jitter of the polling interval, from a generator seeded with the worker's id.
 rand.workspace = true
+# For asking an OSRM server for road distances (D66). It is on the compose network or
+# on this machine, so nothing of the TLS the workspace builds reqwest with is used.
+reqwest.workspace = true
+serde.workspace = true
 sqlx.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -22,6 +27,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 chrono.workspace = true
 serde_json.workspace = true
+# A server inside a test, in the place of OSRM.
+wiremock.workspace = true
 
 [lints]
 workspace = true

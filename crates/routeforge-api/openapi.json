@@ -129,6 +129,14 @@
         "format": "uuid",
         "type": "string"
       },
+      "Distances": {
+        "description": "What a distance was measured along (D66).",
+        "enum": [
+          "great_circle",
+          "road"
+        ],
+        "type": "string"
+      },
       "FieldError": {
         "description": "One field of a request, and what is wrong with it.",
         "properties": {
@@ -654,6 +662,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "distances": {
+            "$ref": "#/components/schemas/Distances",
+            "description": "What that length was measured along. Roads, where the solver has a routing\nservice to ask and was answered, and great circles otherwise (D66)."
+          },
           "id": {
             "$ref": "#/components/schemas/RouteId"
           },
@@ -673,6 +685,7 @@
           "plan_id",
           "courier_id",
           "distance_m",
+          "distances",
           "stops"
         ],
         "type": "object"

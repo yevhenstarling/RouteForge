@@ -1,8 +1,10 @@
 //! The solver's settings, read from the environment.
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
+use reqwest::Url;
 
 /// No span of time is set longer than a day. That keeps the arithmetic on them far
 /// from overflowing, and a longer one would be a mistake anyway.
@@ -36,6 +38,30 @@ pub(crate) struct Config {
     /// How often, at most, a route search under way announces how far it has got and
     /// with which route, to whoever watches its plan (D49).
     pub(crate) progress: Duration,
+    /// The OSRM server to ask for road distances, if there is one. Without it the
+    /// distances are great circles, which need nothing outside the process (D8, D66).
+    pub(crate) roads: Option<Roads>,
+}
+
+/// An OSRM server and how long it is waited for.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Roads {
+    /// Where the server is. It carries no password, so it can be logged.
+    pub(crate) url: Url,
+    /// How long the server is given to answer for one route. After that the route is
+    /// searched for on great circles.
+    pub(crate) within: Duration,
+}
+
+// Written by hand so that the address is logged as it is written, and not taken apart
+// into the nine things an address is made of.
+impl fmt::Debug for Roads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Roads")
+            .field("url", &self.url.as_str())
+            .field("within", &self.within)
+            .finish()
+    }
 }
 
 impl Config {
@@ -80,12 +106,21 @@ impl Config {
             PROGRESS_MS.start(),
             PROGRESS_MS.end()
         );
+        // How long the server may take is read only where there is a server.
+        let roads = match address(&var, "OSRM_URL")? {
+            Some(url) => Some(Roads {
+                url,
+                within: seconds("OSRM_TIMEOUT_SECS", 20)?,
+            }),
+            None => None,
+        };
         let config = Self {
             concurrency,
             lease: seconds("SOLVER_LEASE_SECS", 30)?,
             heartbeat: seconds("SOLVER_HEARTBEAT_SECS", 5)?,
             poll: seconds("SOLVER_POLL_SECS", 5)?,
             progress: Duration::from_millis(progress),
+            roads,
         };
         // One heartbeat that does not get through must not cost the job.
         ensure!(
@@ -103,6 +138,31 @@ impl Config {
     pub(crate) fn connections(&self) -> u32 {
         1 + 3 * self.concurrency
     }
+}
+
+/// The address a setting names, of something that is spoken to over HTTP. `None` if
+/// the variable is missing or empty.
+///
+/// What was given is not repeated when it is refused. An address can carry a password,
+/// and this ends in a log. For the same reason one that does carry a user or a
+/// password is refused: the settings are logged when the solver starts.
+fn address(var: &impl Fn(&str) -> Option<String>, name: &str) -> anyhow::Result<Option<Url>> {
+    let Some(value) = var(name).filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let url = Url::parse(value.trim())
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        .with_context(|| format!("{name} must be an address like http://127.0.0.1:5000"))?;
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "{name} must not carry a user or a password"
+    );
+    ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "{name} must be an address, with nothing after its path"
+    );
+    Ok(Some(url))
 }
 
 /// Where the database is. Kept out of [`Config`], which is logged, because it holds
@@ -134,9 +194,65 @@ mod tests {
                 heartbeat: Duration::from_secs(5),
                 poll: Duration::from_secs(5),
                 progress: Duration::from_millis(250),
+                // No routing service: great circles, which need nothing (D8).
+                roads: None,
             }
         );
         assert_eq!(config.connections(), 4);
+    }
+
+    #[test]
+    fn a_routing_service_is_an_address_and_a_time_to_wait() {
+        let config = from(&[("OSRM_URL", " http://osrm:5000 ")]).unwrap();
+        let roads = config.roads.unwrap();
+        assert_eq!(roads.url.as_str(), "http://osrm:5000/");
+        assert_eq!(roads.within, Duration::from_secs(20));
+        // As it is logged when the solver starts.
+        assert_eq!(
+            format!("{roads:?}"),
+            r#"Roads { url: "http://osrm:5000/", within: 20s }"#
+        );
+
+        let config = from(&[
+            ("OSRM_URL", "http://127.0.0.1:5001/roads"),
+            ("OSRM_TIMEOUT_SECS", "3"),
+        ])
+        .unwrap();
+        let roads = config.roads.unwrap();
+        assert_eq!(roads.url.as_str(), "http://127.0.0.1:5001/roads");
+        assert_eq!(roads.within, Duration::from_secs(3));
+
+        // Docker Compose passes a variable that is not set as an empty one.
+        assert_eq!(from(&[("OSRM_URL", "")]).unwrap().roads, None);
+        // How long to wait says nothing without a service to wait for, mistyped or not.
+        assert_eq!(from(&[("OSRM_TIMEOUT_SECS", "soon")]).unwrap().roads, None);
+    }
+
+    #[test]
+    fn an_address_that_is_none_is_refused_and_not_repeated() {
+        for (value, what) in [
+            ("osrm:5000", "an address like"),
+            ("ftp://osrm:5000", "an address like"),
+            ("http://", "an address like"),
+            ("not an address", "an address like"),
+            ("http://solver:hunter2@osrm:5000", "a user or a password"),
+            ("http://solver@osrm:5000", "a user or a password"),
+            ("http://osrm:5000/?profile=car", "nothing after its path"),
+            ("http://osrm:5000/#table", "nothing after its path"),
+        ] {
+            let error = from(&[("OSRM_URL", value)]).unwrap_err().to_string();
+            assert!(error.contains("OSRM_URL"), "{value}: {error}");
+            assert!(error.contains(what), "{value}: {error}");
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+        for value in ["0", "86401", "a while"] {
+            let set = [
+                ("OSRM_URL", "http://osrm:5000"),
+                ("OSRM_TIMEOUT_SECS", value),
+            ];
+            let error = from(&set).unwrap_err().to_string();
+            assert!(error.contains("OSRM_TIMEOUT_SECS"), "{value}: {error}");
+        }
     }
 
     #[test]
@@ -157,6 +273,7 @@ mod tests {
                 heartbeat: Duration::from_secs(2),
                 poll: Duration::from_secs(1),
                 progress: Duration::from_secs(1),
+                roads: None,
             }
         );
         assert_eq!(config.connections(), 10);

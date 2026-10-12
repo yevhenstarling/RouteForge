@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT routes.id, routes.courier_id, routes.distance_m,\n                  stops.order_id AS \"order_id?\", orders.kind AS \"kind?\",\n                  orders.lat AS \"lat?\", orders.lon AS \"lon?\", orders.demand AS \"demand?\"\n           FROM routes\n           LEFT JOIN route_stops AS stops ON stops.route_id = routes.id\n           LEFT JOIN orders ON orders.id = stops.order_id\n           WHERE routes.plan_id = $1\n           ORDER BY routes.id, stops.position",
+  "query": "SELECT routes.id, routes.courier_id, routes.distance_m, routes.distances,\n                  stops.order_id AS \"order_id?\", orders.kind AS \"kind?\",\n                  orders.lat AS \"lat?\", orders.lon AS \"lon?\", orders.demand AS \"demand?\"\n           FROM routes\n           LEFT JOIN route_stops AS stops ON stops.route_id = routes.id\n           LEFT JOIN orders ON orders.id = stops.order_id\n           WHERE routes.plan_id = $1\n           ORDER BY routes.id, stops.position",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,17 @@
       },
       {
         "ordinal": 3,
+        "name": "distances",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "routes",
+            "name": "distances"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "order_id?",
         "type_info": "Uuid",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "kind?",
         "type_info": "Text",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "lat?",
         "type_info": "Float8",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "lon?",
         "type_info": "Float8",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "demand?",
         "type_info": "Int8",
         "origin": {
@@ -105,8 +116,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "2d2006235d0e09dbaaa3521cbd93e13d3112435b3640ac4f6442bafabd5f60f2"
+  "hash": "5c0bbf915b966758686027cf21fab7a86a0df52d4f81beb2299ef01d621d2851"
 }

@@ -16,12 +16,18 @@
 //! | `SOLVER_HEARTBEAT_SECS` | 5 | How often a running job extends its lease. |
 //! | `SOLVER_POLL_SECS` | 5 | How often an idle worker looks at the queue unprompted. |
 //! | `SOLVER_PROGRESS_MS` | 250 | How often, at most, a search announces how far it has got. |
+//! | `OSRM_URL` | none | An OSRM server to ask for road distances. Without it the distances are great circles. |
+//! | `OSRM_TIMEOUT_SECS` | 20 | How long that server may take over one route. |
 //! | `LOG_FORMAT` | `text` | `json` for one JSON object per line. |
 //! | `RUST_LOG` | `info` | What to log, in the syntax of `tracing`'s `EnvFilter`. |
+//!
+//! A route the OSRM server gives no distances for is searched for on great circles,
+//! and says so (D66). So the server may be down, or started later than the solver.
 //!
 //! The decisions cited as D1, D2, … are in `docs/architecture.md`.
 
 mod config;
+mod osrm;
 mod plan_job;
 mod route_job;
 mod startup;
@@ -32,12 +38,12 @@ mod worker;
 
 use std::io::IsTerminal;
 
-use routeforge_domain::Haversine;
 use tokio::sync::watch;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::osrm::{Osrm, Provider};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,6 +55,10 @@ async fn main() -> anyhow::Result<()> {
         ?config,
         "the solver is starting"
     );
+    let distances = match &config.roads {
+        Some(roads) => Provider::Osrm(Osrm::new(&roads.url, roads.within)?),
+        None => Provider::GreatCircles,
+    };
 
     let (stop, mut shutdown) = watch::channel(false);
     tokio::spawn(async move {
@@ -61,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     if startup::wait_for_schema(&pool, startup::SCHEMA_CHECK, &mut shutdown).await {
-        worker::run(pool.clone(), config, Haversine, shutdown).await;
+        worker::run(pool.clone(), config, distances, shutdown).await;
     }
     pool.close().await;
     info!("the solver has stopped");
