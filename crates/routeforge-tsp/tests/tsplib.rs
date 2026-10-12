@@ -1,38 +1,12 @@
 //! Quality regression on TSPLIB instances whose optimal tour length is known.
 //!
-//! The files in `data/` are unchanged copies from TSPLIB95 by Gerhard Reinelt,
-//! <https://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/>.
+//! The instances, and where they are from, are in `data/`.
 
-use routeforge_tsp::{Control, DistanceMatrix, Point, optimize_route};
+mod data;
 
-struct Instance {
-    name: &'static str,
-    problem: &'static str,
-    optimal_tour: &'static str,
-    /// The length of the shortest tour, as TSPLIB lists it.
-    optimum: u64,
-}
+use routeforge_tsp::{Control, optimize_route};
 
-const INSTANCES: [Instance; 3] = [
-    Instance {
-        name: "eil51",
-        problem: include_str!("data/eil51.tsp"),
-        optimal_tour: include_str!("data/eil51.opt.tour"),
-        optimum: 426,
-    },
-    Instance {
-        name: "berlin52",
-        problem: include_str!("data/berlin52.tsp"),
-        optimal_tour: include_str!("data/berlin52.opt.tour"),
-        optimum: 7_542,
-    },
-    Instance {
-        name: "kroA100",
-        problem: include_str!("data/kroA100.tsp"),
-        optimal_tour: include_str!("data/kroA100.opt.tour"),
-        optimum: 21_282,
-    },
-];
+use crate::data::{INSTANCES, Instance, matrix, section};
 
 const SEED: u64 = 2026;
 
@@ -47,36 +21,15 @@ const BUDGET: u64 = 1_000_000;
 /// fails if annealing stops contributing.
 const TOLERANCE: u64 = 2;
 
-/// The lines of one section of a TSPLIB file, up to the `-1` or `EOF` that ends it.
-fn section<'a>(file: &'a str, name: &str) -> impl Iterator<Item = &'a str> {
-    file.lines()
-        .map(str::trim)
-        .skip_while(move |&line| line != name)
-        .skip(1)
-        .take_while(|&line| line != "-1" && line != "EOF")
-}
-
-/// The matrix of a problem with `EDGE_WEIGHT_TYPE: EUC_2D`. City 1 becomes node 0, the depot.
-fn matrix(instance: &Instance) -> DistanceMatrix {
-    let cities: Vec<Point> = section(instance.problem, "NODE_COORD_SECTION")
-        .map(|line| {
-            let mut numbers = line.split_whitespace().skip(1).map(|number| {
-                number
-                    .parse::<f64>()
-                    .unwrap_or_else(|_| panic!("{}: `{line}` is not a city", instance.name))
-            });
-            match (numbers.next(), numbers.next()) {
-                (Some(x), Some(y)) => Point::new(x, y),
-                _ => panic!("{}: `{line}` is not a city", instance.name),
-            }
-        })
-        .collect();
-    DistanceMatrix::euclidean(&cities)
-}
-
 /// The published optimal tour as nodes of the matrix.
 fn optimal_tour(instance: &Instance) -> Vec<usize> {
-    section(instance.optimal_tour, "TOUR_SECTION")
+    let published = match instance.name {
+        "eil51" => include_str!("data/eil51.opt.tour"),
+        "berlin52" => include_str!("data/berlin52.opt.tour"),
+        "kroA100" => include_str!("data/kroA100.opt.tour"),
+        other => panic!("{other} has no published tour here"),
+    };
+    section(published, "TOUR_SECTION")
         .map(|line| match line.parse::<usize>() {
             Ok(city) if city >= 1 => city - 1,
             _ => panic!("{}: `{line}` is not a city number", instance.name),

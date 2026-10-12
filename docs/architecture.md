@@ -18,8 +18,8 @@ There is no load balancer and no message broker. A free solver takes the next jo
 How a plan is made:
 
 1. An operator asks the api to plan a service date. In one transaction the api inserts the plan and one `plan` job.
-2. A solver claims the `plan` job and groups the date's pending orders into one cluster per courier. In the transaction that completes that job, it marks those orders as planned and inserts one `route` job per cluster.
-3. Solvers claim the `route` jobs. Each one optimizes the stop order for a single courier and writes the route in the transaction that completes its job.
+2. A solver claims the `plan` job and groups the date's pending orders into one cluster per courier, each within what its courier can carry out and can carry back (D65). In the transaction that completes that job, it marks those orders as planned and inserts one `route` job per cluster.
+3. Solvers claim the `route` jobs. Each one optimizes the stop order for a single courier, so that the courier is never overloaded on the way, and writes the route in the transaction that completes its job. The distances it works on are great circles, or roads where the solver was given an OSRM server to ask (D66).
 4. When the last `route` job completes, the plan is marked done.
 
 A plan that is cancelled, or that loses a job for good, undoes itself: its routes are deleted and its orders are pending again (D20). A plan that is done can be discarded, which undoes it the same way, so that its date can be planned again (D30).
@@ -32,7 +32,7 @@ How a plan is watched:
 
 How an order is placed by chat:
 
-1. A person shares a location with the bot. The bot asks with buttons for what an order needs beside it: a delivery or a pickup, how many parcels, which day. It shows what it is about to place (D58, D61).
+1. A person shares a location with the bot. Where the bot was given a geocoding service, they may write an address instead, and pick the place among those the service found (D72). The bot asks with buttons for what an order needs beside the place: a delivery or a pickup, how many parcels, which day. It shows what it is about to place (D58, D61).
 2. On the confirming button the bot shows the api its key and says which Telegram user it is talking to. The api answers with a short-lived token of that user's account, which it makes if this is the first it hears of them (D59, D60).
 3. With that token the bot places the order: as that person, with their rights and no others (D9).
 4. The order announces its day in the database. The api passes the word on, and a page that shows that day reads its orders again, so the order is on the map (D63).
@@ -42,6 +42,7 @@ How it is run:
 1. `docker compose up --build --scale solver=4`, on a clone with no settings, brings up the database, the api, four solvers and the bot (D54).
 2. The api waits for the database to be healthy and applies the schema. The solvers wait for the schema (D32). The bot waits for the api, and without a token from Telegram it idles (D62).
 3. `scripts/demo` shows the two claims about the workers on that stack: more solvers finish a plan sooner, and a solver that dies loses no route (D57).
+4. Two things ask a service outside these four, and are off until somebody turns them on: distances by road, from an OSRM server that the stack runs behind a profile (D67), and the bot's search for an address (D72). On a clone the stack asks nobody but the tile server of the map, and Telegram if the bot has a token (D8).
 
 ## Crates
 
@@ -52,8 +53,8 @@ The workspace has exactly five crates, as the [approved description](description
 | `routeforge-tsp` | Clustering and route optimization. Pure computation. | none |
 | `routeforge-domain` | Domain types, DTOs and geo helpers. With the `db` feature: persistence and the job queue. With the `openapi` feature: the schemas of the DTOs. | none |
 | `routeforge-api` | HTTP API, auth, OpenAPI, the map page. | `domain` with `db` and `openapi` |
-| `routeforge-solver` | Queue worker. | `domain` with `db`, `tsp` |
-| `routeforge-bot` | Telegram bot. | `domain` without `db` |
+| `routeforge-solver` | Queue worker. Asks an OSRM server for distances by road, if it is given one. | `domain` with `db`, `tsp` |
+| `routeforge-bot` | Telegram bot. Asks a geocoding service where an address is, if it is given one. | `domain` without `db` |
 
 ## Decisions
 
@@ -103,17 +104,21 @@ Why: with a lease, a slow worker and its replacement can both finish the same jo
 
 How it is built is in D22 to D26. A worker passes spans of time, how long a lease is to run, and no call returns a timestamp, so a worker has nothing to compare with its own clock.
 
-### D7. Capacity, first version: all demands on a route share the limit (in place)
+### D7. Capacity, first version: all demands on a route share the limit (replaced by D65)
 
-A route is feasible when the sum of its demands, pickups and deliveries together, is within the courier's capacity.
+A route was feasible when the sum of its demands, pickups and deliveries together, was within the courier's capacity.
 
-Why: it never overloads a courier and needs no knowledge of the stop order. It is stricter than necessary, because a courier who delivers before picking up could carry more in total. Tracking the real load along the route is planned for Phase 8.
+Why: it never overloads a courier and needs no knowledge of the stop order. It is stricter than necessary, because a courier who delivers before picking up could carry more in total.
+
+Phases 1 to 7 ran on this rule. Since Phase 8 the load is followed along the route (D65). A route that the old rule allowed is still searched for exactly as it was: no order of its stops can overload its courier, so the search has nothing to look out for.
 
 ### D8. The demo works without the internet (in place)
 
 Distances default to Haversine. The Leaflet library is vendored into the repository. Map tiles are optional: without them the routes still draw. The bot idles when its Telegram token is missing.
 
 Haversine has been the default since Phase 3. The page and its Leaflet are in the binary of the API, and a test fails if the page names any host but the tile server (D52). The bot is the one part that is nothing without the internet: Telegram is where its chats are. Without a token it says so and idles, and with one and no network it waits for Telegram and goes on trying (D62). Nothing else in the stack waits for the bot.
+
+Two things of Phase 8 ask another service, and both are off until somebody turns them on. Distances by road come from an OSRM server, which is a service of the stack behind a profile and runs on this machine, on roads that were fetched once (D67). Where an address is comes from a geocoding service that the bot is given by name (D72). On a clone neither is there: the solvers measure along great circles, and the bot sends what people write to nobody. A solver that was given a server and gets no answer falls back on great circles, route by route (D66).
 
 Building is not part of this. A build asks the registry for its base images, and the first one fetches every crate. Once the images are there, `docker compose up` without `--build` starts them and asks nobody (D54).
 
@@ -160,7 +165,7 @@ Clippy's exemption for tests covers `#[cfg(test)]` modules and `#[test]` functio
 
 Why: 2-opt reverses part of a tour and Or-opt may turn a segment round. Both compute the new length from the few edges that change, which is only right when the reversed part keeps its length. Checking once, when the matrix is built, makes that a property of the type instead of an assumption in every stage.
 
-Consequence for Phase 8: OSRM road distances are not symmetric. The solver must symmetrize the table before it builds the matrix, and compute the real directed length of the finished route itself.
+Consequence for road distances, which are not symmetric: the solver makes the table symmetric before it builds the matrix, and measures the finished route along the directed table itself. Built in Phase 8, and how is D66.
 
 ### D15. One control for all stages; one iteration is one candidate move (in place)
 
@@ -190,6 +195,8 @@ Why:
 - The start position decides where the circle is cut into sectors, and a bad cut splits a group of neighbours. Trying several is cheap, since one walk is linear in the number of stops.
 
 Every stop ends up in exactly one cluster or in `unassigned`, whatever the input. Coordinates that are not finite give an arbitrary clustering, but still a complete one.
+
+Since Phase 8 a courier has room in two ways, for what it carries out and for what it carries back, and a stop fits when it fits the one it asks for (D65). The walk, the repair and the guarantees are as they were. "Largest first" goes by the larger of a stop's two demands.
 
 ### D17. The annealing schedule (in place)
 
@@ -244,6 +251,8 @@ A plan that is done keeps its orders. A later plan for the same date takes the o
 Setting the depot inserts a row, and no row is ever updated. The newest row is the current depot. A plan records the id of the depot it was made for.
 
 Why: the clusters and the routes of one plan are computed by different jobs, possibly minutes apart. With one row that is updated in place, moving the depot in between would give routes that start somewhere other than the place the clusters were formed round, and every old plan would be redrawn from the new place. An id on the plan rules out both, and needs no lock.
+
+Until Phase 8 only the newest row could be read through the API, so the page drew an old plan from the new place all the same. A depot can be read by its id now, and the page draws a plan from the depot it names (D71).
 
 ### D22. The job row and the claim (in place)
 
@@ -547,6 +556,8 @@ Only HS256 tokens are accepted, so the RSA advisory of D12 still does not apply.
 
 A debug build takes about a third of a second over a hash. The tests use the smallest parameters there are, except one test that checks the real ones.
 
+Since Phase 8 a login is counted before anything is looked up or hashed, and only so many passwords are hashed at a time (D68).
+
 ### D41. Who may call what is a table, and the tests hold the API to it (in place)
 
 | | Client | Operator | Admin |
@@ -775,7 +786,7 @@ Not looked into: in those eight seconds the stream that was still open could not
 - **Leaflet 1.9.4**, the release npm tags `latest`; 2.0 is an alpha. It was taken from the registry's tarball, which was checked against the integrity the registry gives for it, and the SHA-256 of every file is in the commit that added them. `.gitattributes` keeps `web/vendor` byte for byte: `leaflet.css` and `LICENSE` come with CRLF line ends, which git would otherwise turn into LF.
 - **Nothing from another host but map tiles** (D8). A test reads the page and fails if it names any other address. The tiles are OpenStreetMap's and a switch turns them off. Without them the map is paper with a grid, and everything else is drawn on it.
 - **The login** is kept in `sessionStorage`, so it survives a reload and ends with the tab. Any `401` clears it and shows the login.
-- **Text from the API goes into the page as text**, never as HTML. An address or the name of a courier is typed by somebody.
+- **Text from the API goes into the page as text**, never as HTML. An address or the name of a courier is typed by somebody. Since Phase 8 the browser is told as much: the page is served with a policy that lets it run its own script and no other (D69).
 - **On the map** the stops are dots on a canvas and the routes are lines in SVG above it. Leaflet draws a canvas in the order things were added to it. On one canvas a route would be hidden under dots that were drawn again after it, as they are when a plan takes its orders.
 - **A client** who logs in sees the depot and their own orders, and no planning. That is what the API lets a client read (D41).
 
@@ -783,9 +794,15 @@ What the page can do beyond the list in the plan was decided by the project owne
 
 - **Discard** a plan that is done, beside Cancel.
 - **Budget and seed** for a plan: seconds or millions of moves for each route, and a seed. Left empty, the API gives its own (D45).
-- **Set up a demo city**, for an admin, on a database with no depot or no courier: a depot in Kyiv and four vans, through the endpoints an admin would use by hand. The vans are sized for the number of orders in the field beside the button. A demo order has a demand of 1 to 3 (D46), so a day asks for twice its number, and each van takes a quarter of that and a tenth more. So the day that is generated next gives every van a route, whether it has 300 orders or 2000.
+- **Set up a demo city**, for an admin, on a database with no depot or no courier: a depot in Kyiv and four vans, through the endpoints an admin would use by hand. The vans are sized for the number of orders in the field beside the button. A demo order has a demand of 1 to 3 (D46), so a day asks for twice its number. Four in five of its orders are deliveries, and it is the deliveries a van has to have room for, since what is picked up comes on board when they are off it (D65). Each van takes a quarter of them and a tenth more. So the day that is generated next gives every van a route, whether it has 300 orders or 2000.
 
-What the page does not do: it draws every route from the depot as it is now, so a plan made for an earlier depot (D21) would be drawn from the wrong place. Until Phase 7 it also learned of an order that somebody else had placed only when Refresh was pressed. An operator's page hears of one now (D63). A client's has no stream, and still shows it after Refresh.
+What Phase 8 added to it:
+
+- **Beside the length of a route, what it was measured along:** `by road` or `as the crow flies` (D66). The lines stay straight, from stop to stop. Drawing them along the streets was offered beside it and not taken, on 2026-10-12.
+- **Beside the stops of a route, the most its courier has on board** along it, and how much the courier carries: `at most 131 of 132 on board` (D65).
+- **A plan is drawn from its own depot** (D71). When the depot has been moved since the plan was made, the plan's depot is on the map as well, as a grey dashed ring.
+
+What the page does not do. Until Phase 7 it learned of an order that somebody else had placed only when Refresh was pressed. An operator's page hears of one now (D63). A client's has no stream, and still shows it after Refresh.
 
 The page has no tests of its own. The API's tests check that it is served and what it loads. What it does was tried in a browser: `docs/plan.md` says how.
 
@@ -822,7 +839,7 @@ There is no index on `plans.service_date`. A table of some hundreds of plans is 
 Why:
 
 - The claim is "from a fresh clone". A step before the command, a file to copy or a key to think of, is a step that can be got wrong by whoever is looking at the project for the first time.
-- Values that are in the repository protect nothing, so nothing may depend on them: the ports are on the loopback. Whoever opens them to a network sets their own values in `.env`, and `.env.example` says so beside each.
+- Values that are in the repository protect nothing, so nothing may depend on them: the ports are on the loopback. Whoever opens them to a network sets their own values in `.env`, and `.env.example` says so beside each. Since Phase 8 the API says so too, in its log, when it starts on one of them (D70).
 - The other way to get a key was to make a random one at each start. Every login would then end with every restart, and the admin's password would still be one that everybody can read.
 - A service that ends has said why (D47), and one that is started again by itself says it over and over. `docker compose up` once more is the restart.
 - Nothing waits for a solver, and which solvers are alive is what the registry says (D27) and the page shows. A check of its own would be a query every few seconds from every instance, to tell Docker what the system knows already.
@@ -895,7 +912,7 @@ How:
 
 - **Through the API alone.** The scripts log in, ask for plans, read them and the stats. Nothing is read from the database behind the API's back.
 - **Where the API is, and who the admin is, they ask the stack:** `docker compose port api 8080`, and the environment of the api container. So a `.env` with other values needs no telling.
-- **What a day needs is made if it is missing:** a depot and four vans, as the page's demo city (D52), and orders. The orders are as many as the couriers carry with a tenth to spare, the page's sum turned round. Then every courier gets a route, and every solver has one to search for.
+- **What a day needs is made if it is missing:** a depot and four vans, as the page's demo city (D52), and orders. The orders are as many as the couriers can deliver with a tenth to spare, the page's sum turned round (D65). Then every courier gets a route, and every solver has one to search for.
 - **The day is tomorrow.** The page opens on today, and on its day a script cancels a plan in progress and discards a done one.
 - **The time of a plan is the plan's own:** `finished_at` less `created_at`, both from the database's clock (D6). How often the script looks does not enter into it.
 - **The routes of every scaling run are compared with those of the first:** whose route it is, how long, and which stops in which order. Other routes end the script as a failure, because the same seed and the same moves give the same routes (D5).
@@ -903,22 +920,26 @@ How:
 - **After each run the script checks what the system is judged by** (D20): every order the plan took is on exactly one route.
 - **Each plan is asked for with a request id of the script's making,** which it prints. `docker compose logs api solver` has it in the lines of the API and of every solver that worked on the plan (D42).
 
-Measured on the development machine, with 16 logical processors and Docker Desktop on WSL2. A new database, 300 orders, four vans, 200 million moves a route:
+Measured on the development machine, with 16 logical processors and Docker Desktop on WSL2, at the end of Phase 8. A new database, 300 orders, four vans of 132, 200 million moves a route:
 
 | Solvers | Seconds | Speed-up | Routes | Kilometres |
 |---|---|---|---|---|
-| 1 | 15.2 | 1.0 | 4 | 123.60 |
-| 2 | 8.1 | 1.9 | 4 | 123.60 |
-| 4 | 4.5 | 3.4 | 4 | 123.60 |
-| 8 | 4.6 | 3.3 | 4 | 123.60 |
+| 1 | 15.5 | 1.0 | 4 | 126.13 |
+| 2 | 8.3 | 1.9 | 4 | 126.13 |
+| 4 | 4.5 | 3.5 | 4 | 126.13 |
+| 8 | 4.8 | 3.2 | 4 | 126.13 |
 
-The routes were the same in every run, and a second round gave 15.1, 7.9, 4.5 and 4.4 seconds.
+The routes were the same in every run, and a second round gave 15.4, 8.2, 4.5 and 4.5 seconds.
 
-- Four solvers are 3.4 times as fast as one and not four times, because the routes are not equally long: 87, 86, 78 and 49 stops. A plan is done when its longest search is. One solver makes the four searches in turn, and four make them side by side.
+- Four solvers are three and a half times as fast as one, and not four times. The routes are much of a length, with 73, 73, 81 and 73 stops, so that is not the reason. A search that ran alone took 3.8 seconds, each of two side by side took 4.1, and each of four took 4.4: the processor gives one busy core more than it gives each of four.
 - Eight solvers are no faster than four. The day has four routes.
-- The same run made while the machine was still clearing away other containers took 28.6 seconds with one solver. The numbers want a machine that is doing nothing else.
+- The numbers want a machine that is doing nothing else. In Phase 6 the same run, made while the machine was still clearing away other containers, took nearly twice as long with one solver.
 
-The failure run, twice, with four solvers and ten seconds a route: the route was taken over 27.8 and 28.3 seconds after the kill, and the plan was done 40.2 and 41.0 seconds after it was asked for, with 300 stops on four routes and every order on exactly one. The solver that took the route over logged the job with `attempt=2`. A lease runs for thirty seconds from the last heartbeat (D33), which came up to five seconds before the kill, and a worker with nothing to do looks at the queue every five. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` set in the shell make it quicker: compose passes them on, and the scripts change no setting themselves.
+The failure run, with four solvers and ten seconds a route: the route was taken over 27.9 seconds after the kill, and the plan was done 40.5 seconds after it was asked for, with 300 stops on four routes and every order on exactly one. The solver that took the route over logs the job with `attempt=2`. A lease runs for thirty seconds from the last heartbeat (D33), which came up to five seconds before the kill, and a worker with nothing to do looks at the queue every five. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` set in the shell make it quicker: compose passes them on, and the scripts change no setting themselves.
+
+The numbers of Phase 6 were of vans of 165 under the rule of D7: 15.2, 8.1, 4.5 and 4.6 seconds, for routes of 87, 86, 78 and 49 stops and 123.60 km. The same orders go onto vans of 132 now, and the sweep cuts the day into four routes that are more alike (D65).
+
+With an OSRM server in the stack (D67) the scripts run as they are. The same day by road was 475.92 km, the same routes with one solver and with four, in 16.0 and 5.3 seconds.
 
 Why:
 
@@ -949,6 +970,8 @@ Why:
 - Code for the Claude API that was never run against the Claude API is not shipped. A scripted model shows that the loop is right, and not that the requests are what the API takes. So that part is not written ahead of a key.
 
 What it costs: "deliver two parcels here tomorrow" is a few taps and not a sentence, and for as long as the item of Phase 8 is not built the bot is less than the description says of it.
+
+Phase 8 ended with no key, and the item was not built. The bot does read words since then, for one thing: an address, which it looks up and asks about with buttons (D72). No model is in that, and nothing is done on the strength of words.
 
 ### D59. A Telegram user gets an account of their own, the first time the bot hears of them (in place)
 
@@ -1034,7 +1057,7 @@ Why:
 - The commands are read in `chat` and not by teloxide's derive. One table then serves the reading, the help and the menu, and a test sends `/order 50.45 30.52` as a person does. The workspace no longer asks teloxide for its `macros` feature.
 - Typed coordinates were added by the project owner's choice on 2026-10-12. Not every client of Telegram can share a location, and they let the bot be tried without a phone.
 
-What it does not do: take free text (D58); turn an address into a place, which is Phase 8's; show more than ten orders at once; or tell an order that was not placed from one that was placed and lost on the way back, which would take a key that makes a request safe to repeat.
+What it does not do: understand sentences (D58); show more than ten orders at once; or tell an order that was not placed from one that was placed and lost on the way back, which would take a key that makes a request safe to repeat. An address in words became a way to begin an order in Phase 8, for a bot that was given a service to ask where it is (D72).
 
 Tests: the order of the phase, press by press, with nothing asked of the API before the last one; dropping it at each step; buttons that are out of date, another chat's, or made up; days that have passed; every command for a client and for an operator; a role that changes between two requests; the API away, refusing, failing, and silent after an order went out. How the three parts are tried together is D64.
 
@@ -1112,3 +1135,205 @@ Why:
 What a stand-in cannot show: that Telegram takes what the bot sends. A keyboard that is shaped wrongly, a text too long for a button, a method that Telegram answers otherwise than teloxide expects, would all pass here and fail there. That is why the "Done when" of the phase is still open, and `docs/plan.md` says what it takes to close it.
 
 Found while it was written: teloxide asks for `GetMe` and not for `getMe` (D62). The first stand-in answered the second alone, and every test of the whole bot waited for an answer that never came.
+
+### D65. What a courier has on board is followed along the route (in place)
+
+Replaces D7. Decided with the project owner on 2026-10-12.
+
+A courier leaves the depot with everything it is to deliver. A delivery takes its parcels off at its stop, and a pickup puts its parcels on at its own. What is on board has to be within the courier's capacity at every moment of the route. A van of twenty can deliver twenty parcels and bring twenty others back, as long as it does not pick up faster than it delivers.
+
+- **Clustering.** A courier has room in two ways: for what it carries out, and for what it carries back. A stop fits when it fits the one it asks for (D16). That is all clustering has to know. The stops of a cluster can be driven in some order when the deliveries fit the courier together and the pickups do: with every delivery made before the first pickup, the load falls to nothing and then rises to what was picked up.
+- **`Loads`.** What the stops of a route ask for, and what its courier carries, is a value of `routeforge-tsp`. It cannot be made for a route that no order of the stops could drive, so a search that is handed one always has a tour to start from. The matrix has its symmetry the same way (D14). A `Loads` also knows whether any order of its stops could overload the courier at all.
+- **The search.** `optimize_route_within` is the search of D15 to D18 with one rule more: it never takes up a tour that overloads the courier.
+  - Nearest neighbour goes to the nearest stop the courier can call at next. It always gets to the end: a delivery can be called at whenever, and when pickups alone are left, what is on board is what was picked up.
+  - 2-opt and Or-opt take the best of the moves that shorten the tour and keep it within the capacity.
+  - Annealing draws for a move as it did. A move it would take is dropped if the tour would overload the courier with it.
+  - A move is tried for its length first, as before. Only one that passes is checked for the load: it is made on a copy of the tour, and the copy is walked once.
+- **Where nothing could overload the courier, the search does not look.** When the deliveries and the pickups fit the courier together, every order of the stops does, and the search is the one without loads, move for move. A route that D7 allowed is such a route. `optimize_route` is that search, and the TSPLIB test and the benchmarks of Phase 1 run it as they did.
+- **The solver** makes the `Loads` of a route job from its orders and its courier. Before it stores a route it checks the calling order once more, and a route that overloads its courier fails the attempt and is not stored. When it turns a route round for the roads (D66), it turns only one that can be driven that way round.
+- **Nothing is stored for it.** What a courier has on board follows from the stops of a route in their order. The page reckons it for each route it shows, and writes the most beside the courier's capacity (D52).
+
+Why:
+
+- Under D7 a pickup took room from the deliveries although the two are never on board together in full. The same vans now take more. The demonstration's day of 300 orders, four in five of them deliveries, is carried by four vans of 132, where D7 needed four of 165.
+- The two sums are exact, and not a safe estimate. A set of stops can be driven if and only if both fit: the courier leaves with all the deliveries, and comes back with all the pickups.
+- The order of the stops is the search's to decide, so the search is what has to mind the load. A rule that held clustering to what any order could carry would be D7 again.
+- Checked after the length, the load costs something only for a move that is about to be taken. Most are not.
+- The solver's check before it stores is the one that counts. A route that overloads a van is the thing the system must not hand out, whatever went wrong before.
+
+What it costs, with `cargo bench -p routeforge-tsp` on the development machine: the whole search for one route, ten million moves, took 194 ms without loads and 195 ms within loads that can overload the courier at 50 stops, and 166 ms and 169 ms at 300. That is less than two runs of the same search differ by.
+
+What it does not do:
+
+- The search never passes through a tour that overloads the courier. Where the loads are tight, a shorter tour that small moves reach only through such a tour may not be found.
+- A parcel that is picked up goes to the depot. It cannot be delivered on the same route (D1).
+- A courier drives one round a day. Coming back to unload and going out again is not planned.
+
+Tests: the sweep's properties under the two kinds of room, and deliveries and pickups not taking each other's; a tour within the loads at every stage, for random routes and loads; never longer than the best such tour that an exhaustive search finds, for up to nine stops; the same seed giving the same tour; with loads that cannot overload, the very tour of the search without loads; a square on which the shortest tour overloads the courier, 40 against 48. In the solver: a courier that leaves full delivers before it picks up; a day of mixed orders with no route over its courier's capacity; a route that overloads its courier not stored.
+
+### D66. Distances by road come from an OSRM server, and a route says what it was measured along (in place)
+
+A solver that is given `OSRM_URL` asks that server for the distances between the stops of each route. Without the setting the distances are great circles, as they have been since Phase 3 (D8, D29).
+
+- **One request for a route.** The solver asks OSRM's table service for the distances from the depot and each stop to each other, in metres. It asks with a `POST`, so the positions travel in a body.
+- **A route that gets no table is searched for on great circles.** That is so when the server does not answer within `OSRM_TIMEOUT_SECS`, twenty seconds by default, when it refuses, when what it answers cannot be read, and when it knows no way between two of the positions. The solver logs a warning with the reason and goes on.
+- **A route says what its length was measured along.** `routes.distances` is `road` or `great_circle`, and the API gives it with the route. The page writes `by road` or `as the crow flies` beside the kilometres (D52).
+- **The table is waited for with the heartbeat beside it** (D34). The lease is kept however long the server takes, and a plan that is cancelled meanwhile ends the wait within a heartbeat.
+- **The search works on the mean of the two directions,** rounded up to the metre. By road the way from A to B is not the way back, and the search needs it to be (D14).
+- **The route that is stored is measured as it is driven,** every leg in its direction. The search cannot tell a tour from the same tour the other way round, and by road one of the two is shorter. Both are measured, and the shorter is stored, unless the courier would be overloaded that way round (D65).
+
+Why:
+
+- A route on great circles is still a route. A job that failed for want of a table would be tried three times and then fail its plan (D23), so a service that is optional by the approved description could end a demonstration. With the fallback a plan is done whatever OSRM does, and the label keeps a route by great circles from being taken for one by road.
+- The label is the route's and not the plan's, because the fallback is. A plan whose server went away in the middle has routes of both kinds, and says so route by route.
+- The mean, and not the shorter or the longer of the two directions: a tour is then as long to the search as the mean of driving it one way round and the other. So what is short to the search is short on the road, whichever way it is driven in the end. Between great circles the two directions are the same and the mean is what they are, so nothing changed for a solver without OSRM.
+- `POST`, because the positions of a route of three hundred stops make an address of several kilobytes, which a server may refuse for its length. In a body `annotations` is a list, where in an address it is a word. The server refuses the word there.
+- Decided with the project owner on 2026-10-12: the page says what a route was measured along, and draws its lines straight. Lines along the streets would take the geometry of every leg from OSRM, and somewhere to keep it.
+
+What it does not do:
+
+- What a search announces while it runs is the length on the matrix it searches, the symmetric one (D49). The length that is stored is the directed one, so the last announcement and the stored route differ a little.
+- OSRM moves every position onto the nearest road it has. A demo order is a point somewhere in the city (D46), which may be in a park or on the river as well as at a door, and its distances are those of the road it was moved to.
+- A route of more stops than the server was started for is refused by it, and searched for on great circles. The stack starts it for 2000 (D67).
+
+Measured on the development machine, against the server of D67. A table of 50 positions took 0.05 seconds, one of 337 took 0.14, one of 1000 took 0.73, and one of 2001 took 2.56 and was an answer of 28 MB. One of 2002 was refused with `TooBig`.
+
+What a day comes to, in the stack as compose runs it: the demonstration's 300 orders on four vans, seed 7, 200 million moves a route.
+
+| | As the crow flies | By road |
+|---|---|---|
+| The routes that were found on great circles | 126.13 km | 603.61 km |
+| The routes that were found by road | 182.05 km | 475.92 km |
+
+- The routes found on great circles are 27 % longer to drive than those found by road. Each driven the shorter way round, which a search on great circles does not know of, they are 586.68 km, and 23 % longer.
+- The lengths by road in the right-hand column were asked of the server again, leg by leg, by a script outside the stack. They came to 475.91 km for the 475.92 km that are stored.
+- The four routes by road, driven the other way round, come to 545.07 km. Each was stored the shorter way.
+- By road the day is several times its length as the crow flies. The stops are some four hundred metres apart. The Dnipro runs between them. And 66 of the 304 positions were more than a hundred metres from a road, one of them 1.25 km: a demo order is a random point (D46).
+- With the server stopped while the first of four routes was searched for, by one solver, the plan was done all the same: one route by road and three on great circles, each labelled. Each of the three waited nearly four seconds for the name of the server to fail.
+
+Tests: the request as OSRM takes it, longitude first; the table read back; each way of failing, by its own name; a table that differs by direction searched on the mean; a route stored the shorter way round, and not turned round when that would overload the courier; a route on great circles stored as the search found it; a route with no table searched on great circles and labelled so; the lease kept while a table is waited for, and the wait ended by a cancel.
+
+### D67. OSRM is a service of the stack behind a profile, on roads that are fetched once (in place)
+
+- **A service with a profile.** `osrm` in `docker-compose.yml` has the profile `osrm`, so `docker compose up` leaves it out. `COMPOSE_PROFILES=osrm` and `OSRM_URL=http://osrm:5000` in `.env` put it in and point the solvers at it.
+- **The image is OSRM's own,** `ghcr.io/project-osrm/osrm-backend:v26.10.0-debian`, by its tag. It is started as `osrm-routed --algorithm ch --max-table-size 2001`.
+- **The roads are prepared once, by a script.** `scripts/osrm-prepare`, as `.ps1` and as `.sh`, fetches the extract of Kyiv that BBBike publishes, 34 MB, into `osrm/`, and runs `osrm-extract` with the car profile and `osrm-contract` on it, with the tools of the same image. On the development machine that took 16 seconds, used half a gigabyte of memory at the most, and left 106 MB.
+- **`osrm/` is nobody's but the machine's.** Git ignores it, and so does the build context of the images.
+- **Nothing waits for it.** It has no health check, and the solvers do not depend on it. A solver that gets no answer falls back, route by route (D66), so the server may come up late, or not at all.
+
+Why:
+
+- A profile keeps the stack as it was for whoever does not ask for roads: one command, no download, and nothing that asks another host (D8, D54).
+- The roads are not in the repository and not in an image. They are 34 MB that change every week and belong to OpenStreetMap, under its licence. A script that fetches them says where they are from.
+- A city and not a country: the demonstration's orders are in Kyiv (D46), and a city is prepared in seconds on a laptop.
+- `ch`, contraction hierarchies, answers a table quickest. Its price is that the whole map is prepared again for any change, which here is never.
+- `--max-table-size 2001`: the server's default is a hundred positions, and a route has a position for each stop and one for the depot. The demonstration makes days of up to 2000 orders (D46), and no route has more stops than its day has orders.
+- The tag ends in `-debian` because that is what the release is published as. `v26.10.0` alone is no image.
+
+Good to know:
+
+- **The extract is a box round Kyiv,** from 30.28 to 30.86 degrees east and from 50.30 to 50.62 north. A position outside it is moved to the nearest road inside it.
+- **Stopping it is quick:** the container was gone a second after it was told to stop.
+- **A solver outside Docker** finds the server at `http://127.0.0.1:5000`. `OSRM_PORT` moves that port.
+
+### D68. A login is counted, and passwords are hashed a few at a time (in place)
+
+Decided with the project owner on 2026-10-12, as the first of four items of hardening that earlier phases left for Phase 8. The others are D69, D70 and D71.
+
+- **Only so many logins are taken for one address within a minute:** five, unless `API_LOGIN_ATTEMPTS` says otherwise. The next is answered `429` with a `Retry-After`, before anything is looked up or hashed.
+- **It counts by the address that was sent,** in lower case, whether it has an account or not, and right password or wrong. A login that succeeds clears the count. A login the API could not check, for a fault of its own, is not counted.
+- **Passwords are hashed four at a time,** unless `API_HASHES_AT_ONCE` says otherwise. A login that gets no turn within five seconds is answered `503`, and is not counted either.
+- **The counts are in memory,** for at most ten thousand addresses, the oldest going first.
+
+Why:
+
+- Without a limit, whoever knows an address can try passwords for it as fast as the API hashes them.
+- Counted before the lookup, a refusal costs no hash, and says nothing about which addresses have accounts: an address nobody has is refused after five tries as one somebody has (D40).
+- The right password is counted as well. Otherwise the sixth try would still say whether it was right.
+- A hash takes 19 MiB and some tens of milliseconds of a processor (D40), and a login needs no token. A hundred at once would be two gigabytes. Four at a time bound that, and the wait in front of them is bounded too.
+
+What it costs: somebody who knows an address can keep its owner out, for as long as they keep trying. A limit by where the tries come from would not have that fault, and would have another: behind Docker's published port every caller comes from the same address. The counts are gone when the API starts again, and two APIs would count apart.
+
+The bot's endpoint is not counted. It takes the bot's key and no password (D60).
+
+Measured on a release build: five wrong logins were answered `401` in 37 to 137 ms each, and the sixth `429` in 2 ms, with `Retry-After: 60`.
+
+Tests: the count, its window and its bound, by a clock the test holds; the sixth login refused before any hash, for an address nobody has as for one somebody has; the right password refused too, and taken when the time is over; a login that succeeds clearing the count; a login that waits too long for its turn answered `503` and not counted; both refusals in the OpenAPI document.
+
+### D69. The page is served with a content security policy (in place)
+
+`GET /` answers with a `Content-Security-Policy`:
+
+```
+default-src 'none'; script-src 'self' 'sha256-…'; style-src 'self' 'sha256-…';
+img-src 'self' data: https://tile.openstreetmap.org; connect-src 'self';
+base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+```
+
+- **The two hashes are of the page's own script and style,** made once, when the page is first asked for, from the bytes that are served.
+- **Everything else is from where the page is from:** Leaflet, its style and its images, and the API. The one other host is the tile server, for images alone (D8).
+- **Only the page has it.** Swagger UI has inline scripts of its own, and is not ours to change (D43).
+
+Why:
+
+- The page puts text from the API into the document as text (D52). The policy is what holds if a change to the page ever forgets that: a script that was not built into the page does not run, wherever it came from.
+- Hashes, and not a file of its own for the script: the page stays one file (D52), and the hash is of exactly what is served, since it is made from it.
+- Made by the API and not written down: a hash in the source would have to be changed with every change to the page, and a stale one is a page that does nothing.
+
+What it costs: a `style` attribute and a handler in an attribute are refused like any other inline code, so the page may have neither. It had none. A `<script>` or `<style>` element beside the first of its kind would be refused too: the policy names one of each.
+
+Tried in a headless Edge: the page worked as before, with twenty tiles, four routes and its stream, and an empty console. Leaflet needed no exception. An inline script added afterwards, a script from another host, a handler in an attribute, `eval`, a request to another host and a `style` attribute were each refused.
+
+Tests: the policy on `/`, and none on what the page loads; the hashes those of the page as it is on disk; no `unsafe-inline`, no `unsafe-eval`, no wildcard, and one other host; a page without a script getting the hash of nothing.
+
+### D70. The API says when it runs on the demonstration's values (in place)
+
+When the API starts with the signing key, the admin's password or the bot's key that `docker-compose.yml` falls back to, it logs a warning that names which, and says that they are in the repository for everybody to read.
+
+Why: the stack starts on those values by design, with its ports open to the machine alone (D54). Whoever opens a port wider has to set their own, and until Phase 8 nothing said so to a person who did not read `.env.example`. A warning costs a demonstration nothing. Refusing to start would break the one command.
+
+The values are constants of the API, and a test holds them to the compose file: it reads the `api` service, and each fallback there has to be the constant. So neither can change without the other.
+
+### D71. A depot can be read by its id, and a plan is drawn from its own (in place)
+
+`GET /api/depots/{id}` gives a depot by its id, to anyone who is logged in, as `GET /api/depot` gives the newest.
+
+A plan names the depot it was made for (D21). The page reads that depot when it is no longer the current one, draws the plan's routes and its searches from there, and marks the place with a grey dashed ring.
+
+Why an endpoint, and not the depot inside the plan: the plan says which depot already, and all that was missing was a way to read one that is no longer the newest. A depot is no secret from anybody who may read the current one, and its id is not guessable (D19).
+
+Tried in a headless Edge: a plan was made, the depot moved two kilometres, and the plan shown again. Its routes started at the old place, which had its ring, and the new depot stood beside it.
+
+### D72. The bot looks an address up, at a service it is given (in place)
+
+Decided with the project owner on 2026-10-12.
+
+A bot that is given `GEOCODER_URL` takes a place in words. It asks that service where the address is, shows up to three places with a button each, and the press of one begins an order there, which the buttons then finish as any other (D61).
+
+- **Off until it is given a service.** On a clone the bot asks nobody but Telegram and the API (D8), and answers words as it did.
+- **The service is one that speaks as Nominatim does,** the search of OpenStreetMap: `GET /search?q=…&format=jsonv2&limit=10`. Whoever names the public one takes on its usage policy, which `.env.example` links.
+- **What the bot does for that policy:**
+  - It says who it is, by its name, its version and the address of this repository.
+  - All its chats together send one request a second at the most. A search that would wait more than five seconds for its turn is told to try again, and is not queued.
+  - It asks only when a person has written an address.
+  - It shows the places with `© OpenStreetMap contributors`.
+- **What is looked up:** a text that is no command, and what follows `/order` when that is no pair of numbers. Not a text that begins with a slash, and not one longer than 200 letters.
+- **Near the depot first.** The bot asks the API where the depot is, as the person (D9), and tells the service to prefer what lies within some 55 kilometres of it. When the API does not say, it searches without.
+- **A search is in memory,** one for each chat, as a draft is (D61). Its buttons name it by the message that asked, and a press that names another search, or a place this one does not have, picks nothing and ends nothing. A new search takes its place, and `/cancel` drops it.
+- **Nothing is begun or placed by words.** What a search finds is shown, and picked by a button. An order is still placed by the press of the confirming button and by nothing before it (D9).
+
+Why:
+
+- Off by default, because what a person writes goes to somebody else's service, and because the public one runs on donated servers and is for light use. Whoever turns it on has read what that takes. For more than a few people the answer is a Nominatim of one's own, which is the same setting.
+- Behind a trait, `Geocoder`, as the API is behind `Api`: the dialogue is tried against a fake, step by step.
+- Ten places are asked for and three are shown. One address is several things on OpenStreetMap's map, each of its buildings and each shop in them, and several come back under one name. The bot shows the first three that differ by name.
+- The box round the depot is a preference and no limit. A street has its name in many towns, and the one in the depot's town is the likely one.
+- The pace is the bot's and not each chat's: the policy counts an application, all its users together.
+
+What a person wrote goes to the service and nowhere else. reqwest names the address it asked in its errors, and here that address ends in the words, so it is taken out before a failure is logged. No header says whose address it is.
+
+What it does not do: understand a sentence (D58), complete an address while it is typed, which the policy forbids, or remember a place from one search to the next.
+
+Tried against the public service, with eight requests in all, a second apart or more. `Хрещатик 22` near the depot gave the address, the post office in it and one more thing that is at it. Without the depot it gave the same address first. `Соборна 10` gave that address in three towns round Kyiv. A line of letters gave nothing. The first try showed that one address comes back three times under one name, which is why the bot now asks for ten.
+
+Tests: the dialogue against a fake of the service and of the API: one place and several, none, a press that is out of date or made up, a new search in the place of the old, the service away and busy, the API not saying where the depot is, what is and is not sent, more places and longer names than a message takes, and the bound on what is kept. The requests against a server that answers as Nominatim does: the query, the name the bot gives, the pace, a search that would wait too long, places under one name, and the words kept out of what is said of a failure. The whole bot against stand-ins for Telegram, the API and the service (D64).
