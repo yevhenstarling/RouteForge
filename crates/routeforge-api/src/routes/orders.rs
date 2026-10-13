@@ -3,10 +3,13 @@
 //! An order belongs to whoever placed it. A client sees and withdraws their own, and
 //! to a client an order of somebody else's is not there at all: the answer is the
 //! `404` of an id that names nothing. Operators and admins see every order.
+//!
+//! Placing an order can be made safe to repeat, with a key of the caller's making
+//! (D76).
 
-use actix_web::{HttpResponse, get, post, web};
-use routeforge_domain::db::orders;
-use routeforge_domain::{Order, OrderFilter, OrderId, OrderRequest, OrderStatus};
+use actix_web::{HttpRequest, HttpResponse, get, post, web};
+use routeforge_domain::db::orders::{self, Placed};
+use routeforge_domain::{IdempotencyKey, Order, OrderFilter, OrderId, OrderRequest, OrderStatus};
 use utoipa_actix_web::service_config::ServiceConfig;
 use uuid::Uuid;
 
@@ -26,11 +29,26 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
 /// Place an order
 ///
 /// The order is the caller's, and is pending until a plan gives it to a courier.
+///
+/// A request may bring a key of the caller's making, as `Idempotency-Key`. Sent again
+/// with the same key, it places nothing: the answer is `200`, with the order that key
+/// placed, as it stands by then. So a request whose answer was lost can be sent again
+/// as it was, and the order is placed once. A key is the caller's own, and is for one
+/// order: with a key that has placed another order the request is refused.
 #[utoipa::path(
     tag = "orders",
     security(("bearer" = [])),
+    params(
+        // A header is there or it is not: it is never null.
+        ("Idempotency-Key" = Option<String>, Header, nullable = false,
+            min_length = 1, max_length = 64, pattern = "^[A-Za-z0-9._-]+$",
+            description = "What makes the request safe to repeat: 1 to 64 letters, digits, \
+                dots, underscores or hyphens, made up by the caller. A UUID will do"),
+    ),
     responses(
         (status = 201, description = "The order", body = Order),
+        (status = 200, description = "The order this key placed before. Nothing was stored this time",
+            body = Order),
         NotLoggedIn,
         NotAcceptable,
     )
@@ -39,12 +57,47 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
 async fn create_order(
     user: AuthUser,
     state: web::Data<AppState>,
+    request: HttpRequest,
     body: web::Json<OrderRequest>,
 ) -> Result<HttpResponse, ApiError> {
-    let request = body.into_inner();
-    validate::order(&request)?;
-    let order = orders::create(&state.pool, &request.placed_by(user.id)).await?;
-    Ok(HttpResponse::Created().json(order))
+    let asked = body.into_inner();
+    validate::order(&asked)?;
+    let key = key_of(&request)?;
+    let new = asked.placed_by(user.id);
+    match orders::place(&state.pool, &new, key.as_ref()).await? {
+        Placed::Now(order) => Ok(HttpResponse::Created().json(order)),
+        Placed::Before(order) if new.asks_for(&order) => Ok(HttpResponse::Ok().json(order)),
+        // The key is taken, and not by this order. To answer with the other one would
+        // be to say that this one was placed.
+        Placed::Before(_) => Err(ApiError::invalid_field(
+            IdempotencyKey::HEADER,
+            "has placed another order already: a key is for one order",
+        )),
+    }
+}
+
+/// The key a request came with, if it came with one (D76).
+///
+/// One that is no key is refused, and not passed over: whoever sent it takes the
+/// request for one that is safe to repeat.
+fn key_of(request: &HttpRequest) -> Result<Option<IdempotencyKey>, ApiError> {
+    let Some(sent) = request.headers().get(IdempotencyKey::HEADER) else {
+        return Ok(None);
+    };
+    let key = sent
+        .to_str()
+        .ok()
+        .and_then(|text| IdempotencyKey::new(text).ok());
+    match key {
+        Some(key) => Ok(Some(key)),
+        None => Err(ApiError::invalid_field(
+            IdempotencyKey::HEADER,
+            format!(
+                "must be 1 to {} letters, digits, dots, underscores or hyphens",
+                IdempotencyKey::LONGEST
+            ),
+        )),
+    }
 }
 
 /// List orders
@@ -152,7 +205,7 @@ mod tests {
 
     use super::*;
     use crate::error::PROBLEM_JSON;
-    use crate::testing::{self, date};
+    use crate::testing::{self, Actor, Api, Reply, date};
 
     fn body(day: u32) -> Value {
         json!({
@@ -162,6 +215,16 @@ mod tests {
             "address": "Khreshchatyk St, 22",
             "demand": 2,
         })
+    }
+
+    /// Asks for an order as `who`, with a key or without one.
+    async fn place(api: &Api, who: &Actor, key: Option<&str>, order: Value) -> Reply {
+        let request = testing::request("POST", "/api/orders", Some(who));
+        let request = match key {
+            Some(key) => request.insert_header((IdempotencyKey::HEADER, key)),
+            None => request,
+        };
+        api.send(request.set_json(order)).await
     }
 
     fn ids(listed: &Value) -> Vec<&str> {
@@ -199,6 +262,160 @@ mod tests {
         let read = api.get(Some(&client), &format!("/api/orders/{id}")).await;
         assert_eq!(read.status, StatusCode::OK);
         assert_eq!(read.body, placed.body);
+    }
+
+    /// What the key is for: a request whose answer was lost is sent again, and the
+    /// order is there once (D76).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn an_order_that_is_sent_again_with_its_key_is_placed_once(pool: PgPool) {
+        let api = testing::api(&pool);
+        let client = api.actor(Role::Client).await;
+
+        let placed = place(&api, &client, Some("press-1"), body(12)).await;
+        assert_eq!(placed.status, StatusCode::CREATED);
+        assert_eq!(placed.body["status"], "pending");
+        let id = placed.body["id"].as_str().unwrap();
+
+        // Sent again as it was: the same order, and a status that says nothing was
+        // placed this time.
+        for _ in 0..2 {
+            let again = place(&api, &client, Some("press-1"), body(12)).await;
+            assert_eq!(again.status, StatusCode::OK);
+            assert_eq!(again.body, placed.body);
+        }
+        assert_eq!(ids(&api.get(Some(&client), "/api/orders").await.body), [id]);
+
+        // It is answered as it stands by then, withdrawn if it was withdrawn.
+        let cancel = format!("/api/orders/{id}/cancel");
+        let withdrawn = api.post(Some(&client), &cancel, Value::Null).await;
+        assert_eq!(withdrawn.status, StatusCode::OK);
+        let again = place(&api, &client, Some("press-1"), body(12)).await;
+        assert_eq!(again.status, StatusCode::OK);
+        assert_eq!(again.body, withdrawn.body);
+        assert_eq!(again.body["status"], "cancelled");
+
+        // Another key is another order. So is no key, every time, as it always was.
+        let other = place(&api, &client, Some("press-2"), body(12)).await;
+        assert_eq!(other.status, StatusCode::CREATED);
+        assert_ne!(other.body["id"], placed.body["id"]);
+        for _ in 0..2 {
+            let keyless = place(&api, &client, None, body(12)).await;
+            assert_eq!(keyless.status, StatusCode::CREATED);
+        }
+        let listed = api.get(Some(&client), "/api/orders").await;
+        assert_eq!(ids(&listed.body).len(), 4);
+
+        // A key is the caller's own: somebody else's that reads the same places theirs.
+        let bob = api.actor(Role::Client).await;
+        let bobs = place(&api, &bob, Some("press-1"), body(12)).await;
+        assert_eq!(bobs.status, StatusCode::CREATED);
+        assert_eq!(bobs.body["client_id"], json!(bob.user.id));
+        assert_eq!(ids(&api.get(Some(&bob), "/api/orders").await.body).len(), 1);
+    }
+
+    /// A key that has placed one order does not answer for another. With the first
+    /// order for an answer, whoever asked would take the second for placed.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_key_is_for_one_order(pool: PgPool) {
+        let api = testing::api(&pool);
+        let client = api.actor(Role::Client).await;
+        let placed = place(&api, &client, Some("press-1"), body(12)).await;
+        assert_eq!(placed.status, StatusCode::CREATED);
+
+        let changes: [fn(&mut Value); 5] = [
+            |order| order["kind"] = json!("pickup"),
+            |order| order["service_date"] = json!(date(13)),
+            |order| order["location"]["lon"] = json!(30.53),
+            |order| order["address"] = Value::Null,
+            |order| order["demand"] = json!(3),
+        ];
+        for change in changes {
+            let mut other = body(12);
+            change(&mut other);
+            let refused = place(&api, &client, Some("press-1"), other.clone()).await;
+            assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{other}");
+            assert_eq!(refused.content_type.as_deref(), Some(PROBLEM_JSON));
+            assert_eq!(refused.body["errors"][0]["field"], "Idempotency-Key");
+            let why = refused.body["errors"][0]["message"].as_str().unwrap();
+            assert!(why.contains("another order"), "{why}");
+        }
+        // Nothing of all that was stored, and the first order is as it was.
+        let listed = api.get(Some(&client), "/api/orders").await;
+        assert_eq!(listed.body, json!([placed.body]));
+        let again = place(&api, &client, Some("press-1"), body(12)).await;
+        assert_eq!((again.status, &again.body), (StatusCode::OK, &placed.body));
+    }
+
+    /// Whoever sends a key takes the request for one that is safe to repeat. So a key
+    /// that is none is refused, and not passed over.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_key_that_is_none_is_refused_and_places_nothing(pool: PgPool) {
+        let api = testing::api(&pool);
+        let client = api.actor(Role::Client).await;
+        let longest = "k".repeat(IdempotencyKey::LONGEST);
+        let too_long = "k".repeat(IdempotencyKey::LONGEST + 1);
+
+        for bad in ["", "two words", "a;b", "ключ", too_long.as_str()] {
+            let refused = place(&api, &client, Some(bad), body(12)).await;
+            assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad:?}");
+            assert_eq!(refused.content_type.as_deref(), Some(PROBLEM_JSON));
+            assert_eq!(
+                refused.body["errors"],
+                json!([{
+                    "field": "Idempotency-Key",
+                    "message": "must be 1 to 64 letters, digits, dots, underscores or hyphens",
+                }]),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            ids(&api.get(Some(&client), "/api/orders").await.body).len(),
+            0
+        );
+
+        for good in [
+            "k",
+            longest.as_str(),
+            "0199e3a4-7c1e-7b52-9d0a-1f2e3d4c5b6a",
+        ] {
+            let placed = place(&api, &client, Some(good), body(12)).await;
+            assert_eq!(placed.status, StatusCode::CREATED, "{good:?}");
+        }
+
+        // The gate comes first: nobody is told what is wrong with a key before they
+        // have shown a token.
+        let request = testing::request("POST", "/api/orders", None)
+            .insert_header((IdempotencyKey::HEADER, "two words"))
+            .set_json(body(12));
+        assert_eq!(api.send(request).await.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// An order that is asked for again changes nothing, so whoever watches its day
+    /// is told nothing (D63).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn an_order_that_is_sent_again_is_announced_once(pool: PgPool) {
+        let api = testing::api(&pool);
+        let _listening = api.listen().await;
+        let operator = api.actor(Role::Operator).await;
+        let client = api.actor(Role::Client).await;
+        let mut stream = api.open(&operator, "/api/system/stats/events").await;
+        stream.next_of("stats").await;
+
+        let placed = place(&api, &client, Some("press-1"), body(13)).await;
+        assert_eq!(placed.status, StatusCode::CREATED);
+        assert_eq!(
+            stream.next_of("orders").await,
+            json!({ "service_date": "2026-10-13" })
+        );
+        let again = place(&api, &client, Some("press-1"), body(13)).await;
+        assert_eq!(again.status, StatusCode::OK);
+        let refused = place(&api, &client, Some("press-1"), body(14)).await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            stream
+                .is_quiet_for(std::time::Duration::from_millis(300))
+                .await
+        );
     }
 
     #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]

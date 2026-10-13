@@ -30,7 +30,10 @@ pub use geo::{
     DistanceProvider, DistanceTable, Distances, EARTH_RADIUS_M, Haversine, InvalidLatLon,
     InvalidPolyline, LatLon, Planar, Polyline, Projection, haversine_m,
 };
-pub use ids::{CourierId, DepotId, JobId, OrderId, PlanId, RouteId, UserId, WorkerId};
+pub use ids::{
+    CourierId, DepotId, IdempotencyKey, InvalidKey, JobId, OrderId, PlanId, RouteId, UserId,
+    WorkerId,
+};
 pub use job::{
     Job, JobKind, JobPayload, JobProgress, JobStatus, QueueDepth, RouteJob, RouteProgress,
     WorkerInfo,

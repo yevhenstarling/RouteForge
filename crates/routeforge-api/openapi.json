@@ -1842,8 +1842,22 @@
         ]
       },
       "post": {
-        "description": "The order is the caller's, and is pending until a plan gives it to a courier.",
+        "description": "The order is the caller's, and is pending until a plan gives it to a courier.\n\nA request may bring a key of the caller's making, as `Idempotency-Key`. Sent again\nwith the same key, it places nothing: the answer is `200`, with the order that key\nplaced, as it stands by then. So a request whose answer was lost can be sent again\nas it was, and the order is placed once. A key is the caller's own, and is for one\norder: with a key that has placed another order the request is refused.",
         "operationId": "create_order",
+        "parameters": [
+          {
+            "description": "What makes the request safe to repeat: 1 to 64 letters, digits, dots, underscores or hyphens, made up by the caller. A UUID will do",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1855,6 +1869,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order"
+                }
+              }
+            },
+            "description": "The order this key placed before. Nothing was stored this time"
+          },
           "201": {
             "content": {
               "application/json": {

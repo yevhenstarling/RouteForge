@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "WITH placed AS (\n               INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n               RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,\n                         plan_id, created_at\n           )\n           SELECT id AS \"id!\", client_id AS \"client_id!\", kind AS \"kind!\", status AS \"status!\",\n                  service_date AS \"service_date!\", lat AS \"lat!\", lon AS \"lon!\", address,\n                  demand AS \"demand!\", plan_id, created_at AS \"created_at!\",\n                  pg_notify($9, to_char(service_date, 'YYYY-MM-DD')) AS watchers\n           FROM placed",
+  "query": "WITH placed AS (\n               INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand,\n                                   idempotency_key)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n               ON CONFLICT (client_id, idempotency_key) WHERE idempotency_key IS NOT NULL\n               DO UPDATE SET idempotency_key = orders.idempotency_key\n               RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,\n                         plan_id, created_at\n           )\n           SELECT id AS \"id!\", client_id AS \"client_id!\", kind AS \"kind!\", status AS \"status!\",\n                  service_date AS \"service_date!\", lat AS \"lat!\", lon AS \"lon!\", address,\n                  demand AS \"demand!\", plan_id, created_at AS \"created_at!\",\n                  CASE WHEN id = $1\n                       THEN pg_notify($10, to_char(service_date, 'YYYY-MM-DD'))\n                  END AS watchers\n           FROM placed",
   "describe": {
     "columns": [
       {
@@ -141,6 +141,7 @@
         "Float8",
         "Text",
         "Int8",
+        "Text",
         "Text"
       ]
     },
@@ -159,5 +160,5 @@
       null
     ]
   },
-  "hash": "7c4bbe6a2a1e50149279b0c20e3eecbf97b8825aaaded44c58c83c68d8deb848"
+  "hash": "bf299265a053b863dfbdd5e7e07cec585aea9567aea7e28ae0f4cc5591bbd245"
 }

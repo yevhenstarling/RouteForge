@@ -8,6 +8,9 @@
 //! An order that is placed or withdrawn says so on [`ORDERS_CHANNEL`], for whoever
 //! shows a day's orders to a person (D63). What a plan does to an order is announced
 //! by the plan (D48).
+//!
+//! An order can be placed with a key of the client's making. Asked for again with the
+//! same key, it is not placed again: see [`place`] (D76).
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgConnection, PgExecutor};
@@ -15,7 +18,7 @@ use uuid::Uuid;
 
 use super::{DbError, parsed, unsigned};
 use crate::geo::LatLon;
-use crate::ids::{OrderId, PlanId};
+use crate::ids::{IdempotencyKey, OrderId, PlanId};
 use crate::model::{NewOrder, Order, OrderFilter, OrderStatus};
 
 /// The channel that says the orders of a day have changed: one was placed, or one was
@@ -64,27 +67,74 @@ fn orders(rows: Vec<OrderRow>) -> Result<Vec<Order>, DbError> {
     rows.into_iter().map(Order::try_from).collect()
 }
 
+/// What came of placing an order with a key (D76).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Placed {
+    /// The order was stored, by this request.
+    Now(Order),
+    /// The client had placed an order with this key already. This is that order, as it
+    /// stands now, and nothing was stored.
+    Before(Order),
+}
+
+impl Placed {
+    /// The order, whichever request stored it.
+    pub fn into_order(self) -> Order {
+        match self {
+            Self::Now(order) | Self::Before(order) => order,
+        }
+    }
+}
+
 /// Stores a new order as pending, and tells the watchers of its day.
 ///
 /// It is one statement, and the notification is sent when the transaction it runs in
 /// commits: an order is heard of when it can be read, and one that was rolled back is
 /// not heard of at all. The schema refuses a demand of 0.
 pub async fn create(executor: impl PgExecutor<'_>, new: &NewOrder) -> Result<Order, DbError> {
-    // The day is written out by `to_char`, so that it reads the same whatever the
-    // session's DateStyle is.
+    // Without a key every request is an order of its own.
+    Ok(place(executor, new, None).await?.into_order())
+}
+
+/// Stores a new order as [`create`] does, once for each key of a client (D76).
+///
+/// With a key the client has placed an order with before, nothing is stored and nobody
+/// is told: the answer is that order, as [`Placed::Before`]. Whether it is the order
+/// this request asks for is for the caller to say: see [`NewOrder::asks_for`].
+///
+/// It is one statement still. Two requests with one key that arrive together are one
+/// order: the second waits for the first to commit, and is then answered with its row.
+pub async fn place(
+    executor: impl PgExecutor<'_>,
+    new: &NewOrder,
+    key: Option<&IdempotencyKey>,
+) -> Result<Placed, DbError> {
+    let id = OrderId::generate();
+    // A key that is taken is no error but an answer, so the conflict updates the row
+    // that has it, to what it is already. `DO NOTHING` would return no row at all to
+    // the request that came second (D59).
+    //
+    // The row that comes back is this request's own if it has the id that was sent,
+    // and only then is anybody told. The day is written out by `to_char`, so that it
+    // reads the same whatever the session's DateStyle is.
     let placed = sqlx::query!(
         r#"WITH placed AS (
-               INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand,
+                                   idempotency_key)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (client_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+               DO UPDATE SET idempotency_key = orders.idempotency_key
                RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,
                          plan_id, created_at
            )
            SELECT id AS "id!", client_id AS "client_id!", kind AS "kind!", status AS "status!",
                   service_date AS "service_date!", lat AS "lat!", lon AS "lon!", address,
                   demand AS "demand!", plan_id, created_at AS "created_at!",
-                  pg_notify($9, to_char(service_date, 'YYYY-MM-DD')) AS watchers
+                  CASE WHEN id = $1
+                       THEN pg_notify($10, to_char(service_date, 'YYYY-MM-DD'))
+                  END AS watchers
            FROM placed"#,
-        OrderId::generate().0,
+        id.0,
         new.client_id.0,
         new.kind.as_str(),
         new.service_date,
@@ -92,11 +142,12 @@ pub async fn create(executor: impl PgExecutor<'_>, new: &NewOrder) -> Result<Ord
         new.location.lon(),
         new.address,
         i64::from(new.demand),
+        key.map(IdempotencyKey::as_str),
         ORDERS_CHANNEL,
     )
     .fetch_one(executor)
     .await?;
-    OrderRow {
+    let order = Order::try_from(OrderRow {
         id: placed.id,
         client_id: placed.client_id,
         kind: placed.kind,
@@ -108,8 +159,12 @@ pub async fn create(executor: impl PgExecutor<'_>, new: &NewOrder) -> Result<Ord
         demand: placed.demand,
         plan_id: placed.plan_id,
         created_at: placed.created_at,
-    }
-    .try_into()
+    })?;
+    Ok(if order.id == id {
+        Placed::Now(order)
+    } else {
+        Placed::Before(order)
+    })
 }
 
 pub async fn get(executor: impl PgExecutor<'_>, id: OrderId) -> Result<Option<Order>, DbError> {
@@ -596,6 +651,228 @@ mod tests {
         }
         // Nor has a plan that takes an order. It announces itself, elsewhere (D48).
         assert!(told_of(&mut watcher).await.is_empty());
+    }
+
+    fn key(text: &str) -> IdempotencyKey {
+        IdempotencyKey::new(text).unwrap()
+    }
+
+    /// How many orders a client has, whatever became of them.
+    async fn orders_of(pool: &PgPool, client_id: UserId) -> usize {
+        let filter = OrderFilter {
+            client_id: Some(client_id),
+            ..OrderFilter::default()
+        };
+        list(pool, &filter).await.unwrap().len()
+    }
+
+    #[sqlx::test]
+    async fn an_order_placed_with_a_key_is_placed_once(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let new = testing::new_order(client.id, date(12));
+
+        let Placed::Now(first) = place(&pool, &new, Some(&key("press-1"))).await.unwrap() else {
+            panic!("the first request with a key places the order");
+        };
+        assert_eq!(first.status, OrderStatus::Pending);
+        assert!(new.asks_for(&first));
+
+        // Asked again, however often: the same order, and nothing more is stored.
+        for _ in 0..3 {
+            let again = place(&pool, &new, Some(&key("press-1"))).await.unwrap();
+            assert_eq!(again, Placed::Before(first.clone()));
+        }
+        assert_eq!(orders_of(&pool, client.id).await, 1);
+
+        // Another key is another order, and so is no key at all, each time.
+        let other = place(&pool, &new, Some(&key("press-2"))).await.unwrap();
+        assert!(matches!(&other, Placed::Now(order) if order.id != first.id));
+        for _ in 0..2 {
+            let keyless = place(&pool, &new, None).await.unwrap();
+            assert!(matches!(keyless, Placed::Now(_)));
+        }
+        assert_eq!(orders_of(&pool, client.id).await, 4);
+        // A key is told from another by its letters, to the case.
+        let shouted = place(&pool, &new, Some(&key("PRESS-1"))).await.unwrap();
+        assert!(matches!(shouted, Placed::Now(_)));
+    }
+
+    /// The answer to a repeat is the order the key placed, whatever the repeat asks
+    /// for. Whether that is an answer to it is for the caller to say.
+    #[sqlx::test]
+    async fn a_repeat_is_answered_with_the_order_as_it_stands_now(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let plan = testing::plan(&pool, date(12)).await;
+        let new = testing::new_order(client.id, date(12));
+        let withdrawn = place(&pool, &new, Some(&key("a"))).await.unwrap();
+        let planned = place(&pool, &new, Some(&key("b"))).await.unwrap();
+        let (withdrawn, planned) = (withdrawn.into_order(), planned.into_order());
+        assert!(cancel(&pool, withdrawn.id).await.unwrap());
+        mark_planned(&pool, plan.id, &[planned.id]).await.unwrap();
+
+        let Placed::Before(again) = place(&pool, &new, Some(&key("a"))).await.unwrap() else {
+            panic!("an order that was withdrawn is still the order its key placed");
+        };
+        assert_eq!(
+            (again.id, again.status),
+            (withdrawn.id, OrderStatus::Cancelled)
+        );
+        let Placed::Before(again) = place(&pool, &new, Some(&key("b"))).await.unwrap() else {
+            panic!("an order that a plan holds is still the order its key placed");
+        };
+        assert_eq!(
+            (again.id, again.status, again.plan_id),
+            (planned.id, OrderStatus::Planned, Some(plan.id))
+        );
+        // Nothing of the order was changed by being asked for again.
+        assert_eq!(get(&pool, planned.id).await.unwrap(), Some(again));
+
+        // One that asks for something else gets the first order all the same, and the
+        // caller can tell that it is not what was asked for.
+        let mut other = new.clone();
+        other.demand = 4;
+        let Placed::Before(found) = place(&pool, &other, Some(&key("a"))).await.unwrap() else {
+            panic!("the key is taken");
+        };
+        assert_eq!((found.id, found.demand), (withdrawn.id, 1));
+        assert!(!other.asks_for(&found) && new.asks_for(&found));
+        assert_eq!(orders_of(&pool, client.id).await, 2);
+    }
+
+    /// Two clients who make up the same key have placed two orders, and neither is
+    /// answered with the other's.
+    #[sqlx::test]
+    async fn a_key_is_a_clients_own(pool: PgPool) {
+        let ada = testing::user(&pool, Role::Client).await;
+        let bob = testing::user(&pool, Role::Client).await;
+        let same = key("the-key-everybody-thinks-of");
+
+        let adas = place(&pool, &testing::new_order(ada.id, date(12)), Some(&same)).await;
+        let bobs = place(&pool, &testing::new_order(bob.id, date(12)), Some(&same)).await;
+        let (Placed::Now(adas), Placed::Now(bobs)) = (adas.unwrap(), bobs.unwrap()) else {
+            panic!("each of them placed an order");
+        };
+        assert_eq!((adas.client_id, bobs.client_id), (ada.id, bob.id));
+        assert_ne!(adas.id, bobs.id);
+
+        let again = place(&pool, &testing::new_order(bob.id, date(12)), Some(&same)).await;
+        assert_eq!(again.unwrap(), Placed::Before(bobs));
+    }
+
+    /// The race the key is there for: a request is sent again while the first is
+    /// still on its way.
+    #[sqlx::test]
+    async fn requests_with_one_key_that_arrive_together_are_one_order(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let new = testing::new_order(client.id, date(12));
+
+        // As many at once as a test pool has connections for.
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            let (pool, new) = (pool.clone(), new.clone());
+            requests.push(tokio::spawn(async move {
+                place(&pool, &new, Some(&key("pressed-twice")))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut stored = Vec::new();
+        let mut found = Vec::new();
+        for request in requests {
+            match request.await.unwrap() {
+                Placed::Now(order) => stored.push(order.id),
+                Placed::Before(order) => found.push(order.id),
+            }
+        }
+        assert_eq!(stored.len(), 1, "one of them placed the order");
+        assert_eq!(found, [stored[0]; 3], "and the others were given it");
+        assert_eq!(orders_of(&pool, client.id).await, 1);
+
+        // A request that is held up by one that then comes to nothing places the
+        // order itself.
+        let mut first = pool.begin().await.unwrap();
+        let undone = place(&mut *first, &new, Some(&key("undone")))
+            .await
+            .unwrap();
+        assert!(matches!(undone, Placed::Now(_)));
+        let second = tokio::spawn({
+            let (pool, new) = (pool.clone(), new.clone());
+            async move { place(&pool, &new, Some(&key("undone"))).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!second.is_finished(), "it waits to see what the first does");
+        first.rollback().await.unwrap();
+        let Placed::Now(placed) = second.await.unwrap() else {
+            panic!("the first was rolled back, so the second is the one that placed it");
+        };
+        assert_ne!(placed.id, undone.into_order().id);
+        assert_eq!(orders_of(&pool, client.id).await, 2);
+    }
+
+    /// What `IdempotencyKey` refuses, the schema refuses as well.
+    #[sqlx::test]
+    async fn the_schema_refuses_a_key_that_is_empty_or_too_long(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let store = async |key: String| {
+            sqlx::query(
+                "INSERT INTO orders (id, client_id, kind, service_date, lat, lon, demand,
+                                     idempotency_key)
+                 VALUES ($1, $2, 'delivery', DATE '2026-10-12', 50.4, 30.6, 1, $3)",
+            )
+            .bind(OrderId::generate().0)
+            .bind(client.id.0)
+            .bind(key)
+            .execute(&pool)
+            .await
+        };
+
+        for refused in [String::new(), "k".repeat(IdempotencyKey::LONGEST + 1)] {
+            let error = store(refused).await.unwrap_err();
+            assert!(
+                matches!(&error, sqlx::Error::Database(database)
+                    if database.constraint() == Some("orders_idempotency_key_check")),
+                "{error:?}"
+            );
+        }
+        store("k".repeat(IdempotencyKey::LONGEST)).await.unwrap();
+        // And a key is stored once for a client, whoever stores it.
+        let error = store("k".repeat(IdempotencyKey::LONGEST))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, sqlx::Error::Database(database)
+                if database.constraint() == Some("orders_client_idempotency_key")),
+            "{error:?}"
+        );
+    }
+
+    /// A repeat stores nothing, so there is nothing to tell anybody (D63).
+    #[sqlx::test]
+    async fn an_order_placed_with_a_key_is_announced_once(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let new = testing::new_order(client.id, date(12));
+        let mut watcher = watching(&pool).await;
+
+        place(&pool, &new, Some(&key("press-1"))).await.unwrap();
+        assert_eq!(told_of(&mut watcher).await, ["2026-10-12"], "placed");
+        for _ in 0..2 {
+            let again = place(&pool, &new, Some(&key("press-1"))).await.unwrap();
+            assert!(matches!(again, Placed::Before(_)));
+        }
+        assert!(told_of(&mut watcher).await.is_empty(), "asked for again");
+
+        // Not for a day the repeat names either: nothing of that day has changed.
+        let mut other_day = new.clone();
+        other_day.service_date = date(13);
+        place(&pool, &other_day, Some(&key("press-1")))
+            .await
+            .unwrap();
+        assert!(told_of(&mut watcher).await.is_empty());
+
+        place(&pool, &other_day, Some(&key("press-2")))
+            .await
+            .unwrap();
+        assert_eq!(told_of(&mut watcher).await, ["2026-10-13"]);
     }
 
     /// The payload is the day and nothing more, so that PostgreSQL folds the

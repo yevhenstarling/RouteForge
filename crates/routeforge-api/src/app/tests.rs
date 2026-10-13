@@ -561,6 +561,34 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
         }])
     );
 
+    // Placing an order says what makes it safe to repeat, and that a repeat is
+    // answered with the order and another status (D76). The bot reads the name of the
+    // header from here.
+    let placing = &document["paths"]["/api/orders"]["post"];
+    assert_eq!(
+        placing["parameters"],
+        json!([{
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "What makes the request safe to repeat: 1 to 64 letters, digits, \
+                dots, underscores or hyphens, made up by the caller. A UUID will do",
+            "required": false,
+            "schema": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9._-]+$",
+            },
+        }])
+    );
+    for status in ["200", "201"] {
+        assert_eq!(
+            placing["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Order",
+            "{status}"
+        );
+    }
+
     // Nothing in the document points at a schema it does not have.
     let text = document.to_string();
     for reference in text.split("#/components/schemas/").skip(1) {
