@@ -882,8 +882,11 @@ function fit() {
   for (const order of state.orders.values()) {
     if (order.status !== 'cancelled') points.push(point(order.location));
   }
-  if (points.length === 1) map.setView(points[0], 13);
-  else if (points.length > 1) map.fitBounds(L.latLngBounds(points).pad(0.08));
+  // At once, and not by a zoom that is seen to happen: while Leaflet shows one, it
+  // passes over the next move it is asked for. A day that is picked just after
+  // another would keep the view of the day before.
+  if (points.length === 1) map.setView(points[0], 13, { animate: false });
+  else if (points.length > 1) map.fitBounds(L.latLngBounds(points).pad(0.08), { animate: false });
 }
 
 // ---------------------------------------------------------------- what the panels say
@@ -1046,7 +1049,11 @@ function renderRoutes() {
     } else if (progress && job.status === 'running') {
       numbers = km(progress.best_cost_m);
       stands += `, ${moves(progress.iterations)}`;
-      if (search) stands += `, from ${km(search.points[0].metres)}`;
+      // The first length this page heard of, once the search has got below it. A page
+      // may open its stream after a search has announced its first tour.
+      if (search && search.points[0].metres > progress.best_cost_m) {
+        stands += `, from ${km(search.points[0].metres)}`;
+      }
     }
 
     const colour = colourOf(job.courier_id);
@@ -1177,8 +1184,8 @@ function showStop(stop) {
     pane: 'depot', radius: 13, color: '#111', weight: 2.5, fill: false, interactive: false,
   }).addTo(layers.mark);
   // Near enough to tell the stop from its neighbours, and no further off than the map
-  // is already.
-  map.setView(where, Math.max(map.getZoom(), 15));
+  // is already. At once, as in `fit`: the row that is pressed next is not passed over.
+  map.setView(where, Math.max(map.getZoom(), 15), { animate: false });
   renderSheet();
   const marker = markers.get(stop.order_id);
   if (marker) marker.openTooltip();
