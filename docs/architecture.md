@@ -973,6 +973,8 @@ What it costs: "deliver two parcels here tomorrow" is a few taps and not a sente
 
 Phase 8 ended with no key, and the item was not built. The bot does read words since then, for one thing: an address, which it looks up and asks about with buttons (D72). No model is in that, and nothing is done on the strength of words.
 
+On 2026-10-13 the project owner made the item a phase of its own, Phase 11 in `docs/plan.md`, without having decided whether it will be built. What holds for it is what holds here: it is not begun without a key.
+
 ### D59. A Telegram user gets an account of their own, the first time the bot hears of them (in place)
 
 Decided with the project owner on 2026-10-12.

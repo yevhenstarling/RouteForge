@@ -24,7 +24,7 @@ Confirmed with the project owner:
 - **The stack starts with no settings.** A fresh clone has no key to sign tokens with and no admin. Compose falls back to values for a demonstration, which are in the repository for everybody to read, and the ports are open to the machine alone (D54).
 - **The bot is in the stack before it is built.** Its image and its compose service are Phase 6's, with a stub that idles. The bot itself stays Phase 7's (D56).
 - **Phase 6 has a quick start in the README, and leaves CI alone.** Starting the stack in CI, and running the demo script there, were offered beside it and not taken.
-- **The bot takes buttons and commands, not free text.** A location and a few buttons say what an order needs. Free text through the Claude API, which the description names, is an optional item of Phase 8 and is built only when there is a key to try it with (D58).
+- **The bot takes buttons and commands, not free text.** A location and a few buttons say what an order needs. Free text through the Claude API, which the description names, is an optional item of Phase 8 and is built only when there is a key to try it with (D58). Phase 8 had no key and did not build it. It is Phase 11 now.
 - **A Telegram user gets an account of their own, the first time they write to the bot.** A client's, with no address and no password, which an admin can make an operator's. Tying a Telegram user to an account that is there already, by a code, was offered beside it and not taken (D59).
 - **Phase 7 has two things beyond its list:** an order shows on the map as it is placed, and the bot takes coordinates that are typed where a location cannot be shared (D61, D63).
 - **Phase 7 was merged before it was tried against Telegram.** There was no token for a bot while it was built. It was built and tried against a stand-in for Telegram (D64), and the try with a real bot is the one step of it that is open.
@@ -32,6 +32,8 @@ Confirmed with the project owner:
 - **The bot looks addresses up only where it is given a service to ask.** The public Nominatim was the other choice. It is named in `.env.example`, with its usage policy, and is nobody's default (D72).
 - **A route says what it was measured along, and the map draws it straight.** Lines along the streets were offered beside the label and not taken (D66).
 - **There will be no token from Telegram, and there was no key for the Claude API.** So Phase 8 tried the bot as Phase 7 did, against stand-ins, and did not build free text (D58). The bootcamp holds the project to nothing formal beyond the approved description.
+- **Three phases were added on 2026-10-13, after Phase 8 was done.** Phase 9 gives the map more to show, Phase 10 gives a client something to do on the page, and Phase 11 is the free text of the bot, which is a phase of its own now and not decided on. What each is to hold is listed under it, and no more than that: how a phase is built is planned when the phase begins.
+- **Two things that were offered beside them were not taken:** starting the stack and running `scripts/demo.sh` in CI, and pictures of the page in the README. The project has no CI on GitHub, the project owner said the same day. The workflow under `.github/` is in the repository all the same, and nothing here has seen it run.
 
 Derived from the description:
 
@@ -81,8 +83,13 @@ RouteForge/
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | done |
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | built; not tried against Telegram yet |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | L | done; free text for the bot was not built |
+| 9 | More to see on the map | Routes along the streets, vans driving them, a route getting shorter while it is searched for | M | todo |
+| 10 | The client's page | A client placing an order on the page and seeing it planned, beside an operator's page | M | todo |
+| 11 | Free text for the bot | An order placed by a sentence | M | not decided on; needs an Anthropic API key |
 
 **Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58). In the end one thing was dropped there: the LLM part, for which there was no key.
+
+Phases 9 to 11 were added when all of that was done, and nothing depends on any of them. Each stands by itself, so they can be taken in any order, or left. Phases 9 and 10 make a demonstration show more. Phase 11 is the one part of the approved description that is not built.
 
 ## Phase 0: skeleton and tooling
 
@@ -387,13 +394,7 @@ Delivered:
 - **Numbers and documents.** The example `quality` in `routeforge-tsp`, which prints the length of a route against the moves its search was given. The README, with what the moves buy, what a stage takes, the scaling table made again, distances by road, addresses in the bot and the known limits. D65 to D72 in the decision log, with D7 marked as replaced. `cargo audit` in CI, as a job of its own.
 - In the solver, where a solver takes its distances from is decided in `Provider::of` and no longer in `main`, and the bot's binary has a test that starts it with a geocoding service. Both came of asking what a test would say to a fault in `main`.
 
-What the free text was to be, for whoever builds it with a key:
-
-- A Claude client over `reqwest` against the Messages API (there is no official Rust SDK), with a hand-written tool loop: capped iterations, all tool results of a turn returned in one message, assistant content echoed back unchanged, `refusal` and `max_tokens` stop reasons handled.
-- The tools, with strict schemas, are the operations the bot has from Phase 7. A side effect is still confirmed with a button (D9). Bounded per-chat history in memory.
-- Model id from env, default `claude-opus-5-5`. Running a cheaper model is a config change and the owner's call.
-- Tests: the tool loop against a scripted fake model; request and response shapes with wiremock.
-- It goes into `Chats::handle`, where a text that is no command arrives. Today such a text is an address, to a bot that has a geocoding service, and nothing to one that has not (D72). A model would be asked before either.
+The free text is Phase 11 now. What it was to be is listed there.
 
 Tests: 117 more, and a doctest. 35 are in `routeforge-tsp`, which has 100 now beside its two TSPLIB tests; 28 in the solver (69); 21 in the API (132); 31 in the bot (78), six of which run the binary; and 2 in the domain crate (124). They hold:
 
@@ -458,10 +459,76 @@ Found while it was tried, and guarded against since:
 
 What is left, for whoever goes on:
 
-- The try with Telegram, and free text with a key: both as "Needed from the project owner" says.
-- The known limits in the README. Each is a thing that was looked at and left.
-- Lines along the streets on the map. The routes are found by road and drawn straight (D66).
+- The try with Telegram, as "Needed from the project owner" says. Free text with a key is Phase 11 now.
+- The known limits in the README. Each is a thing that was looked at and left. Phase 10 takes up two of them: a client's page that hears of nothing, and an order that can be placed twice.
+- Lines along the streets on the map. The routes are found by road and drawn straight (D66). That is in Phase 9 now.
 - A route that is searched through tours which overload its courier. The search takes up none, which can keep it from a shorter one where the loads are tight (D65).
+
+## Phase 9: more to see on the map
+
+Not begun, and not planned beyond this list. Added by the project owner on 2026-10-13.
+
+What it is to hold:
+
+- **Routes drawn along the streets,** where they were found by road.
+- **Vans that move along their routes,** for the demonstration.
+- **The length of a route as its search goes on,** drawn as a small chart beside the route, so that it is seen to fall.
+- **A route sheet:** the stops of a route in the order the courier calls, with what is on board after each.
+
+Done when: with the OSRM profile on, the routes of a plan follow the streets on the map. The vans of a plan that is done are seen driving their routes. While a plan is searched for, the length of each of its routes is seen to fall. And a route can be opened as the list of its stops, with the load after each.
+
+What is known so far:
+
+- **The lines turn round a choice of 2026-10-12,** when the project owner took a label on the route over lines along the streets (D66). They are for routes that were measured by road. A route on great circles is straight by what it is, so a clone without OSRM shows what it shows now.
+- **Nothing stores the way a route takes.** A route has its stops, a length and what the length was measured along. The solver asks OSRM's table service and no other. The way along the streets would come from the service of OSRM that gives a route its geometry.
+- **Moving vans are a simulation.** The approved description has live GPS tracking of couriers among what the project will not do, and that is not changed by a van that is moved for show. So what moves on the page is to be called simulated, there and in the README.
+- **How a van gets its position is open.** Three ways were put to the project owner on 2026-10-12, who put the choice off:
+  - It is reckoned from the time since the van set out: the route is stored, the speed is given, and the database has one clock. Nothing is stored and nothing is sent in. This was the one recommended.
+  - It is reported through a new endpoint, by a script that plays the couriers. That is the first half of tracking, and it does change what the description says the project will not do.
+  - A simulator inside the system writes positions, and the streams pass them on. The same on the screen as the first, with more behind it.
+- **The chart needs nothing new of the API.** A search announces its best length a few times a second, and the stream of a plan passes that on (D49). Nothing stores those lengths, so a page that is opened after a search has no chart to draw.
+- **The route sheet needs nothing new of the API either.** The page has the stops of a route in calling order, each with its kind and its demand, and reckons the most on board already (D65).
+- **Three of the four are the page's,** and the page is tried by hand (D52). Whatever it gains has to keep to its policy: one script and one style, nothing inline beside them, and no host but the tile server (D69).
+
+## Phase 10: the client's page
+
+Not begun, and not planned beyond this list. Added by the project owner on 2026-10-13.
+
+What it is to hold:
+
+- **An account opened on the page,** and an order placed there by a click on the map, and withdrawn there.
+- **A client's page that hears of its orders:** one that was placed elsewhere, and one that a plan has taken, with nobody pressing Refresh.
+- **A key that makes placing an order safe to repeat,** for the bot and for the page.
+
+Done when, in two browser windows: somebody opens an account on the page and places an order by a click on the map. The operator's page shows it at once. The operator plans the day, and the client's page shows the order as planned, with nobody pressing Refresh. And an order that is sent twice with the same key is stored once, so that the bot can say for certain whether an order was placed.
+
+What is known so far:
+
+- **A client can do nothing on the page today.** One who logs in sees the depot and their own orders (D52). The page has no way to open an account, and none to place or to withdraw an order. The API has had all three since Phase 4: `register`, `create_order` and `cancel_order`.
+- **A client's page has no stream.** The two streams there are, of a plan and of the queue, are for operators and admins (D41, D50). An operator's page hears of an order through the second (D63). What a client may hear of is their own orders, and nothing of anybody else's.
+- **An order can be placed twice today.** When the answer to it is lost on the way back, the bot says that it cannot tell whether the order was placed, and the person may press again (D61). That is among the known limits in the README, and so is the page of a client that shows a new order only after Refresh.
+- **The bot's requests are held to the API's document** (D64). Whatever carries the key, a header or a field, has to be in `openapi.json` before the bot's tests answer it.
+
+## Phase 11: free text for the bot
+
+Not decided on. It is the one part of the approved description that is not built: the description calls the bot LLM-powered and names the Claude API (D58). The project owner made it a phase of its own on 2026-10-13, and had not decided then whether it will be built.
+
+It is not begun without an Anthropic API key. Code for the Claude API that was never run against the Claude API is not shipped (D58).
+
+What it is to hold, as it was planned for Phase 8:
+
+- A Claude client over `reqwest` against the Messages API (there is no official Rust SDK), with a hand-written tool loop: capped iterations, all tool results of a turn returned in one message, assistant content echoed back unchanged, `refusal` and `max_tokens` stop reasons handled.
+- The tools, with strict schemas, are the operations the bot has from Phase 7. A side effect is still confirmed with a button (D9). Bounded per-chat history in memory.
+- Model id from env, default `claude-opus-5-5`. Running a cheaper model is a config change and the owner's call.
+- Tests: the tool loop against a scripted fake model; request and response shapes with wiremock.
+- It goes into `Chats::handle`, where a text that is no command arrives. Today such a text is an address, to a bot that has a geocoding service, and nothing to one that has not (D72). A model would be asked before either.
+
+Done when: a sentence such as "deliver two parcels to Khreshchatyk 22 tomorrow" brings the question the buttons bring, with the same confirming button under it. The order is placed by the press of that button and by nothing before it (D9). And this was tried against the Claude API itself, and not against a stand-in for it alone.
+
+What is known so far:
+
+- **To be shown in a chat it needs a token from Telegram as well,** and the project owner said on 2026-10-12 that there will be none. Without one, the half that faces Telegram is tried against the stand-in, as all of the bot is (D64), and the half that faces the model against the Claude API.
+- **The README says today that the bot understands no sentences, and why.** When this is built, that paragraph goes.
 
 ## Known traps
 
@@ -537,7 +604,8 @@ What is left, for whoever goes on:
   If something that Telegram answers differs from what the stand-in answered (D64), it shows in `docker compose logs bot` as a warning with Telegram's own words.
 
   With `GEOCODER_URL` set as well, step 4 has a second way in: write an address where the location was shared, and press the button of the place.
-- For the free text of the bot, which Phase 8 left out: an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58). The item is described under Phase 8 as it was planned.
+- For Phase 9: nothing new. The lines along the streets show where an OSRM server is asked, which takes the roads that `scripts/osrm-prepare` fetches.
+- For Phase 11, the free text of the bot: the decision whether to build it, and an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58). The phase is not begun without the key.
 - The owner said on 2026-10-12 that the bootcamp holds the project to nothing formal: no rubric, and no word on whether the bot may come without its LLM part. If that changes, the README's paragraph on the bot is where the difference from the approved description is said.
 
 ## Verification
