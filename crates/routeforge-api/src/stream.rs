@@ -8,7 +8,8 @@
 //!   ([`Heard::Changed`]), and every so often without one, since a notification is a
 //!   hint and can be missed (D26). It sends only what differs from what it last sent.
 //! - What is news by itself, the progress of a search, it sends on as it comes
-//!   ([`Heard::Frame`]).
+//!   ([`Heard::Frame`]). One thing is both, news and a reason to read
+//!   ([`Heard::ChangedWith`]): that a plan has changed, to the stream of the queue.
 //! - A comment goes out now and then, so that nothing between the API and the reader
 //!   takes the silence of a quiet plan for a dead connection.
 //!
@@ -56,6 +57,9 @@ pub(crate) struct Pace {
     /// The same for the stream of the queue and its workers. It is short, because a
     /// worker comes, and falls silent, without a word to anybody (D27).
     pub(crate) stats_every: Duration,
+    /// The same for the stream of somebody's own orders (D77). As for a plan: all
+    /// that changes an order is announced, and this is for the word that was lost.
+    pub(crate) orders_every: Duration,
     /// How often a comment is sent.
     pub(crate) keep_alive: Duration,
 }
@@ -66,6 +70,7 @@ impl Default for Pace {
             settle: Duration::from_millis(200),
             plan_every: Duration::from_secs(10),
             stats_every: Duration::from_secs(2),
+            orders_every: Duration::from_secs(10),
             keep_alive: Duration::from_secs(15),
         }
     }
@@ -80,6 +85,8 @@ pub(crate) enum Heard {
     Changed,
     /// An event to send on as it is.
     Frame(Bytes),
+    /// An event to send on as it is, and a reason to read again as well.
+    ChangedWith(Bytes),
 }
 
 /// What one kind of stream shows.
@@ -194,6 +201,10 @@ impl<W: Watch> Feed<W> {
                         Heard::Nothing => {}
                         Heard::Changed => self.read_soon(),
                         Heard::Frame(frame) => self.ready.push_back(frame),
+                        Heard::ChangedWith(frame) => {
+                            self.ready.push_back(frame);
+                            self.read_soon();
+                        }
                     },
                     // It fell behind, and cannot know what it was not told.
                     Err(RecvError::Lagged(_)) => self.read_soon(),

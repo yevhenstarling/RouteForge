@@ -66,6 +66,7 @@ pub(crate) const PACE: Pace = Pace {
     settle: Duration::from_millis(20),
     plan_every: NEVER,
     stats_every: NEVER,
+    orders_every: NEVER,
     keep_alive: NEVER,
 };
 

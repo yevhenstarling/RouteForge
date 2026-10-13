@@ -24,7 +24,7 @@ mod text;
 
 pub use dto::{
     CourierChange, DemoCreated, DemoRequest, FieldError, Login, OrderRequest, OrdersChanged,
-    PlanRequest, Problem, RoleChange, Session, SystemStats, TelegramLogin,
+    PlanChanged, PlanRequest, Problem, RoleChange, Session, SystemStats, TelegramLogin,
 };
 pub use geo::{
     DistanceProvider, DistanceTable, Distances, EARTH_RADIUS_M, Haversine, InvalidLatLon,

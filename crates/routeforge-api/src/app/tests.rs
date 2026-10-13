@@ -47,6 +47,7 @@ const MATRIX: &[(&str, &str, Needs)] = &[
     ("post", "/api/orders", Needs::Anyone),
     ("get", "/api/orders", Needs::Anyone),
     ("get", "/api/orders/stops", Needs::Anyone),
+    ("get", "/api/orders/events", Needs::Anyone),
     ("get", "/api/orders/{id}", Needs::Anyone),
     ("post", "/api/orders/{id}/cancel", Needs::Anyone),
     ("get", "/api/depot", Needs::Anyone),
@@ -502,11 +503,16 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
         "JobProgress",
         "JobStatus",
         "OrdersChanged",
+        "PlanChanged",
     ] {
         assert!(schemas.get(named).is_some(), "no schema for {named}");
     }
     // A stream says that it is one, and what a caller who is kept out is answered.
-    for path in ["/api/plans/{id}/events", "/api/system/stats/events"] {
+    for path in [
+        "/api/plans/{id}/events",
+        "/api/system/stats/events",
+        "/api/orders/events",
+    ] {
         let responses = &document["paths"][path]["get"]["responses"];
         let stream = &responses["200"]["content"]["text/event-stream"];
         assert_eq!(stream["schema"]["type"], "string", "{path}");

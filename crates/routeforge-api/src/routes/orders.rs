@@ -9,12 +9,20 @@
 //!
 //! Of the route a plan puts an order on, whoever placed the order is told where the
 //! order is on it, and nothing else (D78).
+//!
+//! And whoever placed orders can watch them: a stream says when something has become
+//! of one of their own, and nothing of anybody else's (D77).
 
+use std::time::Duration;
+
+use actix_web::web::Bytes;
 use actix_web::{HttpRequest, HttpResponse, get, post, web};
+use chrono::NaiveDate;
 use routeforge_domain::db::orders::{self, Placed};
 use routeforge_domain::db::routes;
 use routeforge_domain::{
     IdempotencyKey, Order, OrderDay, OrderFilter, OrderId, OrderRequest, OrderStatus, OrderStop,
+    OrdersChanged, UserId,
 };
 use utoipa_actix_web::service_config::ServiceConfig;
 use uuid::Uuid;
@@ -22,6 +30,8 @@ use uuid::Uuid;
 use crate::app::{AppState, NotAcceptable, NotLoggedIn, NotNow, NotThere};
 use crate::auth::AuthUser;
 use crate::error::ApiError;
+use crate::events::Signal;
+use crate::stream::{self, Heard, Pace, Watch};
 use crate::validate;
 
 pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
@@ -29,8 +39,9 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
         .service(create_order)
         .service(list_orders)
         // Before the route that takes an id: a path is given to the first route it
-        // fits, and `stops` fits `{id}` as any word does.
+        // fits, and `stops` and `events` fit `{id}` as any word does.
         .service(list_order_stops)
+        .service(watch_orders)
         .service(get_order)
         .service(cancel_order);
 }
@@ -172,6 +183,104 @@ async fn list_order_stops(
     Ok(web::Json(stops))
 }
 
+/// Watch one's own orders of a day
+///
+/// An event stream (`text/event-stream`) that stays open. It sends an `orders` event,
+/// an `OrdersChanged`, when it opens and whenever something has become of an order the
+/// caller placed for that day: it was placed, here or elsewhere, or withdrawn, a plan
+/// has taken it, its route was stored, or a plan has given it back. The event names
+/// the day and no order: whoever hears it reads `GET /api/orders` and
+/// `GET /api/orders/stops` for that day again.
+///
+/// It tells of the caller's own orders, whoever the caller is, and of nobody else's:
+/// an order that somebody else places sends nothing here. An operator hears of
+/// everybody's orders on the stream of `GET /api/system/stats/events`.
+///
+/// A line that starts with a colon is a comment, sent to keep the connection open.
+/// The stream ends when the token it was opened with expires.
+#[utoipa::path(
+    tag = "orders",
+    security(("bearer" = [])),
+    params(OrderDay),
+    responses(
+        (status = 200, description = "The events, for as long as the stream is read",
+            body = String, content_type = "text/event-stream"),
+        NotLoggedIn,
+    )
+)]
+#[get("/api/orders/events")]
+async fn watch_orders(
+    user: AuthUser,
+    state: web::Data<AppState>,
+    query: web::Query<OrderDay>,
+) -> Result<HttpResponse, ApiError> {
+    let watch = OrdersWatch {
+        client_id: user.id,
+        service_date: query.service_date,
+        sent: None,
+    };
+    stream::open(state, user, watch).await
+}
+
+/// How one's own orders of a day stand: each with its status, and where those are that
+/// are on a route. It is what the stream of them compares, to know whether to speak.
+type Standing = (Vec<(OrderId, OrderStatus)>, Vec<OrderStop>);
+
+/// What the stream of somebody's own orders of a day shows (D77).
+struct OrdersWatch {
+    client_id: UserId,
+    service_date: NaiveDate,
+    /// How the orders stood when the stream last said that they had changed.
+    sent: Option<Standing>,
+}
+
+impl Watch for OrdersWatch {
+    fn hears(&self, signal: &Signal) -> Heard {
+        match signal {
+            // An order of the day was placed or withdrawn: whose, is not said (D63).
+            // And a plan has changed: of which day, is not said either, and a plan
+            // takes orders, puts them on routes and gives them back (D48).
+            //
+            // Neither is passed on. Each is a reason to read, and the read is of the
+            // caller's own orders. So what goes out says nothing of anybody else's:
+            // not even that somebody else has placed an order.
+            Signal::Orders(service_date) if *service_date == self.service_date => Heard::Changed,
+            Signal::Plan(_) | Signal::Missed => Heard::Changed,
+            Signal::Orders(_) | Signal::Progress(_) => Heard::Nothing,
+        }
+    }
+
+    async fn read(&mut self, state: &AppState) -> Result<Vec<Bytes>, ApiError> {
+        let own = OrderFilter {
+            client_id: Some(self.client_id),
+            service_date: Some(self.service_date),
+            ..OrderFilter::default()
+        };
+        let orders = orders::list(&state.pool, &own)
+            .await?
+            .into_iter()
+            .map(|order| (order.id, order.status))
+            .collect();
+        let stops =
+            routes::stops_of_day(&state.pool, self.service_date, Some(self.client_id)).await?;
+
+        let standing = (orders, stops);
+        if self.sent.as_ref() == Some(&standing) {
+            return Ok(Vec::new());
+        }
+        let changed = OrdersChanged {
+            service_date: self.service_date,
+        };
+        let event = stream::frame("orders", &changed)?;
+        self.sent = Some(standing);
+        Ok(vec![event])
+    }
+
+    fn unprompted(&self, pace: &Pace) -> Duration {
+        pace.orders_every
+    }
+}
+
 /// Read one order
 #[utoipa::path(
     tag = "orders",
@@ -239,14 +348,262 @@ async fn visible_to(user: &AuthUser, state: &AppState, id: OrderId) -> Result<Or
 
 #[cfg(test)]
 mod tests {
-    use actix_web::http::StatusCode;
-    use routeforge_domain::Role;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use actix_web::http::{StatusCode, header};
+    use routeforge_domain::{JobId, PlanId, Role, RouteProgress};
     use serde_json::{Value, json};
     use sqlx::PgPool;
 
     use super::*;
     use crate::error::PROBLEM_JSON;
+    use crate::stream::EVENT_STREAM;
     use crate::testing::{self, Actor, Api, Reply, date};
+
+    /// How long a stream is listened to before it is taken to have nothing to say.
+    const QUIET: Duration = Duration::from_millis(300);
+
+    /// The stream of one's own orders of the 12th, and what an event of it says.
+    const EVENTS: &str = "/api/orders/events?service_date=2026-10-12";
+
+    fn the_12th() -> Value {
+        json!({ "service_date": "2026-10-12" })
+    }
+
+    /// What the page of a client lives on (D77): the stream says that something has
+    /// become of an order of theirs, whatever it was and whoever did it.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_stream_of_ones_orders_says_when_something_became_of_one(pool: PgPool) {
+        let api = testing::api(&pool);
+        let _listening = api.listen().await;
+        let operator = api.actor(Role::Operator).await;
+        let ada = api.actor(Role::Client).await;
+        api.depot().await;
+        api.courier(100).await;
+
+        // It opens by saying that there is something to read.
+        let mut stream = api.open(&ada, EVENTS).await;
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        assert!(stream.is_quiet_for(QUIET).await, "nothing has changed");
+
+        // An order is placed: here, by chat, or on another page.
+        let kept = api.order(&ada, 12).await;
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        let withdrawn = api.order(&ada, 12).await;
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        // And withdrawn.
+        let cancel = format!("/api/orders/{withdrawn}/cancel");
+        let reply = api.post(Some(&ada), &cancel, Value::Null).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        // A plan is asked for, which by itself is nothing to an order.
+        let asked = json!({ "service_date": date(12) });
+        let plan = api.post(Some(&operator), "/api/plans", asked).await;
+        assert_eq!(plan.status, StatusCode::CREATED);
+        assert!(
+            stream.is_quiet_for(QUIET).await,
+            "the plan has taken nothing yet"
+        );
+
+        // The plan takes the order.
+        assert!(testing::work_one(&pool).await);
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        let read = api.get(Some(&ada), &format!("/api/orders/{kept}")).await;
+        assert_eq!(read.body["status"], "planned");
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        // The route of the order is stored: from now on it can be said where it is.
+        assert!(testing::work_one(&pool).await);
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        let stops = "/api/orders/stops?service_date=2026-10-12";
+        let found = api.get(Some(&ada), stops).await;
+        assert_eq!(
+            found.body,
+            json!([{ "order_id": kept, "courier": "Van", "position": 0, "stops": 1 }])
+        );
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        // The plan is discarded, and gives the order back.
+        let discard = format!("/api/plans/{}/discard", plan.body["id"].as_str().unwrap());
+        let discarded = api.post(Some(&operator), &discard, Value::Null).await;
+        assert_eq!(discarded.status, StatusCode::OK, "{}", discarded.text);
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        let read = api.get(Some(&ada), &format!("/api/orders/{kept}")).await;
+        assert_eq!(read.body["status"], "pending");
+        assert!(stream.is_quiet_for(QUIET).await);
+    }
+
+    /// The one thing nobody is to learn here: what somebody else does (D77). The
+    /// stream is the caller's own, whoever the caller is.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_stream_of_ones_orders_says_nothing_of_anybody_elses(pool: PgPool) {
+        let api = testing::api(&pool);
+        let _listening = api.listen().await;
+        let operator = api.actor(Role::Operator).await;
+        let ada = api.actor(Role::Client).await;
+        let bob = api.actor(Role::Client).await;
+        api.depot().await;
+        api.courier(100).await;
+        api.order(&ada, 12).await;
+        let mut stream = api.open(&ada, EVENTS).await;
+        stream.next_of("orders").await;
+
+        // Somebody else places an order for the same day, and withdraws it, and
+        // places another.
+        let bobs = api.order(&bob, 12).await;
+        let cancel = format!("/api/orders/{bobs}/cancel");
+        let reply = api.post(Some(&bob), &cancel, Value::Null).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        api.order(&bob, 12).await;
+        assert!(stream.is_quiet_for(QUIET).await, "somebody else's orders");
+
+        // An order of one's own of another day, and a plan that takes it and stores
+        // its route.
+        api.order(&ada, 13).await;
+        let asked = json!({ "service_date": date(13) });
+        let plan = api.post(Some(&operator), "/api/plans", asked).await;
+        assert_eq!(plan.status, StatusCode::CREATED);
+        testing::work_off(&pool).await;
+        assert!(stream.is_quiet_for(QUIET).await, "another day");
+
+        // How far a search has got is nothing to an order.
+        api.events().send(Signal::Progress(Arc::new(RouteProgress {
+            plan_id: PlanId::generate(),
+            job_id: JobId::generate(),
+            attempt: 1,
+            iterations: 16_384,
+            best_cost_m: 900,
+            order: None,
+        })));
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        // An operator sees every order, and is told here of their own alone, as
+        // anybody is. Everybody's are on the stream of the queue (D63).
+        let mut staff = api.open(&operator, EVENTS).await;
+        staff.next_of("orders").await;
+        api.order(&ada, 12).await;
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        assert!(staff.is_quiet_for(QUIET).await, "a client's order");
+        api.order(&operator, 12).await;
+        assert_eq!(staff.next_of("orders").await, the_12th());
+        assert!(stream.is_quiet_for(QUIET).await, "an operator's order");
+    }
+
+    /// A word can be lost (D26), and here nobody even listens to the database. The
+    /// stream looks now and then all the same.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_stream_of_ones_orders_reads_now_and_then_without_a_reason(pool: PgPool) {
+        let pace = Pace {
+            orders_every: Duration::from_millis(100),
+            ..testing::PACE
+        };
+        let api = testing::api_at(&pool, pace);
+        let ada = api.actor(Role::Client).await;
+        let bob = api.actor(Role::Client).await;
+        let mut stream = api.open(&ada, EVENTS).await;
+        stream.next_of("orders").await;
+        // What it finds unchanged it does not say again.
+        assert!(stream.is_quiet_for(QUIET).await);
+
+        orders::create(&pool, &testing::new_order(ada.user.id, 12))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_of("orders").await, the_12th());
+        // And what it finds of somebody else's it does not say at all.
+        orders::create(&pool, &testing::new_order(bob.user.id, 12))
+            .await
+            .unwrap();
+        assert!(stream.is_quiet_for(QUIET).await);
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_stream_of_ones_orders_reads_again_when_it_may_have_missed_something(pool: PgPool) {
+        // Nothing listens to the database, so nobody tells the stream of an order.
+        let api = testing::api(&pool);
+        let ada = api.actor(Role::Client).await;
+        let bob = api.actor(Role::Client).await;
+        let mut stream = api.open(&ada, EVENTS).await;
+        stream.next_of("orders").await;
+
+        api.order(&ada, 12).await;
+        assert!(stream.is_quiet_for(QUIET).await, "nobody told it");
+        api.events().send(Signal::Missed);
+        assert_eq!(stream.next_of("orders").await, the_12th());
+
+        // Told by hand what the database would say of somebody else's order: it
+        // reads, finds its own orders as they were, and says nothing.
+        api.order(&bob, 12).await;
+        api.events().send(Signal::Orders(date(12)));
+        api.events().send(Signal::Plan(PlanId::generate()));
+        assert!(stream.is_quiet_for(QUIET).await);
+        // And of an order of its own, of the day it shows and of another.
+        api.order(&ada, 12).await;
+        api.events().send(Signal::Orders(date(13)));
+        assert!(stream.is_quiet_for(QUIET).await, "told of another day");
+        api.events().send(Signal::Orders(date(12)));
+        assert_eq!(stream.next_of("orders").await, the_12th());
+    }
+
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_stream_of_ones_orders_is_sent_as_a_stream_and_has_to_be_told_its_day(
+        pool: PgPool,
+    ) {
+        let api = testing::api(&pool);
+        let ada = api.actor(Role::Client).await;
+
+        let opened = api.get(Some(&ada), EVENTS).await;
+        assert_eq!(opened.status, StatusCode::OK);
+        assert_eq!(opened.content_type.as_deref(), Some(EVENT_STREAM));
+        assert_eq!(
+            opened.headers.get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert_eq!(
+            opened.text,
+            "event: orders\ndata: {\"service_date\":\"2026-10-12\"}\n\n"
+        );
+
+        // `events` is no id of an order, and the day has to be said.
+        for unreadable in [
+            "/api/orders/events",
+            "/api/orders/events?service_date=monday",
+        ] {
+            let reply = api.get(Some(&ada), unreadable).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{unreadable}");
+            assert_eq!(reply.content_type.as_deref(), Some(PROBLEM_JSON));
+        }
+        // And nobody watches without a token, with a day or without one.
+        for path in [EVENTS, "/api/orders/events"] {
+            let reply = api.get(None, path).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+
+    /// A token is checked when a request arrives, and a stream answers for long after
+    /// that. It ends when its token does (D50).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_stream_of_ones_orders_ends_when_its_token_expires(pool: PgPool) {
+        let api = testing::api(&pool);
+        let ada = api.actor(Role::Client).await;
+        // Good for this second and the next one.
+        let leaving = api.expiring_in(&ada, 1);
+
+        let opened = Instant::now();
+        let mut stream = api.open(&leaving, EVENTS).await;
+        stream.next_of("orders").await;
+        stream.ended().await;
+        let open_for = opened.elapsed();
+        assert!(
+            (Duration::from_secs(1)..Duration::from_secs(5)).contains(&open_for),
+            "{open_for:?}"
+        );
+        let refused = api.get(Some(&leaving), EVENTS).await;
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(refused.content_type.as_deref(), Some(PROBLEM_JSON));
+    }
 
     fn body(day: u32) -> Value {
         json!({
