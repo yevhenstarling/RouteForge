@@ -193,6 +193,12 @@ async fn a_location_three_presses_and_a_confirmation_place_one_order() {
     assert_eq!(order.url.path(), "/api/orders");
     assert_eq!(header(order, "authorization"), format!("Bearer {TOKEN}"));
     assert_eq!(header(order, "x-request-id"), "tg-5");
+    // With a key that makes the order safe to ask for again (D76).
+    let key = header(order, "idempotency-key");
+    assert!(
+        key.parse::<routeforge_domain::IdempotencyKey>().is_ok(),
+        "{key}"
+    );
     assert_eq!(
         order.body_json::<Value>().unwrap(),
         json!({

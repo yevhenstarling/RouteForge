@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use chrono::{NaiveDate, Utc};
 use routeforge_domain::{
-    Depot, DepotId, LatLon, Order, OrderFilter, OrderId, OrderKind, OrderRequest, OrderStatus,
-    Plan, PlanId, PlanRequest, PlanStatus, Role, RouteBudget, Session, User, UserId,
+    Depot, DepotId, IdempotencyKey, LatLon, Order, OrderFilter, OrderId, OrderKind, OrderRequest,
+    OrderStatus, Plan, PlanId, PlanRequest, PlanStatus, Role, RouteBudget, Session, User, UserId,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path_regex};
@@ -158,6 +158,8 @@ pub(crate) enum Asked {
         token: String,
         request_id: String,
         order: OrderRequest,
+        /// The key the order was asked for with (D76).
+        key: String,
     },
     ListOrders {
         token: String,
@@ -190,6 +192,9 @@ pub(crate) enum Asked {
 /// It notes everything it is asked, keeps orders and plans as the API does as far as
 /// the bot can tell, and can be told to refuse the next request or not to answer it.
 /// Every login gives a new token, so a test can see which login a request came of.
+///
+/// Like the API it places an order once for each key (D76), and it can be told to
+/// place one and lose the answer on its way back.
 #[derive(Clone)]
 pub(crate) struct FakeApi(Arc<Mutex<Fake>>);
 
@@ -197,6 +202,10 @@ struct Fake {
     user: User,
     logins: u32,
     orders: Vec<Order>,
+    /// The key each order was placed with, and the order it placed.
+    placed: Vec<(String, OrderId)>,
+    /// How many of the next requests for an order are done and not answered.
+    answers_lost: u32,
     plans: Vec<Plan>,
     /// The depot as it is now, if one has been set.
     depot: Option<Depot>,
@@ -214,6 +223,8 @@ impl FakeApi {
             user: a_user(Role::Client, telegram_id),
             logins: 0,
             orders: Vec::new(),
+            placed: Vec::new(),
+            answers_lost: 0,
             plans: Vec::new(),
             depot: Some(a_depot()),
             asked: Vec::new(),
@@ -283,6 +294,27 @@ impl FakeApi {
     pub(crate) fn fail_next(&self, failure: Failure) {
         self.fake().no_answer.push_back(failure);
     }
+
+    /// The next request for an order is done, and its answer is lost on the way back:
+    /// the order is placed, and whoever asked is not told. [`fail_next`] with
+    /// [`Failure::Away`] is the other half, a request that never arrived.
+    ///
+    /// [`fail_next`]: Self::fail_next
+    pub(crate) fn lose_next_answer(&self) {
+        self.fake().answers_lost += 1;
+    }
+
+    /// The keys the orders were asked for with, oldest request first.
+    pub(crate) fn keys(&self) -> Vec<String> {
+        let asked = &self.fake().asked;
+        asked
+            .iter()
+            .filter_map(|asked| match asked {
+                Asked::CreateOrder { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 fn refused(status: u16, detail: &str) -> Failure {
@@ -328,15 +360,49 @@ impl Api for FakeApi {
         })
     }
 
-    async fn create_order(&self, who: &Caller<'_>, order: &OrderRequest) -> Result<Order, Failure> {
+    async fn create_order(
+        &self,
+        who: &Caller<'_>,
+        order: &OrderRequest,
+        key: &IdempotencyKey,
+    ) -> Result<Order, Failure> {
         let mut fake = self.fake();
         fake.take(Asked::CreateOrder {
             token: who.token.to_owned(),
             request_id: who.request_id.to_owned(),
             order: order.clone(),
+            key: key.to_string(),
         })?;
-        let stored = an_order(fake.user.id, order);
-        fake.orders.push(stored.clone());
+
+        // As the API does (D76): the order a key has placed is the answer to that key
+        // from then on, and a key answers for one order.
+        let before = fake.placed.iter().find(|(known, _)| known == key.as_str());
+        let stored = match before.map(|(_, id)| *id) {
+            Some(id) => {
+                let known = fake.orders.iter().find(|order| order.id == id);
+                let known = known.cloned().expect("an order that was placed is kept");
+                if !order.clone().placed_by(fake.user.id).asks_for(&known) {
+                    return Err(refused(
+                        422,
+                        "the request has fields that cannot be accepted; Idempotency-Key \
+                         has placed another order already: a key is for one order",
+                    ));
+                }
+                known
+            }
+            None => {
+                let stored = an_order(fake.user.id, order);
+                fake.orders.push(stored.clone());
+                fake.placed.push((key.to_string(), stored.id));
+                stored
+            }
+        };
+        if fake.answers_lost > 0 {
+            fake.answers_lost -= 1;
+            return Err(Failure::Away(
+                "the answer was lost on its way back".to_owned(),
+            ));
+        }
         Ok(stored)
     }
 
@@ -492,6 +558,30 @@ pub(crate) fn documented(operation_id: &str) -> (String, String) {
         for (method, operation) in item.as_object().unwrap() {
             if operation["operationId"] == operation_id {
                 return (method.to_uppercase(), path.clone());
+            }
+        }
+    }
+    panic!("the API's document has no operation `{operation_id}`");
+}
+
+/// The headers the API's own document says an operation takes, beside the one that
+/// says who is asking. What the bot sends as a header has to be among them.
+pub(crate) fn documented_headers(operation_id: &str) -> Vec<String> {
+    let file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../routeforge-api/openapi.json"
+    );
+    let document: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    for item in document["paths"].as_object().unwrap().values() {
+        for operation in item.as_object().unwrap().values() {
+            if operation["operationId"] == operation_id {
+                let parameters = operation["parameters"].as_array();
+                return parameters
+                    .into_iter()
+                    .flatten()
+                    .filter(|parameter| parameter["in"] == "header")
+                    .map(|parameter| parameter["name"].as_str().unwrap().to_owned())
+                    .collect();
             }
         }
     }
