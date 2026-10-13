@@ -147,6 +147,10 @@ async fn get_plan(
 ///
 /// Those that are stored so far, each with its stops in the order the courier calls.
 /// A plan that failed, was cancelled or was discarded has none.
+///
+/// A route that was measured by road says the way it takes along the streets as
+/// `path`, if the routing service gave it. A route without one is drawn from stop to
+/// stop.
 #[utoipa::path(
     tag = "plans",
     security(("bearer" = [])),
@@ -348,7 +352,10 @@ mod tests {
 
     use actix_web::http::{StatusCode, header};
     use routeforge_domain::db::queue::JOBS_CHANNEL;
-    use routeforge_domain::{JobId, JobPayload, JobStatus, OrderStatus, Role, RouteProgress};
+    use routeforge_domain::{
+        Distances, JobId, JobPayload, JobStatus, LatLon, NewRoute, OrderStatus, Polyline, Role,
+        RouteProgress,
+    };
     use serde_json::{Value, json};
     use sqlx::PgPool;
     use sqlx::postgres::PgListener;
@@ -571,6 +578,58 @@ mod tests {
         let asked = api.post(Some(operator), "/api/plans", plan_for(day)).await;
         assert_eq!(asked.status, StatusCode::CREATED);
         (id_of(&asked), placed)
+    }
+
+    /// A route is read with the way it takes along the streets, where it has one
+    /// (D73): by road, and given by the routing service.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_route_is_read_with_the_way_it_takes(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        let depot = api.depot().await;
+        let asked = api.post(Some(&operator), "/api/plans", plan_for(12)).await;
+        let plan_id = id_of(&asked);
+
+        let turn = LatLon::new(50.46, 30.53).unwrap();
+        let way = Polyline::through(&[depot.location, turn, depot.location]).unwrap();
+        // As a solver stores them: by road with its way, by road without, and as the
+        // crow flies.
+        for (distances, path) in [
+            (Distances::Road, Some(way.clone())),
+            (Distances::Road, None),
+            (Distances::GreatCircle, None),
+        ] {
+            let route = NewRoute {
+                plan_id,
+                courier_id: api.courier(10).await.id,
+                distance_m: 2_000,
+                distances,
+                path,
+                stops: Vec::new(),
+            };
+            routes::insert(&pool, &route).await.unwrap();
+        }
+
+        let routes = api
+            .get(Some(&operator), &format!("/api/plans/{plan_id}/routes"))
+            .await;
+        assert_eq!(routes.status, StatusCode::OK);
+        let said: Vec<(&Value, &Value)> = routes
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|route| (&route["distances"], &route["path"]))
+            .collect();
+        // The way as text, which is what a page decodes, and `null` where there is none.
+        assert_eq!(
+            said,
+            [
+                (&json!("road"), &json!(way.as_str())),
+                (&json!("road"), &Value::Null),
+                (&json!("great_circle"), &Value::Null),
+            ]
+        );
     }
 
     /// The flow the phase is done by, with a stand-in for the solver: orders, a plan,

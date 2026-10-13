@@ -584,6 +584,7 @@ pub(crate) async fn work_one(pool: &PgPool) -> bool {
                 courier_id: *courier_id,
                 distance_m: 1_000,
                 distances: Distances::GreatCircle,
+                path: None,
                 stops,
             };
             routes::insert(completion.conn(), &route).await.unwrap();

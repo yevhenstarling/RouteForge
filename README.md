@@ -19,6 +19,13 @@ The first build compiles everything and takes several minutes. On Windows, run i
 
 On a new database the page offers an admin "Set up a demo city". Press it, generate orders, and press Plan: the routes are drawn while the solvers search for them.
 
+What there is to see on the page:
+
+- **A plan as it is made.** A route is a dashed line while a solver searches for it, and a solid one when it is stored. A small chart in its row shows its length falling as the search goes on. With 300 orders a route is at its final length a quarter of a second in, and the chart is one step. With 1200 it goes on falling for seconds.
+- **Vans that drive the routes** of a plan that is done. They are simulated. Each page moves its own along the stored routes, at a speed at which the longest route takes a minute. Nothing tracks a courier, and the project is not to.
+- **A route sheet** for each stored route: its stops in the order the courier calls, with what is on board after each. A click on a route's line opens its sheet, and a row of the sheet shows its stop on the map.
+- **The queue and the workers,** as they are.
+
 That login, and the key that signs the tokens, are in this repository for everybody to read. They are for a demonstration on your own machine, which is the only place the ports are open to. Set your own in a `.env` before opening them to anything else: `.env.example` lists every setting. Until you do, the API says so in its log every time it starts.
 
 ## The demonstration
@@ -124,7 +131,7 @@ COMPOSE_PROFILES=osrm
 OSRM_URL=http://osrm:5000
 ```
 
-and start the stack as before. The page then writes `by road` beside the length of each route, where it wrote `as the crow flies`. The lines on the map stay straight: a route is found by road, and drawn from stop to stop.
+and start the stack as before. The page then writes `by road` beside the length of each route, where it wrote `as the crow flies`, and draws each stored route along the streets it takes. The vans drive along them too.
 
 What it changes, for the demonstration's day of 300 orders on four vans:
 
@@ -138,6 +145,8 @@ The routes that look shortest on the map are a quarter longer to drive than the 
 By road everything is several times the straight line. The stops are some four hundred metres apart, and over such a distance one-way streets and turns that are not allowed count for much. The Dnipro runs through the middle, with few bridges. And a demo order is a random point and no address: one in five was more than a hundred metres from any road a car may use, and was moved to the nearest.
 
 A route that the server gives no distances for is searched for on great circles, and says `as the crow flies`. So a plan is done whether the server is there or not. Stopped in the middle of a plan, it left one route by road and three as the crow flies.
+
+The way a route takes is asked of the server once, when the route is stored, and kept with it. A route by road that the server gave no way for is drawn from stop to stop, and says so.
 
 The roads are OpenStreetMap's, © OpenStreetMap contributors, under the Open Database Licence, as [BBBike](https://download.bbbike.org/osm/bbbike/) extracts them. They are not part of this repository.
 
@@ -168,7 +177,10 @@ The days the bot offers are those of its clock, which is on UTC in a container u
 What the system does not do, or does only up to a point:
 
 - **One order is one stop.** A parcel goes from the depot to a client, or from a client to the depot. A courier makes one round a day, and there are no time windows.
-- **The map draws straight lines,** by road as well.
+- **A route that is still searched for is drawn as straight lines,** by road as well. It follows its streets once it is stored. One that was stored while the OSRM server was away stays straight until its day is planned again.
+- **The vans are a simulation.** No courier reports where they are. Each page reckons its own vans, so a page that opens a plan later starts them from the depot, and Refresh sends them out again.
+- **The chart of a search is the page's.** Nothing stores the lengths a search announces, so a page that is opened after a search has no chart of it.
+- **The route sheet has no distances.** The length of a route is stored, and that of its legs is not.
 - **The bot has not met Telegram, and understands no sentences.** Both are in the section above.
 - **A login is counted by its address.** After five tries in a minute the next is refused, so somebody who knows an address can keep its owner out for as long as they keep trying. The count is in the memory of the one API.
 - **A token lasts until it expires.** A role that an admin changes applies from the user's next login, an hour later at the most.

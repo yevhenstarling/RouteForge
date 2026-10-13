@@ -48,8 +48,9 @@ pub(crate) struct Config {
 pub(crate) struct Roads {
     /// Where the server is. It carries no password, so it can be logged.
     pub(crate) url: Url,
-    /// How long the server is given to answer for one route. After that the route is
-    /// searched for on great circles.
+    /// How long the server is given for one answer: the distances of a route, and
+    /// then its way. A route without the first is searched for on great circles, and
+    /// one without the second is stored without it.
     pub(crate) within: Duration,
 }
 
@@ -383,6 +384,33 @@ mod tests {
         assert!(osrm.contains(&"- ./osrm:/data:ro".to_owned()), "{osrm:#?}");
         let published = "- \"127.0.0.1:5000:5000\"".to_owned();
         assert!(osrm.contains(&published), "{osrm:#?}");
+    }
+
+    /// The server is started for the routes the solvers ask it about. A table has a
+    /// row for the depot and one for each stop (D66). The way of a route starts at the
+    /// depot and ends there, so it passes one position more (D73). Started for fewer,
+    /// the server would give a long route its distances and refuse it its way.
+    #[test]
+    fn the_stack_starts_the_routing_service_for_a_way_as_long_as_its_longest_table() {
+        let osrm = service_of_the_stack("osrm");
+        let command = osrm
+            .iter()
+            .find_map(|line| line.strip_prefix("command: "))
+            .expect("the service is started with a command");
+        let words: Vec<String> = serde_json::from_str(command).expect("a list of words");
+        let limit = |flag: &str| -> usize {
+            let at = words
+                .iter()
+                .position(|word| word == flag)
+                .unwrap_or_else(|| panic!("the server is started without {flag}: {words:?}"));
+            words[at + 1].parse().expect("a number of positions")
+        };
+
+        let table = limit("--max-table-size");
+        // The demonstration makes days of up to 2000 orders (D46), and no route has
+        // more stops than its day has orders.
+        assert_eq!(table, 2_001);
+        assert_eq!(limit("--max-viaroute-size"), table + 1);
     }
 
     /// A setting that compose does not hand on is one that `.env` cannot set: the

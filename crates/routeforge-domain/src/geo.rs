@@ -1,6 +1,8 @@
-//! Positions on Earth, the distances between them, and a flat map for clustering (D29).
+//! Positions on Earth, the distances between them, a flat map for clustering (D29),
+//! and a line through positions as text (D73).
 
 use std::convert::Infallible;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -204,10 +206,213 @@ impl DistanceTable {
     }
 }
 
+/// How many steps of a [`Polyline`] make a degree: six decimal places, which on the
+/// ground is a tenth of a metre.
+const POLYLINE_STEPS: f64 = 1e6;
+
+/// Where the letters of a [`Polyline`] begin in ASCII: a letter is 63 more than the six
+/// bits it stands for.
+const FIRST_LETTER: u8 = 63;
+
+/// A line on the map as text: an encoded polyline with six decimal places (D73).
+///
+/// It is the format OSRM writes the way of a route in, and it is short. Each point is
+/// written as how far it is from the point before, the latitude first, five bits to a
+/// letter. So a point of a way along streets takes some four letters, where two
+/// numbers in JSON take forty.
+///
+/// A value of this type decodes into two positions or more, and holds nothing else:
+/// [`Polyline::new`] and deserialization both check.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(try_from = "String", into = "String")]
+pub struct Polyline(String);
+
+/// A text that is no line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidPolyline {
+    /// A letter that no number of a line is written with.
+    #[error("letter {at} of the line is none that a line is written with")]
+    Letter { at: usize },
+    /// The text ends in the middle of a number, or after a latitude that has no
+    /// longitude.
+    #[error("the line breaks off in the middle of a point")]
+    BrokenOff,
+    /// A number of more letters than the distance between two positions takes.
+    #[error("the number at letter {at} of the line is further than any position is from another")]
+    TooLarge { at: usize },
+    #[error("point {point} of the line is not a position on Earth")]
+    OffTheGlobe { point: usize },
+    #[error("a line has two points at least, and this has {points}")]
+    TooShort { points: usize },
+}
+
+impl Polyline {
+    /// Takes `text` for a line, if it is one.
+    pub fn new(text: impl Into<String>) -> Result<Self, InvalidPolyline> {
+        let text = text.into();
+        decode(&text, POLYLINE_STEPS)?;
+        Ok(Self(text))
+    }
+
+    /// The line through `positions` in the order given, each rounded to six decimal
+    /// places. `None` for fewer than two: a line has two ends.
+    pub fn through(positions: &[LatLon]) -> Option<Self> {
+        (positions.len() >= 2).then(|| Self(encode(positions, POLYLINE_STEPS)))
+    }
+
+    /// The positions the line goes through.
+    pub fn positions(&self) -> Vec<LatLon> {
+        // It was decoded when it was made, so it decodes.
+        decode(&self.0, POLYLINE_STEPS).unwrap_or_default()
+    }
+
+    /// How long the line is in metres, along great circles from point to point.
+    pub fn length_m(&self) -> f64 {
+        let positions = self.positions();
+        positions
+            .windows(2)
+            .map(|leg| haversine_m(leg[0], leg[1]))
+            .sum()
+    }
+
+    /// The line as it is stored and sent.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Polyline {
+    type Error = InvalidPolyline;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::new(text)
+    }
+}
+
+impl From<Polyline> for String {
+    fn from(line: Polyline) -> Self {
+        line.0
+    }
+}
+
+// Written by hand: the way of a route is tens of thousands of letters, which a log
+// line or a failed assertion is no place for.
+impl fmt::Debug for Polyline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const SHOWN: usize = 48;
+        // Every letter of a line is one byte, so the text can be cut anywhere.
+        match self.0.get(..SHOWN) {
+            Some(start) if self.0.len() > SHOWN => {
+                write!(f, "Polyline({start:?}, and {} more)", self.0.len() - SHOWN)
+            }
+            _ => write!(f, "Polyline({:?})", self.0),
+        }
+    }
+}
+
+/// The positions `text` is the line through, with `steps` steps to a degree.
+fn decode(text: &str, steps: f64) -> Result<Vec<LatLon>, InvalidPolyline> {
+    let mut letters = text.bytes().enumerate();
+    let mut positions = Vec::new();
+    // In steps. A point is written as how far it is from the one before, and the
+    // first as how far it is from nought.
+    let (mut lat, mut lon) = (0_i64, 0_i64);
+    while let Some(north) = number(&mut letters)? {
+        let east = number(&mut letters)?.ok_or(InvalidPolyline::BrokenOff)?;
+        // Neither can run over: a number is 35 bits at the most, and what it is added
+        // to was a position a moment ago.
+        lat += north;
+        lon += east;
+        let point = positions.len();
+        let position = LatLon::new(lat as f64 / steps, lon as f64 / steps)
+            .map_err(|_| InvalidPolyline::OffTheGlobe { point })?;
+        positions.push(position);
+    }
+    if positions.len() < 2 {
+        return Err(InvalidPolyline::TooShort {
+            points: positions.len(),
+        });
+    }
+    Ok(positions)
+}
+
+/// The next number of a line, or `None` where the text ends.
+///
+/// A number is written five bits to a letter, the lowest first, and every letter but
+/// the last has a sixth bit set to say that more follow. The lowest bit of all is the
+/// sign: a number below nought is written as its complement, which sets it.
+fn number(letters: &mut impl Iterator<Item = (usize, u8)>) -> Result<Option<i64>, InvalidPolyline> {
+    /// Seven letters. Once round the globe is 360 million steps, which takes 30 bits
+    /// with the sign.
+    const MOST_BITS: u32 = 35;
+
+    let mut written = 0_i64;
+    let mut bits = 0;
+    loop {
+        let Some((at, letter)) = letters.next() else {
+            return if bits == 0 {
+                Ok(None)
+            } else {
+                Err(InvalidPolyline::BrokenOff)
+            };
+        };
+        let six = letter
+            .checked_sub(FIRST_LETTER)
+            .filter(|six| *six < 64)
+            .ok_or(InvalidPolyline::Letter { at })?;
+        if bits >= MOST_BITS {
+            return Err(InvalidPolyline::TooLarge { at });
+        }
+        written |= i64::from(six & 0x1f) << bits;
+        bits += 5;
+        if six & 0x20 == 0 {
+            break;
+        }
+    }
+    Ok(Some(if written & 1 == 0 {
+        written >> 1
+    } else {
+        !(written >> 1)
+    }))
+}
+
+/// The line through `positions` as text, with `steps` steps to a degree.
+fn encode(positions: &[LatLon], steps: f64) -> String {
+    let mut text = String::new();
+    let (mut lat, mut lon) = (0_i64, 0_i64);
+    for position in positions {
+        let north = (position.lat * steps).round() as i64;
+        let east = (position.lon * steps).round() as i64;
+        write_number(&mut text, north - lat);
+        write_number(&mut text, east - lon);
+        (lat, lon) = (north, east);
+    }
+    text
+}
+
+/// Writes one number of a line, as [`number`] reads it.
+fn write_number(text: &mut String, number: i64) {
+    let mut rest = if number < 0 {
+        !(number << 1)
+    } else {
+        number << 1
+    };
+    loop {
+        let five = (rest & 0x1f) as u8;
+        rest >>= 5;
+        let more = if rest == 0 { 0 } else { 0x20 };
+        text.push(char::from(FIRST_LETTER + five + more));
+        if rest == 0 {
+            break;
+        }
+    }
+}
+
 /// A source of distances between positions.
 ///
 /// [`Haversine`] is the default and needs nothing outside the process (D8). A provider
-/// that asks a routing service does I/O, which is why the method returns a future, and
+/// that asks a routing service does I/O, which is why the methods return a future, and
 /// can fail, which is why the error is its own.
 pub trait DistanceProvider {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -221,6 +426,16 @@ pub trait DistanceProvider {
         &self,
         positions: &[LatLon],
     ) -> impl Future<Output = Result<DistanceTable, Self::Error>> + Send;
+
+    /// The way from the first of `positions` through the others in the order given,
+    /// along what this provider measures, as a line for a map (D73).
+    ///
+    /// `None` from a provider that measures along straight lines. The line from each
+    /// position to the next is the way then, and whoever draws it needs no telling.
+    fn path(
+        &self,
+        positions: &[LatLon],
+    ) -> impl Future<Output = Result<Option<Polyline>, Self::Error>> + Send;
 }
 
 /// Great-circle distances. Works offline and never fails.
@@ -236,6 +451,10 @@ impl DistanceProvider for Haversine {
 
     async fn table(&self, positions: &[LatLon]) -> Result<DistanceTable, Infallible> {
         Ok(DistanceTable::haversine(positions))
+    }
+
+    async fn path(&self, _positions: &[LatLon]) -> Result<Option<Polyline>, Infallible> {
+        Ok(None)
     }
 }
 
@@ -471,6 +690,179 @@ mod tests {
         // Some 8 km between the first two.
         assert!((7_000..9_000).contains(&table.get(0, 1)));
         assert_eq!(Haversine.measures(), Distances::GreatCircle);
+        // Between great circles the straight line is the way, and there is none to give.
+        let Ok(path) = Haversine.path(&positions).await;
+        assert_eq!(path, None);
+    }
+
+    /// The example every description of the format gives. It is written with five
+    /// decimal places, and read here by the code that reads six.
+    #[test]
+    fn a_line_is_written_as_the_format_says() {
+        let text = "_p~iF~ps|U_ulLnnqC_mqNvxq`@";
+        let points = [at(38.5, -120.2), at(40.7, -120.95), at(43.252, -126.453)];
+        assert_eq!(decode(text, 1e5).unwrap(), points);
+        assert_eq!(encode(&points, 1e5), text);
+    }
+
+    #[test]
+    fn a_line_has_six_decimal_places_and_the_latitude_first() {
+        let depot = at(50.45, 30.52);
+        let north_east = at(50.450_001, 30.520_002);
+        let line = Polyline::through(&[depot, north_east]).unwrap();
+        assert_eq!(line.positions(), [depot, north_east]);
+        // One step north and two east: each a letter, the sign in its lowest bit.
+        assert!(line.as_str().ends_with("AC"), "{line:?}");
+        // The seventh place is rounded away.
+        let finer = Polyline::through(&[at(50.450_000_4, 30.52), at(50.450_001_4, 30.520_002)]);
+        assert_eq!(finer.unwrap(), line);
+
+        // Back the way it came, which is below nought both ways.
+        let back = Polyline::through(&[north_east, depot]).unwrap();
+        assert_eq!(back.positions(), [north_east, depot]);
+        assert!(back.as_str().ends_with("@B"), "{back:?}");
+
+        // A degree of latitude is 111.2 km everywhere.
+        let degree = Polyline::through(&[at(50.0, 30.0), at(51.0, 30.0)]).unwrap();
+        assert_eq!(degree.length_m().round(), 111_195.0);
+        // From pole to pole and half way round, which is the most a number is asked to say.
+        let far = [at(-90.0, -180.0), at(90.0, 180.0), at(-90.0, -180.0)];
+        assert_eq!(Polyline::through(&far).unwrap().positions(), far);
+    }
+
+    #[test]
+    fn a_line_has_two_ends() {
+        let depot = at(50.45, 30.52);
+        assert_eq!(Polyline::through(&[]), None);
+        assert_eq!(Polyline::through(&[depot]), None);
+        // The same place twice is a line all the same, of no length: it is what a
+        // routing service answers for a way from a place to itself.
+        let nowhere = Polyline::through(&[depot, depot]).unwrap();
+        assert!(nowhere.as_str().ends_with("??"), "{nowhere:?}");
+        assert_eq!(nowhere.length_m(), 0.0);
+
+        assert_eq!(
+            Polyline::new(""),
+            Err(InvalidPolyline::TooShort { points: 0 })
+        );
+        let one_point = encode(&[depot], POLYLINE_STEPS);
+        assert_eq!(
+            Polyline::new(one_point),
+            Err(InvalidPolyline::TooShort { points: 1 })
+        );
+    }
+
+    #[test]
+    fn text_that_is_no_line_is_refused() {
+        let line = Polyline::through(&[at(50.45, 30.52), at(50.46, 30.53)]).unwrap();
+        let text = line.as_str();
+        assert_eq!(Polyline::new(text).unwrap(), line);
+
+        // Cut off in the middle of a number, and after a latitude.
+        assert_eq!(
+            Polyline::new(&text[..text.len() - 1]),
+            Err(InvalidPolyline::BrokenOff)
+        );
+        // And in the middle of the latitude of a third point. The two points before it
+        // are a line by themselves, and it is not that line that was sent.
+        let third_begun = format!("{text}_");
+        assert_eq!(Polyline::new(third_begun), Err(InvalidPolyline::BrokenOff));
+        let latitude_alone = format!("{text}_ibE");
+        assert_eq!(
+            Polyline::new(latitude_alone),
+            Err(InvalidPolyline::BrokenOff)
+        );
+        // A letter from outside the 64 a line is written with, on either side.
+        for stranger in [' ', '>', '\u{7f}', 'é', '\n'] {
+            let spoilt = format!("{text}{stranger}");
+            assert_eq!(
+                Polyline::new(spoilt),
+                Err(InvalidPolyline::Letter { at: text.len() }),
+                "{stranger:?}"
+            );
+        }
+        // A number that goes on for ever.
+        assert_eq!(
+            Polyline::new("~~~~~~~~~~~~"),
+            Err(InvalidPolyline::TooLarge { at: 7 })
+        );
+        // A point off the globe: thirty degrees north of the eightieth parallel.
+        let mut off = encode(&[at(50.0, 30.0), at(80.0, 30.0)], POLYLINE_STEPS);
+        write_number(&mut off, 30_000_000);
+        write_number(&mut off, 0);
+        assert_eq!(
+            Polyline::new(off),
+            Err(InvalidPolyline::OffTheGlobe { point: 2 })
+        );
+        // And what is plainly something else.
+        assert!(Polyline::new("{\"type\": \"LineString\"}").is_err());
+    }
+
+    #[test]
+    fn json_cannot_smuggle_in_what_is_no_line() {
+        let line = Polyline::through(&[at(50.45, 30.52), at(50.46, 30.53)]).unwrap();
+        let json = serde_json::to_value(&line).unwrap();
+        assert_eq!(json, serde_json::json!(line.as_str()));
+        assert_eq!(serde_json::from_value::<Polyline>(json).unwrap(), line);
+
+        let error = serde_json::from_str::<Polyline>("\"not a line\"").unwrap_err();
+        assert!(error.to_string().contains("line"), "{error}");
+        assert!(serde_json::from_str::<Polyline>("[[50.45, 30.52]]").is_err());
+    }
+
+    #[test]
+    fn a_long_line_is_not_written_out_where_it_is_shown() {
+        let short = Polyline::through(&[at(50.45, 30.52), at(50.46, 30.53)]).unwrap();
+        assert_eq!(
+            format!("{short:?}"),
+            format!("Polyline({:?})", short.as_str())
+        );
+
+        let stops: Vec<LatLon> = (0..200)
+            .map(|step| at(50.0 + f64::from(step) * 0.001, 30.0))
+            .collect();
+        let long = Polyline::through(&stops).unwrap();
+        let shown = format!("{long:?}");
+        assert!(shown.len() < 100, "{shown}");
+        assert!(shown.contains(&long.as_str()[..48]), "{shown}");
+        assert!(shown.contains(&format!("{} more", long.as_str().len() - 48)));
+    }
+
+    proptest! {
+        #[test]
+        fn a_line_is_read_back_as_it_was_written(
+            positions in prop::collection::vec(position(), 2..40),
+        ) {
+            let line = Polyline::through(&positions).unwrap();
+            let read = line.positions();
+            prop_assert_eq!(read.len(), positions.len());
+            for (read, written) in read.iter().zip(&positions) {
+                // To the sixth decimal place, give or take what a float is off by.
+                prop_assert!((read.lat() - written.lat()).abs() <= 5.000_001e-7);
+                prop_assert!((read.lon() - written.lon()).abs() <= 5.000_001e-7);
+            }
+            // What was read is written as the same text, letter for letter.
+            prop_assert_eq!(&Polyline::through(&read).unwrap(), &line);
+            prop_assert_eq!(&Polyline::new(line.as_str()).unwrap(), &line);
+        }
+
+        /// Whatever a service sends is read without a panic: it is a line or it is not.
+        #[test]
+        fn any_text_is_a_line_or_is_refused(text in "\\PC{0,60}") {
+            if let Ok(line) = Polyline::new(text) {
+                prop_assert!(line.positions().len() >= 2);
+            }
+        }
+
+        #[test]
+        fn any_letters_of_a_line_are_a_line_or_are_refused(text in "[?-~]{0,60}") {
+            if let Ok(line) = Polyline::new(text.as_str()) {
+                let positions = line.positions();
+                prop_assert!(positions.len() >= 2);
+                // What it reads as is on the globe, which a position always is.
+                prop_assert!(Polyline::through(&positions).is_some());
+            }
+        }
     }
 
     #[test]

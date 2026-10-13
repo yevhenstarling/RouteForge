@@ -16,13 +16,14 @@
 //! | `SOLVER_HEARTBEAT_SECS` | 5 | How often a running job extends its lease. |
 //! | `SOLVER_POLL_SECS` | 5 | How often an idle worker looks at the queue unprompted. |
 //! | `SOLVER_PROGRESS_MS` | 250 | How often, at most, a search announces how far it has got. |
-//! | `OSRM_URL` | none | An OSRM server to ask for road distances. Without it the distances are great circles. |
-//! | `OSRM_TIMEOUT_SECS` | 20 | How long that server may take over one route. |
+//! | `OSRM_URL` | none | An OSRM server to ask for road distances, and for the way a route takes along the roads. Without it the distances are great circles. |
+//! | `OSRM_TIMEOUT_SECS` | 20 | How long that server may take over one answer. |
 //! | `LOG_FORMAT` | `text` | `json` for one JSON object per line. |
 //! | `RUST_LOG` | `info` | What to log, in the syntax of `tracing`'s `EnvFilter`. |
 //!
 //! A route the OSRM server gives no distances for is searched for on great circles,
-//! and says so (D66). So the server may be down, or started later than the solver.
+//! and says so (D66). A route it gives no way for is stored without one (D73). So the
+//! server may be down, or started later than the solver.
 //!
 //! The decisions cited as D1, D2, … are in `docs/architecture.md`.
 
