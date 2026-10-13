@@ -34,6 +34,9 @@ Confirmed with the project owner:
 - **There will be no token from Telegram, and there was no key for the Claude API.** So Phase 8 tried the bot as Phase 7 did, against stand-ins, and did not build free text (D58). The bootcamp holds the project to nothing formal beyond the approved description.
 - **Three phases were added on 2026-10-13, after Phase 8 was done.** Phase 9 gives the map more to show, Phase 10 gives a client something to do on the page, and Phase 11 is the free text of the bot, which is a phase of its own now and not decided on. What each is to hold is listed under it, and no more than that: how a phase is built is planned when the phase begins.
 - **Two things that were offered beside them were not taken:** starting the stack and running `scripts/demo.sh` in CI, and pictures of the page in the README. The project has no CI on GitHub, the project owner said the same day. The workflow under `.github/` is in the repository all the same, and nothing here has seen it run.
+- **The vans of Phase 9 are reckoned on the page.** Each page moves its own vans along the stored routes, from the time since they set out on that page. Decided on 2026-10-13, while the phase was built. Reckoning from the clock of the database, positions sent in through an endpoint, and a simulator inside the system were offered beside it and not taken (D74).
+- **Phase 9 has one thing beyond its list:** the map and the route sheet point at each other. A sheet that follows its van, with the length of every leg stored for it, was offered beside that and not taken (D75).
+- **A route by road keeps the way it takes.** The solver asks the OSRM server for it, and it is stored with the route. That turns round the choice of 2026-10-12, for a label and straight lines (D73).
 
 Derived from the description:
 
@@ -83,7 +86,7 @@ RouteForge/
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | done |
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | built; not tried against Telegram yet |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | L | done; free text for the bot was not built |
-| 9 | More to see on the map | Routes along the streets, vans driving them, a route getting shorter while it is searched for | M | todo |
+| 9 | More to see on the map | Routes along the streets, vans driving them, a route getting shorter while it is searched for | M | done |
 | 10 | The client's page | A client placing an order on the page and seeing it planned, beside an operator's page | M | todo |
 | 11 | Free text for the bot | An order placed by a sentence | M | not decided on; needs an Anthropic API key |
 
@@ -466,29 +469,84 @@ What is left, for whoever goes on:
 
 ## Phase 9: more to see on the map
 
-Not begun, and not planned beyond this list. Added by the project owner on 2026-10-13.
+Built. What it was to hold was listed by the project owner on 2026-10-13, and how it was built was planned when the phase began. Two things were decided with the project owner then, and are among the decisions at the top of this plan: that the vans are reckoned on the page, and that the map and the route sheet point at each other.
 
-What it is to hold:
+Delivered:
 
-- **Routes drawn along the streets,** where they were found by road.
-- **Vans that move along their routes,** for the demonstration.
-- **The length of a route as its search goes on,** drawn as a small chart beside the route, so that it is seen to fall.
-- **A route sheet:** the stops of a route in the order the courier calls, with what is on board after each.
+- **Routes along the streets (D73).**
+  - In `routeforge-domain`: `Polyline`, a line as text, which decodes when it is made, as `LatLon` checks its numbers. `DistanceProvider::path`, which `Haversine` answers with nothing. `Route.path`. Migration `0007_route_path.sql`, with `routes.path`, which the schema lets only a route by road have.
+  - In the solver: the client asks OSRM's route service beside its table service. The route job asks for the way of a route when the search is over and the route is turned the way it is driven, with the heartbeat beside the wait, and stores a route without its way when it is given none.
+  - In compose: the OSRM server is started for a way through 2002 positions.
+  - On the page: a stored route is drawn along its way, and one that is by road and has none says that it is drawn from stop to stop.
+- **Vans (D74).** A van for each route of a plan that is done, driving what the route is drawn with. They set out when the page sees the plan done, all at one speed, at which the longest route takes a minute. A button stops them and sends them out again. The page says beside them that they are simulated.
+- **A chart of each search (D75).** In the row of a route, its length as the search announced it: a staircase across the plan's budget, from the shortest length so far to 2 % above it.
+- **A route sheet, and the map and the sheet pointing at each other (D75).** A stored route opens as the list of its stops in calling order, with the parcels that come off or on at each and what is on board after it. A click on the route's line opens it as its button does, and a row of it shows its stop on the map.
+- **The list of routes keeps its rows.** A row is replaced only when what it says has changed.
+- The README says what there is to see on the page, and calls the vans simulated. D73 to D75 are in the decision log, and D52, D66 and D67 say where they were added to or turned round.
 
-Done when: with the OSRM profile on, the routes of a plan follow the streets on the map. The vans of a plan that is done are seen driving their routes. While a plan is searched for, the length of each of its routes is seen to fall. And a route can be opened as the list of its stops, with the load after each.
+The API has no new endpoint and no new setting. `GET /api/plans/{id}/routes` gives a route its `path`, and that is the whole of what changed in `openapi.json`. Nothing was added to `Cargo.toml`.
 
-What is known so far:
+Tests: 24 more, and one case more in a test that was there. 11 are in the domain crate, which has 135 now, 12 in the solver (81) and one in the API (133). They hold:
 
-- **The lines turn round a choice of 2026-10-12,** when the project owner took a label on the route over lines along the streets (D66). They are for routes that were measured by road. A route on great circles is straight by what it is, so a clone without OSRM shows what it shows now.
-- **Nothing stores the way a route takes.** A route has its stops, a length and what the length was measured along. The solver asks OSRM's table service and no other. The way along the streets would come from the service of OSRM that gives a route its geometry.
-- **Moving vans are a simulation.** The approved description has live GPS tracking of couriers among what the project will not do, and that is not changed by a van that is moved for show. So what moves on the page is to be called simulated, there and in the README.
-- **How a van gets its position is open.** Three ways were put to the project owner on 2026-10-12, who put the choice off:
-  - It is reckoned from the time since the van set out: the route is stored, the speed is given, and the database has one clock. Nothing is stored and nothing is sent in. This was the one recommended.
-  - It is reported through a new endpoint, by a script that plays the couriers. That is the first half of tracking, and it does change what the description says the project will not do.
-  - A simulator inside the system writes positions, and the streams pass them on. The same on the screen as the first, with more behind it.
-- **The chart needs nothing new of the API.** A search announces its best length a few times a second, and the stream of a plan passes that on (D49). Nothing stores those lengths, so a page that is opened after a search has no chart to draw.
-- **The route sheet needs nothing new of the API either.** The page has the stops of a route in calling order, each with its kind and its demand, and reckons the most on board already (D65).
-- **Three of the four are the page's,** and the page is tried by hand (D52). Whatever it gains has to keep to its policy: one script and one style, nothing inline beside them, and no host but the tile server (D69).
+- the line as text to the published example of its format, to reading back what it wrote, for random lines, and to refusing whatever is no line of two points or more, in JSON as well;
+- a route to being stored and read with its own way, beside routes without one and one without stops, and the schema to keeping a way off a route on great circles;
+- the client of OSRM to what the route service takes, longitude first, to each way it can fail, and to the first route of an answer;
+- the route job to asking for the way of the route as it is driven, to storing a route by road without a way when it is given none, to asking for none on great circles, and to keeping its lease while it waits;
+- the compose file to starting the server for a way one position longer than its longest table;
+- and the API to giving a route its way.
+
+The tests were tried against 44 faults put into the code and into the compose file on purpose: 19 in the domain crate, one of them in the migration, 21 in the solver, 2 in the compose file, and one each for the API and for the page. Each made a test fail but one. With a line that breaks off in the middle of a latitude taken for the line before it, every test passed. The test cut a line off inside a longitude alone, which the reading of the next number refuses whatever the reading of this one says. It cuts one off inside a latitude now, after two points that are a line by themselves, and fails for the fault.
+
+Among the others: five decimal places for six, and the longitude first, in the reading and in the writing; a sign lost; a line of one point taken; a letter from outside the alphabet taken; a number of any length; a line taken unread; a way not stored, not read, read from the second stop, and none for a route without stops; a way allowed on a route by great circles; latitude first to OSRM; the outline for the whole way; the service's own choice of going straight on; one position asked about; the last route of an answer for the first; a refusal taken for an answer; a way asked for on great circles, and for a route without stops; a job that fails for want of a way; no heartbeat beside the wait; a way that does not start, or does not end, at the depot; the limit missing from the compose file; the way left out of what the API sends; and a namespace named in the page.
+
+One of them was caught by one test alone, which was written for it: the way asked for in the order the search found, and not in the order the route is driven. To the search a ring that is driven one way is the same ring driven the other, so it finds the same tour on both, and on one of the two that tour is against the traffic and is turned round. The job is run on both.
+
+Tried by hand, with the development database left alone. First with the API and the solvers on the host, against a database made for it. Then in the stack: a clone of the phase branch in a directory of its own, with no `.env`, under another project name and on other ports, from images that were built there. The page was looked at in a headless Edge driven over the DevTools protocol, and the pictures were looked at.
+
+- **The server asked first.** Before the client was written, the OSRM server of the stack was asked what its route service takes in a body and what it answers. That is where `continue_straight`, the limit of 500 positions and the kinds of value each option takes come from (D73).
+- **The stack, as a clone has it.** Up 11 seconds after `docker compose up` on a new volume, with four solvers. The images are 140, 133 and 134 MB, as they were.
+- **A day on the page.** An admin was offered the demo city and pressed the button, generated 300 orders and pressed Plan, with six seconds a route. Four dashed routes were searched for by four solvers, each named by the id of its container, and stored: 33.16, 33.65, 37.52 and 19.75 km, 124.08 km as the crow flies. As the plan was done a van set out along each. The one line in the console was the browser's own note of the `404` for a depot that is not there yet.
+- **The charts.** On a day of 1200 orders, on vans of 528, the routes had 331, 344, 330 and 195 stops. Their charts began at 77.55, 84.32, 76.63 and 47.98 km and went on falling for one to six of the ten seconds, to 62.84, 66.16, 64.37 and 39.41 km. On the day of 300 orders each chart is one step, or a level line where the page heard of the search after its first tour (D75).
+- **The sheet.** A route of 86 stops left the depot with 131 on board and came back with 37. The most in the column was 131, which is what its row says, and every row added up. It was opened by its button and by a click on its line, and a row brought the map to its stop.
+- **The vans.** On the map 35 ms after the page showed the plan as done. Stopped and sent out again by the button, back after a minute, gone with a discard, and not setting out by themselves in a browser that was asked for less motion (D74).
+- **A plan with fewer workers than routes,** two for four. The row of a stored route stayed the element it was while the other routes were searched for, and its button opened its sheet while the plan was still at it.
+- **The roads.** With the profile on, the day of 300 orders came to 505.55 km by road, with 200 million moves a route, in 4.8 seconds. Each route had its way: 2067 to 4848 points, within 0.21 % of the route's length from point to point. The stored routes followed the streets and crossed the Dnipro on its bridges, and at three moments of a drive each van was within 1.1 pixels of its route's line. By the server's own log the four ways took 5 to 9 ms, beside 19 to 29 ms for the four tables.
+- **Routes of more than 500 stops.** A day of 2000 orders on four vans had routes of 347, 548, 549 and 556 stops. Each got its way, which the server refuses unless it is started for it.
+- **A server that refuses the way,** started for one through ten positions. The plan was done, with four routes by road and no way, a warning in the log of each solver, and `by road, drawn from stop to stop` on the page.
+- **The server stopped three seconds into a plan,** with one solver and six seconds a route. The plan was done after 40.2 seconds: one route by road without its way, and three as the crow flies, each saying which.
+- **The demonstration,** with `scripts/demo.ps1` on that stack, since the route job was changed: 15.4 seconds with one solver and 4.7 with four, the same routes. The killed solver's route was taken over 27.9 seconds after the kill, and the plan was done after 40.6, with every order on exactly one route. Those are the numbers of Phase 8, to a few tenths of a second.
+- **In every run** the browser held nothing against the page, and the only hosts it asked were the API and the tile server.
+- **The tests, on Linux,** as in Phases 7 and 8: the whole workspace in a container of the image the `Dockerfile` builds on, 116 seconds with the compiling, all of it green.
+
+Where it differs from what was planned:
+
+- The chart shows 2 % above the shortest length, and not 5 %. With 5 % the fall that goes on took the lowest third of the chart or less.
+- The chart, the sheet and the vans were committed together. They are three parts of one file, and all three hang on the list of routes that keeps its rows.
+- The map is moved at once by the page, and no longer by a zoom that is seen to happen. That is Phase 5's, and was changed for what is said below.
+
+Found while it was tried, and guarded against since:
+
+- **A way that is not the route.** Asked as its documentation leaves it, OSRM makes a way go straight on at every stop, where its table measures every leg by itself. Nearly half the legs of a long route came out longer. Found by asking the server before a line of the client was written.
+- **A move of the map that was passed over.** While Leaflet shows a zoom, it passes over the next move it is asked for. A day that was picked just after the login kept the view of the day before, and a row of the sheet pressed just after another would not have moved the map. Found because a script picks a day faster than a person.
+- **A row that named one length twice.** In the stack the first length the page heard of a search was sometimes its last, and the row said `from 33.16 km` beside 33.16 km.
+- **A fault that no test caught,** which is above.
+
+Seen, and left: on a day of 1200 orders the dashed lines of the searches can hardly be told from the dots of their own colour. They are there, as the page's own elements say. That is as it was in Phase 5.
+
+What later phases need from it:
+
+- Phase 10: none of this is on a client's page. A client sees no plan, so no route, no van and no sheet (D41). If a client is to see the van that has their order, that is a question of what a client may read, and not of the page.
+- Phase 10: a list on the page that gets buttons has to keep its rows, as the list of routes does now (D75). `renderRoutes` shows how: what a row says is made into one text, and the row is replaced when the text has changed.
+- Phase 10: the page moves the map with `{ animate: false }`. A click on the map that places an order should not start a zoom that the next move is lost in.
+- Phase 10: the next migration is number 0008.
+- Phases 10 and 11: the OSRM server of the stack logs the body of every request, which is the position of every stop. It is the stack's own server, and nothing of a person but where their order is.
+
+What is left, for whoever goes on:
+
+- A sheet that follows its van, and kilometres in the sheet. Both need the length of every leg of a route, which the solver has when it stores the route and does not keep (D73, D74).
+- Vans that are at the same place on every page, and on their way when a page is opened later. That takes the clock of the database, as a span (D74).
+- A chart for a page that did not see the search. Nothing stores what a search announces (D49).
+- A way for a route that was stored while the server was away. It is asked for once.
 
 ## Phase 10: the client's page
 
@@ -579,6 +637,9 @@ What is known so far:
 - **OSRM's `annotations` is a list in a body.** In an address it is a word, `annotations=distance`. Sent as a word in the body of a `POST`, it is refused with `InvalidQuery`: "annotations must be a boolean or an array of strings" (D66).
 - **OSRM and Nominatim take longitude first.** OSRM's coordinates are `[lon, lat]`, and Nominatim's `viewbox` is two corners as `lon,lat`. `LatLon` says latitude first, as people do. Each client has a test that would fail for the other order.
 - **OSRM answers a table of a hundred positions and no more, unless it is started for more.** Beyond `--max-table-size` it refuses with `TooBig`. An answer for 2001 positions is 28 MB (D66).
+- **OSRM gives a way through five hundred positions and no more, unless it is started for more.** That is another limit than the table's, `--max-viaroute-size`, and raising the one does not raise the other. A server that is started for long tables alone gives a long route its distances and refuses it its way (D73).
+- **For cars, OSRM makes a way go on from a stop in the direction it came to it.** Its table does not: there every leg is measured by itself. So the way it gives through the stops of a route is not the way the route was measured along, unless it is asked with `continue_straight` off. Left on, a way through 330 stops was 1.6 % longer than the table's legs, and nearly one leg in two differed (D73).
+- **In a body, OSRM takes each option as one kind of value.** `steps`, `continue_straight` and `skip_waypoints` are booleans, `overview` and `geometries` are words, `annotations` is a boolean or a list. The other kind is refused with `InvalidQuery`. An option it does not know is passed over without a word, so a misspelt one changes nothing and says nothing.
 - **The extract of Kyiv is called `Kiew`** at BBBike, where the cities have their German names: `https://download.bbbike.org/osm/bbbike/Kiew/Kiew.osm.pbf`.
 - **A reqwest error names the address it asked.** `error.to_string()` ends in `for url (...)`, with the whole query. Where the query holds what a person wrote, as the bot's search for an address does, `error.without_url()` comes before the error goes anywhere (D72).
 - **Nominatim gives one address several times.** `Хрещатик 22` came back as three buildings under one name, and with `limit=3` that was all. The bot asks for ten and shows the first three that differ by name (D72).
@@ -586,6 +647,10 @@ What is known so far:
 - **In Windows PowerShell 5.1, `2>$null` on a native command can end a script.** With `$ErrorActionPreference = 'Stop'`, what the command writes to its error stream becomes an error. `scripts/osrm-prepare.ps1` sets the preference to `Continue` round such a call and pipes `2>&1` to `Out-Null`.
 - **`wsl.exe -- sh -c "..."` from PowerShell loses its quoting.** Write the commands into a file and have `sh` run the file.
 - **Docker Desktop starts a container whose port is taken, and says nothing.** On the development machine another program listens on `127.0.0.1:5001`. An OSRM server that was to be published there came up, was reported as started, and had no port: `docker ps` shows `5000/tcp` with nothing in front of it, and what answers on the port is the other program, with a `404`. `OSRM_PORT`, `API_PORT` and `POSTGRES_PORT` move the ports.
+- **A button that is replaced between the press of the mouse and its release is not pressed.** A list that is written anew several times a second cannot have a button in it, and loses the place of whoever moves through it by keyboard. The page keeps a row of its list of routes until what it says has changed (D75).
+- **To a test that reads the page for addresses, a namespace is an address.** `http://www.w3.org/2000/svg` in the page fails the test that it names no host but the tile server. The page has Leaflet make its SVG elements, with `L.SVG.create` (D75).
+- **JavaScript shifts in 32 bits.** `31 << 30` is not thirty-one times two to the thirtieth. The page reads the numbers of an encoded line with multiplication, and the domain crate, which has 64 bits, refuses a number of more than seven letters.
+- **OSRM's length of a way is not the length of its line from point to point.** Measured along great circles between its points, a way came out 0.2 % shorter than OSRM says it is. Whatever compares the two has to allow for that.
 - **PowerShell rounds a fraction away in `[math]::Min(1, 0.5)`.** With a whole number among its arguments it takes the function for whole numbers, and the answer is `0`. Write `1.0`. It made every great-circle length nought in a script that checked the lengths of Phase 8, and none of the repository's scripts has it: `scripts/demo.ps1` takes the least of whole numbers.
 
 ## Needed from the project owner
@@ -604,7 +669,7 @@ What is known so far:
   If something that Telegram answers differs from what the stand-in answered (D64), it shows in `docker compose logs bot` as a warning with Telegram's own words.
 
   With `GEOCODER_URL` set as well, step 4 has a second way in: write an address where the location was shared, and press the button of the place.
-- For Phase 9: nothing new. The lines along the streets show where an OSRM server is asked, which takes the roads that `scripts/osrm-prepare` fetches.
+- For Phase 9: nothing new. The lines along the streets show where an OSRM server is asked, which takes the roads that `scripts/osrm-prepare` fetches. An OSRM server that was started before Phase 9 takes a way through 500 positions and no more: `docker compose up` makes it anew from the compose file as it is now.
 - For Phase 11, the free text of the bot: the decision whether to build it, and an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58). The phase is not begun without the key.
 - The owner said on 2026-10-12 that the bootcamp holds the project to nothing formal: no rubric, and no word on whether the bot may come without its LLM part. If that changes, the README's paragraph on the bot is where the difference from the approved description is said.
 
@@ -621,3 +686,4 @@ What is known so far:
 9. Roads: `scripts/osrm-prepare`, the two lines in `.env`, and step 2 again. Every route says `by road`, and the day is several times as long as it was. `docker compose stop osrm` in the middle of a plan leaves the plan done, with the routes that came after it `as the crow flies` (D66).
 10. Load: on the page, each route says the most its van has on board, and none says more than the van carries. With the demo city's vans, three of four leave the depot full (D65).
 11. Numbers: `cargo run -p routeforge-tsp --release --example quality` and `cargo bench -p routeforge-tsp` print what the README's tables were made from.
+12. The map: while a plan is searched for, each route has a chart in its row that falls, for seconds if the day has 1200 orders. When the plan is done, a van sets out along each route and is back within a minute, and the page says that the vans are simulated. The button in a route's row, or a click on its line, opens its sheet, and a row of the sheet shows its stop. With the roads of step 9 the stored routes follow the streets, and so do the vans (D73 to D75).

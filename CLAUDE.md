@@ -33,7 +33,7 @@ The numbers in the README are made by `cargo run -p routeforge-tsp --release --e
 
 The bot idles until `.env` has `TELEGRAM_BOT_TOKEN`, a token from @BotFather (D62). Nothing else has to be set for it. Whoever writes to it gets a client's account, and `/start` says the account's id, which an admin needs to make it an operator's (D59). It takes an address in words only where `.env` has `GEOCODER_URL`, a service that speaks as Nominatim does (D72).
 
-Distances by road are off until they are turned on (D67). `scripts/osrm-prepare.ps1` (or `.sh`) fetches the roads of Kyiv into `osrm/` and prepares them, once. With `COMPOSE_PROFILES=osrm` and `OSRM_URL=http://osrm:5000` in `.env`, the same command then starts an OSRM server too, and the solvers ask it. A solver on the host asks it at `OSRM_URL=http://127.0.0.1:5000`.
+Distances by road are off until they are turned on (D67). `scripts/osrm-prepare.ps1` (or `.sh`) fetches the roads of Kyiv into `osrm/` and prepares them, once. With `COMPOSE_PROFILES=osrm` and `OSRM_URL=http://osrm:5000` in `.env`, the same command then starts an OSRM server too, and the solvers ask it. A solver on the host asks it at `OSRM_URL=http://127.0.0.1:5000`. Only then are the routes on the map drawn along the streets (D73).
 
 An image holds what was in the working tree when it was built. After a change, `--build` again.
 
@@ -65,6 +65,7 @@ An API that is to take a bot needs `BOT_SERVICE_KEY` as well, of at least 32 byt
 - Route costs are integer metres.
 - A courier is never overloaded along its route (D65). A route is searched with `optimize_route_within`, on the `Loads` of its orders and its courier, and the solver checks the calling order with `Loads::fits` once more before it stores it. Whatever changes the order of a route's stops after the search, as turning it round for the roads does, has to check that too.
 - A route job does not fail for want of road distances. A table that the routing service does not give is made of great circles, and the route is stored as `great_circle` (D66). The search gets a matrix that is the same both ways, and the length that is stored is measured along the table as it was given, leg by leg.
+- Nor does it fail for want of the way a route takes along the streets, which a map draws (D73). The way is asked for when the search is over, with the lease kept, for the stops in the order the route is driven and not the order the search found, and only for a route that was measured by road. It is asked for with `continue_straight` off, or it is not the way the table measured. A route that gets none is stored without it.
 - Lease and retry times come from the database clock, not the worker's.
 - After changing a query or a migration, run `scripts/sqlx-prepare.ps1` (or `.sh`) and commit `.sqlx/`: builds check queries against that directory, not a database (D28). Never edit a migration that has been merged; add a new one.
 - Nothing may need OpenSSL, CMake or NASM to build: TLS stays on rustls with ring, crypto on pure-Rust backends (D12).
@@ -86,6 +87,9 @@ An API that is to take a bot needs `BOT_SERVICE_KEY` as well, of at least 32 byt
 - A file added under `web/` needs a row in `FILES` in `crates/routeforge-api/src/page.rs`. Files under `web/vendor/` are kept as they were released: do not edit them (D52).
 - The page asks no other host for anything but map tiles, and puts text from the API into the document as text, never as HTML (D52). After changing `web/index.html`, try it in a browser: the tests check that the page is served and what it loads, not what it does.
 - The page is served with a policy that names its one `<script>` and its one `<style>` by their hash, and allows no other inline code (D69). So the page has one of each, without attributes, and no `style` attribute and no handler in an attribute anywhere. What the browser refuses shows in its console and nowhere else.
+- The page makes its SVG with Leaflet's `L.SVG.create`, and names no namespace: to the test that reads the page for other hosts, a namespace is an address (D75).
+- What moves on the page is a simulation, and the page says so beside it. Nothing reports where a courier is, and nothing is to: tracking is among what the approved description rules out. The vans are reckoned on the page, from the routes as they are stored (D74).
+- The list of routes on the page replaces a row only when what it says has changed. Written anew with every event of a search, a button in a row cannot be pressed (D75).
 - `rust-toolchain.toml` and the base image in the `Dockerfile` name the same compiler. Change them together (D10).
 - `docker compose up` has to work on a clone with no `.env`. A variable the compose file hands to a service needs a fallback there when the binary has no default for it. A test in `crates/routeforge-api/src/config.rs` holds the fallbacks of the `api` service to what the API starts with, and one in `crates/routeforge-bot/src/config.rs` those of the `bot` service (D54). The bot and the API have to fall back to the same `BOT_SERVICE_KEY`. The three values that are no secrets are constants of the API as well, which warns when it starts on one of them: change them in both places (D70).
 - What asks a service outside the stack is off on a clone: OSRM is behind a compose profile, and the bot's geocoder has no value to fall back on (D8, D67, D72).

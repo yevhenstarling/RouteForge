@@ -19,7 +19,7 @@ How a plan is made:
 
 1. An operator asks the api to plan a service date. In one transaction the api inserts the plan and one `plan` job.
 2. A solver claims the `plan` job and groups the date's pending orders into one cluster per courier, each within what its courier can carry out and can carry back (D65). In the transaction that completes that job, it marks those orders as planned and inserts one `route` job per cluster.
-3. Solvers claim the `route` jobs. Each one optimizes the stop order for a single courier, so that the courier is never overloaded on the way, and writes the route in the transaction that completes its job. The distances it works on are great circles, or roads where the solver was given an OSRM server to ask (D66).
+3. Solvers claim the `route` jobs. Each one optimizes the stop order for a single courier, so that the courier is never overloaded on the way, and writes the route in the transaction that completes its job. The distances it works on are great circles, or roads where the solver was given an OSRM server to ask (D66). A route by road is stored with the way it takes along the streets, which the solver asks the same server for (D73).
 4. When the last `route` job completes, the plan is marked done.
 
 A plan that is cancelled, or that loses a job for good, undoes itself: its routes are deleted and its orders are pending again (D20). A plan that is done can be discarded, which undoes it the same way, so that its date can be planned again (D30).
@@ -28,7 +28,8 @@ How a plan is watched:
 
 1. Every change to a plan or to one of its jobs is announced in the database, by the function of the queue that makes it and in the transaction that makes it (D48). A solver that is searching for a route also announces, four times a second, how far it has got and which route is the best so far (D49).
 2. One connection of the api listens. What it hears reaches every open event stream, and a stream that hears of its plan reads the plan again and sends what has changed (D50).
-3. The page, which the api serves at `/`, reads the stream and draws: a dashed line for a route that is still searched for, a solid one when it is stored (D52).
+3. The page, which the api serves at `/`, reads the stream and draws: a dashed line for a route that is still searched for, a solid one when it is stored (D52). A stored route that has a way is drawn along it (D73). Beside each route the page charts the length its search announced, and it opens a stored route as a sheet of its stops (D75).
+4. When the plan is done, the page sends a van along each route. That is a simulation of the page's own: nothing tracks a courier (D74).
 
 How an order is placed by chat:
 
@@ -53,7 +54,7 @@ The workspace has exactly five crates, as the [approved description](description
 | `routeforge-tsp` | Clustering and route optimization. Pure computation. | none |
 | `routeforge-domain` | Domain types, DTOs and geo helpers. With the `db` feature: persistence and the job queue. With the `openapi` feature: the schemas of the DTOs. | none |
 | `routeforge-api` | HTTP API, auth, OpenAPI, the map page. | `domain` with `db` and `openapi` |
-| `routeforge-solver` | Queue worker. Asks an OSRM server for distances by road, if it is given one. | `domain` with `db`, `tsp` |
+| `routeforge-solver` | Queue worker. Asks an OSRM server for distances by road and for the way a route takes, if it is given one. | `domain` with `db`, `tsp` |
 | `routeforge-bot` | Telegram bot. Asks a geocoding service where an address is, if it is given one. | `domain` without `db` |
 
 ## Decisions
@@ -1380,10 +1381,16 @@ Why:
 
 What it takes, measured against the server of D67 on the development machine:
 
-- **Time.** The way through 75 stops took 17 ms, through 330 stops 71 ms, and through 500 positions 155 ms.
-- **Room.** A way has a point every 35 metres or so. For the demonstration's day of 300 orders on four vans, with twenty million moves a route, the four ways had 2067 to 5174 points and were 8 to 20 thousand letters. The answer of `GET /api/plans/{id}/routes` for that day was 110 kB.
-- **The limit.** Left to itself the server takes a way through 500 positions, and refuses a longer one with `TooBig`. The stack starts it with `--max-viaroute-size 2002`: a table has the depot and the stops, and a way comes back to the depot (D67).
-- **The line against the length.** Measured from point to point along great circles, each of those four ways came to within 0.2 % of the length its route is stored with, which is OSRM's own measure of the same way.
+- **Time.** Next to nothing beside the table. By the server's own log, in the stack: for a planned day of 300 orders on four vans the four tables took 19 to 29 ms and the four ways 5 to 9 ms. For a day of 2000 orders, with routes of 347 to 556 stops, the tables took 94 to 216 ms and the ways 24 to 30 ms. A way through stops in no order at all is longer and takes longer: 71 ms through 330 of them, and 155 ms through 500.
+- **Room.** A way has a point every 35 metres or so, and a point is four letters. For the day of 300 orders, which came to 505.55 km by road, the four ways had 2067 to 4848 points and were 8 to 19 thousand letters, and the answer of `GET /api/plans/{id}/routes` was 108 kB. For the day of 2000 orders the ways had 12 to 17 thousand points each, and the answer was 517 kB.
+- **The limit.** Left to itself the server takes a way through 500 positions, and refuses a longer one with `TooBig`. The stack starts it with `--max-viaroute-size 2002`: a table has the depot and the stops, and a way comes back to the depot (D67). Three of the four routes of the day of 2000 orders had more than 500 stops, and each got its way.
+- **The line against the length.** Measured from point to point along great circles, each of those eight ways came to within 0.21 % of the length its route is stored with, which is OSRM's own measure of the same way.
+
+Tried in the stack, from a clone of the phase branch, and in a headless Edge:
+
+- **The lines.** The stored routes of a day by road followed the streets, and crossed the Dnipro on its bridges. Close up, a stop that lies off the roads has a short spur to it and back.
+- **A server that gives the distances and refuses the way,** started for a way through ten positions. The plan was done in 1.4 seconds. Its four routes were stored by road without a way, each solver logged a warning with the server's `TooBig`, and the page said `by road, drawn from stop to stop` of each.
+- **The server stopped three seconds into a plan,** which one solver worked on with six seconds a route. It was gone a second later. The plan was done after 40.2 seconds: the first route by road, without its way, and three as the crow flies. The page said `219.79 km over 4 routes: 1 by road, 3 as the crow flies`. Each time the server was asked and was not there, the solver waited four seconds for its name to fail, as in Phase 8 (D66).
 
 What it does not do:
 
@@ -1423,6 +1430,8 @@ What it does not do:
 - Refresh, and picking the plan again, send the vans out again from the depot.
 - A plan that is not done has no vans, and a discarded one loses them.
 
+Tried in a headless Edge, on the host and in the stack. The vans were on the map 35 ms after the page showed its plan as done, with nobody pressing anything. At three moments of a drive by road, each of four vans was within 1.1 pixels of the line of its route, which Leaflet draws a pixel off at the most. The van with the shortest route, 53.60 km, was back first, while the one with 183.44 km had most of its way before it. After a minute all were back, and the page said so. The button stopped them and sent them out again, a sheet that was opened meanwhile stayed open, and a discard took them off the map. In a browser that was asked for less motion nothing set out until the button was pressed.
+
 ### D75. The chart of a search and the route sheet are the page's (in place)
 
 Both are made of what the page has already, and the API was not changed for either.
@@ -1451,3 +1460,7 @@ What they do not do:
 - Neither is there for a client, who sees no plan (D41).
 
 Tried in a headless Edge, against an API and solvers on the host. On a day of 300 orders on four vans, the chart of each route fell once, a quarter of a second in, and stood: one went from 146.97 km to 129.49 km. On a day of 1200 orders the charts went on falling for one to six of the ten seconds: one route went from 78.64 km to 63.87 km at once, and to 62.84 km in four steps after. A sheet of 86 stops left the depot with 131 on board and came back with 37, and the most in its column was the 131 its row names. A row brought the map to its stop, which was in the Dnipro: a demo order is a random point (D46).
+
+With two workers for four routes, the row of a route that was stored stayed the element it was while the two others were searched for, and its button opened its sheet while the plan was still at it. The rows of the searches were made anew, as they have to be.
+
+In the stack, on the day of 300 orders, the first length the page heard of each search was already its last, and the four charts were level lines. A search announces its first tour within a millisecond or so of starting, and the page opens the stream of a plan after the plan was asked for: which of the two is first is chance. So a row names the first length only where the search has got below it.
