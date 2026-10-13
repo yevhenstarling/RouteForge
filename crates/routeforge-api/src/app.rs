@@ -10,7 +10,7 @@ use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::middleware::from_fn;
 use actix_web::{App, web};
-use routeforge_domain::{OrdersChanged, Problem, RouteJob, RouteProgress};
+use routeforge_domain::{OrdersChanged, PlanChanged, Problem, RouteJob, RouteProgress};
 use sqlx::PgPool;
 use tracing_actix_web::TracingLogger;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -101,10 +101,10 @@ pub(crate) fn app(
             press **Authorize** and paste it.\n\n\
             The same API is behind the map at `/`."
     ),
-    // `Problem` is what the refusals name, and the other three are what the events of
+    // `Problem` is what the refusals name, and the other four are what the events of
     // a stream carry. None of them is the body of a response, where utoipa would find
     // it.
-    components(schemas(Problem, RouteJob, RouteProgress, OrdersChanged)),
+    components(schemas(Problem, RouteJob, RouteProgress, OrdersChanged, PlanChanged)),
     modifiers(&BearerToken),
     tags(
         (name = "health", description = "Whether the API is up, and ready"),

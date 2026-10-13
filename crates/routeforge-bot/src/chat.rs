@@ -17,7 +17,7 @@
 //! reads no more into them than that, and never acts on them: what a search finds is
 //! shown, and picked by a button.
 //!
-//! Three things hold throughout:
+//! Four things hold throughout:
 //!
 //! - **The bot has no authority of its own (D9).** What it asks of the API it asks
 //!   with a token of the person it is talking to, which it is given anew each time. So
@@ -30,6 +30,10 @@
 //! - **An order that is being put together is in memory**, one for each chat, and is
 //!   gone when the bot stops. A button says which draft it belongs to, so one that is
 //!   left over from an earlier draft is told that it is out of date.
+//! - **An order is placed once, however often it is asked for (D76).** A draft has a
+//!   key, which goes to the API with the order. When no answer comes back, the draft
+//!   stays, with its key, and the next press asks for the same order again: the API
+//!   places it if it had not, and answers with it either way.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,8 +41,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use chrono::{Days, NaiveDate};
 use routeforge_domain::{
-    LatLon, Order, OrderFilter, OrderId, OrderKind, OrderRequest, OrderStatus, Plan, PlanRequest,
-    PlanStatus, Role, Session,
+    IdempotencyKey, LatLon, Order, OrderFilter, OrderId, OrderKind, OrderRequest, OrderStatus,
+    Plan, PlanRequest, PlanStatus, Role, Session,
 };
 use tracing::{error, info, warn};
 
@@ -78,6 +82,10 @@ const HOW_TO_BEGIN: &str = "share its place: the button below, or the paperclip 
 const STALE: &str = "This order is no longer open: it was placed or dropped, or you began \
     another. Share a location to begin a new one.";
 const AWAY: &str = "The service does not answer right now. Try again in a moment.";
+/// What is said of an order that went out and got no answer. It may be placed or not,
+/// and asking again settles which, without placing it twice (D76).
+const NO_ANSWER: &str = "The service did not answer, so I cannot say yet whether the order \
+    was placed. Press the button again: it is placed once, however often you ask.";
 
 // The same two, for a bot that looks addresses up (D72).
 const NOT_UNDERSTOOD_BY_ADDRESS: &str = "An order begins with a location or with an address \
@@ -341,6 +349,10 @@ struct Draft {
     kind: Option<OrderKind>,
     parcels: Option<u32>,
     day: Option<NaiveDate>,
+    /// What the order is asked for with, so that it is placed once (D76). It is the
+    /// key of the draft as it is: a draft that is changed gets another, and one that
+    /// is only asked for again keeps the one it has.
+    key: IdempotencyKey,
 }
 
 impl Draft {
@@ -802,6 +814,7 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
             kind: None,
             parcels: None,
             day: None,
+            key: IdempotencyKey::generate(),
         };
         let question = draft.question(sender.today, in_place);
 
@@ -825,6 +838,10 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
         match drafts.get_mut(&sender.chat).filter(|draft| draft.id == id) {
             Some(draft) => {
                 note(draft);
+                // Another order now than the one its key may have gone out with. A
+                // key answers for one order (D76): asked for with the old one, the
+                // API would refuse the order for not being the one it has.
+                draft.key = IdempotencyKey::generate();
                 draft.question(sender.today, true)
             }
             None => Reply::in_place(STALE),
@@ -865,6 +882,8 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
             return question;
         };
         if !on_offer(day, sender.today) {
+            // It cannot go out again before it has a day, and it gets another key
+            // with that day, in `fill`: it is another order then.
             draft.day = None;
             let mut question = draft.question(sender.today, true);
             question.text = format!("That day is no longer on offer.\n\n{}", question.text);
@@ -883,7 +902,7 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
             Err(reply) => format!("{}\nThe order was not placed.", reply.text),
             Ok(session) => match self
                 .api
-                .create_order(&caller(&session, sender), &asked)
+                .create_order(&caller(&session, sender), &asked, &draft.key)
                 .await
             {
                 Ok(placed) => {
@@ -894,12 +913,11 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
                     ));
                 }
                 // The request went out and no answer came back. The API may have
-                // stored the order all the same.
+                // stored the order all the same. The draft is kept with its key, so
+                // the next press asks for the same order and cannot place a second.
                 Err(failure @ Failure::Away(_)) => {
-                    warn!(%failure, "do not know whether an order was placed");
-                    "The service did not answer, so I cannot say whether the order was placed. \
-                     /orders shows whether it is there: look before you press again."
-                        .to_owned()
+                    warn!(%failure, "do not know yet whether an order was placed");
+                    NO_ANSWER.to_owned()
                 }
                 Err(failure) => {
                     format!("{}\nThe order was not placed.", refused(&failure, &session))

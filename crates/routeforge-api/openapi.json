@@ -399,8 +399,39 @@
         ],
         "type": "string"
       },
+      "OrderStop": {
+        "description": "Where a planned order is on its route: who calls, and when in the round (D78).\n\nAn order has one from the moment its route is stored. Before that, while the route\nis still searched for, it is planned and has none.",
+        "properties": {
+          "courier": {
+            "description": "The name of the courier whose route the order is on.",
+            "type": "string"
+          },
+          "order_id": {
+            "$ref": "#/components/schemas/OrderId"
+          },
+          "position": {
+            "description": "Which call of the route it is, counted from 0.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stops": {
+            "description": "How many calls the route has.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "courier",
+          "position",
+          "stops"
+        ],
+        "type": "object"
+      },
       "OrdersChanged": {
-        "description": "What an `orders` event of the stats stream says: an order of this day was placed or\nwithdrawn, so whoever shows the day reads its orders again (D63).",
+        "description": "What an `orders` event says: the orders of this day have changed, so whoever shows\nthe day reads its orders again.\n\nOn the stats stream it is an order of anybody's that was placed or withdrawn (D63).\nOn the stream of somebody's own orders it is one of theirs, and whatever became of\nit: placed, withdrawn, taken by a plan, put on a route or given back (D77).",
         "properties": {
           "service_date": {
             "format": "date",
@@ -499,6 +530,18 @@
           "routes_total",
           "routes_done",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "PlanChanged": {
+        "description": "What a `plans` event of the stats stream says: this plan has changed, or one of its\njobs has, or it is new (D79). It names the plan and says nothing of it. Whoever\nshows a day reads the plans of that day again if the plan is one they do not know.",
+        "properties": {
+          "plan_id": {
+            "$ref": "#/components/schemas/PlanId"
+          }
+        },
+        "required": [
+          "plan_id"
         ],
         "type": "object"
       },
@@ -1842,8 +1885,22 @@
         ]
       },
       "post": {
-        "description": "The order is the caller's, and is pending until a plan gives it to a courier.",
+        "description": "The order is the caller's, and is pending until a plan gives it to a courier.\n\nA request may bring a key of the caller's making, as `Idempotency-Key`. Sent again\nwith the same key, it places nothing: the answer is `200`, with the order that key\nplaced, as it stands by then. So a request whose answer was lost can be sent again\nas it was, and the order is placed once. A key is the caller's own, and is for one\norder: with a key that has placed another order the request is refused.",
         "operationId": "create_order",
+        "parameters": [
+          {
+            "description": "What makes the request safe to repeat: 1 to 64 letters, digits, dots, underscores or hyphens, made up by the caller. A UUID will do",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1855,6 +1912,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order"
+                }
+              }
+            },
+            "description": "The order this key placed before. Nothing was stored this time"
+          },
           "201": {
             "content": {
               "application/json": {
@@ -1892,6 +1959,107 @@
           }
         ],
         "summary": "Place an order",
+        "tags": [
+          "orders"
+        ]
+      }
+    },
+    "/api/orders/events": {
+      "get": {
+        "description": "An event stream (`text/event-stream`) that stays open. It sends an `orders` event,\nan `OrdersChanged`, when it opens and whenever something has become of an order the\ncaller placed for that day: it was placed, here or elsewhere, or withdrawn, a plan\nhas taken it, its route was stored, or a plan has given it back. The event names\nthe day and no order: whoever hears it reads `GET /api/orders` and\n`GET /api/orders/stops` for that day again.\n\nIt tells of the caller's own orders, whoever the caller is, and of nobody else's:\nan order that somebody else places sends nothing here. An operator hears of\neverybody's orders on the stream of `GET /api/system/stats/events`.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
+        "operationId": "watch_orders",
+        "parameters": [
+          {
+            "description": "The day the orders are for.",
+            "in": "query",
+            "name": "service_date",
+            "required": true,
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The events, for as long as the stream is read"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No token was sent, or the one sent is not valid or has expired"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Watch one's own orders of a day",
+        "tags": [
+          "orders"
+        ]
+      }
+    },
+    "/api/orders/stops": {
+      "get": {
+        "description": "For each order of the day that is on a stored route: the name of its courier, which\ncall of the route it is, counted from 0, and how many calls the route has. Oldest\norder first. An order that is pending or withdrawn is not among them, and neither is\none that a plan has taken and whose route is still searched for.\n\nA client gets those of their own orders. That is all a client is told of a route:\nnot its other calls, its line or its length.",
+        "operationId": "list_order_stops",
+        "parameters": [
+          {
+            "description": "The day the orders are for.",
+            "in": "query",
+            "name": "service_date",
+            "required": true,
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/OrderStop"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Where each order of the day is that is on a route"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No token was sent, or the one sent is not valid or has expired"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Say where the orders of a day are on their routes",
         "tags": [
           "orders"
         ]
@@ -2571,7 +2739,7 @@
     },
     "/api/system/stats/events": {
       "get": {
-        "description": "An event stream (`text/event-stream`) that stays open. It opens with a `stats`\nevent, which is what `GET /api/system/stats` gives, and sends another whenever that\nhas changed: at once when a job is queued, claimed or finished, and within a couple\nof seconds when a worker has come or has fallen silent.\n\nIt also sends an `orders` event, an `OrdersChanged`, whenever an order was placed\nor withdrawn. It names the day and no order: whoever shows that day reads its\norders again. Nothing makes up for one that was lost, so a reader also reads now\nand then without being told.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
+        "description": "An event stream (`text/event-stream`) that stays open. It opens with a `stats`\nevent, which is what `GET /api/system/stats` gives, and sends another whenever that\nhas changed: at once when a job is queued, claimed or finished, and within a couple\nof seconds when a worker has come or has fallen silent.\n\nIt also sends an `orders` event, an `OrdersChanged`, whenever an order was placed\nor withdrawn. It names the day and no order: whoever shows that day reads its\norders again. Nothing makes up for one that was lost, so a reader also reads now\nand then without being told.\n\nAnd it sends a `plans` event, a `PlanChanged`, whenever a plan has changed, or one\nof its jobs has, or a plan is new. It names the plan and says nothing of it: a\nreader that shows a day and does not know the plan reads the plans of that day\nagain. That is how a page shows a plan that was asked for elsewhere.\n\nA line that starts with a colon is a comment, sent to keep the connection open.\nThe stream ends when the token it was opened with expires.",
         "operationId": "watch_system_stats",
         "responses": {
           "200": {

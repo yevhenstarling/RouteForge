@@ -139,6 +139,15 @@ fn data_of(reply: &Reply, label: &str) -> String {
     data
 }
 
+/// The key of the one order the bot has asked for so far, which has to be one the API
+/// takes for a key.
+fn the_one_key(bot: &Bot) -> String {
+    let keys = bot.api.keys();
+    assert_eq!(keys.len(), 1, "one order was asked for: {keys:?}");
+    IdempotencyKey::new(&keys[0]).expect("a key the API takes");
+    keys[0].clone()
+}
+
 fn only_logins(asked: &[Asked]) -> bool {
     asked
         .iter()
@@ -205,7 +214,7 @@ async fn a_delivery_of_two_parcels_for_tomorrow_is_placed_by_the_last_press_and_
     assert!(placed.in_place);
 
     // Asked as the person, with a token that was got for it, under the id of the
-    // update that confirmed.
+    // update that confirmed, and with a key that makes it safe to ask again (D76).
     let order = OrderRequest {
         kind: OrderKind::Delivery,
         service_date: date(13),
@@ -213,6 +222,7 @@ async fn a_delivery_of_two_parcels_for_tomorrow_is_placed_by_the_last_press_and_
         address: None,
         demand: 2,
     };
+    let key = the_one_key(&bot);
     assert_eq!(
         bot.api.asked(),
         [
@@ -224,6 +234,7 @@ async fn a_delivery_of_two_parcels_for_tomorrow_is_placed_by_the_last_press_and_
                 token: "token-1".to_owned(),
                 request_id: bot.last_request(),
                 order,
+                key,
             },
         ]
     );
@@ -1281,25 +1292,136 @@ async fn an_order_that_could_not_be_placed_is_kept_and_placed_when_the_api_answe
     assert!(bot.api.orders().is_empty());
 
     // The order went out and no answer came back. It may be stored all the same,
-    // so the bot does not say that it is not.
+    // so the bot does not say that it is not. It says that it cannot tell yet, and
+    // that asking again is safe.
     bot.api
         .fail_next(Failure::Away("the answer took too long".to_owned()));
     let unknown = bot.presses(&kept, "Place the order").await;
-    assert!(
-        unknown.text.starts_with(
-            "The service did not answer, so I cannot say whether the order was placed."
-        ),
-        "{}",
-        unknown.text
-    );
+    assert_eq!(unknown.text, format!("{NO_ANSWER}\n\n{}", shown.text));
     assert!(!unknown.text.contains("was not placed"), "{}", unknown.text);
-    assert_eq!(unknown.keys, shown.keys);
+    assert!(unknown.text.contains("Press the button again"));
+    assert_eq!((&unknown.keys, unknown.in_place), (&shown.keys, true));
 
     // And when the API answers, the order that was kept is placed, once.
     let placed = bot.presses(&unknown, "Place the order").await;
     assert!(placed.text.starts_with("Placed:"), "{}", placed.text);
     assert_eq!(bot.api.orders().len(), 1);
     assert_eq!(bot.presses(&unknown, "Place the order").await.text, STALE);
+
+    // It was the same order every time it was asked for, so it went out with the
+    // same key every time: three refusals or silences, and the one that placed it.
+    let keys = bot.api.keys();
+    assert_eq!(keys.len(), 4);
+    assert!(keys.iter().all(|key| *key == keys[0]), "{keys:?}");
+}
+
+/// What the key is for (D76). The API has placed the order, and the bot was not told.
+/// The person presses again, as they were asked to, and the order is there once.
+#[tokio::test]
+async fn an_order_whose_answer_was_lost_is_not_placed_again_by_the_next_press() {
+    let bot = bot();
+    let shown = bot.whole_order().await;
+
+    bot.api.lose_next_answer();
+    let unknown = bot.presses(&shown, "Place the order").await;
+    assert_eq!(unknown.text, format!("{NO_ANSWER}\n\n{}", shown.text));
+    assert_eq!(unknown.keys, shown.keys);
+    assert_eq!(bot.api.orders().len(), 1, "placed, and nobody was told");
+
+    // Lost once more, and then answered: the bot can say for certain.
+    bot.api.lose_next_answer();
+    let unknown = bot.presses(&unknown, "Place the order").await;
+    assert!(unknown.text.starts_with(NO_ANSWER), "{}", unknown.text);
+    let placed = bot.presses(&unknown, "Place the order").await;
+    assert_eq!(
+        placed.text,
+        "Placed: a delivery of 2 parcels to 50.45010, 30.52340, on Tue 13 Oct.\n\
+         It is pending until that day is planned. /orders shows it."
+    );
+    assert_eq!(bot.api.orders().len(), 1, "and it is there once");
+
+    let keys = bot.api.keys();
+    assert_eq!(keys.len(), 3);
+    assert!(keys.iter().all(|key| *key == keys[0]), "{keys:?}");
+    IdempotencyKey::new(&keys[0]).expect("a key the API takes");
+    assert_eq!(bot.presses(&unknown, "Place the order").await.text, STALE);
+}
+
+/// A key is for one order. Another order has another, and so has an order that was
+/// changed after it went out: what the API would answer to the old key is the order
+/// as it was.
+#[tokio::test]
+async fn every_order_goes_out_with_a_key_of_its_own() {
+    let bot = bot();
+
+    // Two orders, one after the other, alike in everything.
+    for _ in 0..2 {
+        let shown = bot.whole_order().await;
+        let placed = bot.presses(&shown, "Place the order").await;
+        assert!(placed.text.starts_with("Placed:"), "{}", placed.text);
+    }
+    let keys = bot.api.keys();
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0], keys[1]);
+    assert_eq!(bot.api.orders().len(), 2);
+
+    // An order for tomorrow goes out, is placed, and its answer is lost. Two days
+    // on, the day it names has passed. The person picks another, which makes it
+    // another order, and that one is placed as well.
+    let shown = bot.whole_order().await;
+    bot.api.lose_next_answer();
+    let unknown = bot.presses(&shown, "Place the order").await;
+    assert!(unknown.text.starts_with(NO_ANSWER), "{}", unknown.text);
+    let late = bot.presses_on(14, &unknown, "Place the order").await;
+    assert!(
+        late.text.starts_with("That day is no longer on offer."),
+        "{}",
+        late.text
+    );
+    let shown = bot.presses_on(14, &late, "Today, Wed 14 Oct").await;
+    let placed = bot.presses_on(14, &shown, "Place the order").await;
+    assert_eq!(
+        placed.text,
+        "Placed: a delivery of 2 parcels to 50.45010, 30.52340, on Wed 14 Oct.\n\
+         It is pending until that day is planned. /orders shows it."
+    );
+    let keys = bot.api.keys();
+    assert_eq!(keys.len(), 4);
+    assert_ne!(keys[2], keys[3], "the order was changed between the two");
+    let days: Vec<NaiveDate> = bot
+        .api
+        .orders()
+        .iter()
+        .map(|order| order.service_date)
+        .collect();
+    assert_eq!(days, [date(13), date(13), date(13), date(14)]);
+
+    // The same with a button of an earlier question, pressed where it is still
+    // shown, on another telephone: three parcels and not two. With the key of the
+    // order of two the API would refuse it, as not the order that key placed.
+    let located = bot.shares(30, 50.4501, 30.5234).await;
+    let parcels = bot.presses(&located, "Delivery").await;
+    let which_day = bot.presses(&parcels, "2").await;
+    let shown = bot.presses(&which_day, "Tomorrow, Tue 13 Oct").await;
+    bot.api.lose_next_answer();
+    let unknown = bot.presses(&shown, "Place the order").await;
+    assert!(unknown.text.starts_with(NO_ANSWER), "{}", unknown.text);
+    let changed = bot.presses(&parcels, "3").await;
+    assert_eq!(
+        changed.text,
+        "A delivery of 3 parcels to 50.45010, 30.52340, on Tue 13 Oct.\nPlace this order?"
+    );
+    let placed = bot.presses(&changed, "Place the order").await;
+    assert_eq!(
+        placed.text,
+        "Placed: a delivery of 3 parcels to 50.45010, 30.52340, on Tue 13 Oct.\n\
+         It is pending until that day is planned. /orders shows it."
+    );
+    let keys = bot.api.keys();
+    assert_eq!(keys.len(), 6);
+    assert_ne!(keys[4], keys[5], "the order was changed between the two");
+    let parcels: Vec<u32> = bot.api.orders().iter().map(|order| order.demand).collect();
+    assert_eq!(parcels, [2, 2, 2, 2, 2, 3]);
 }
 
 /// An order that is on its way to the API is no longer the chat's to change. If the
@@ -1471,6 +1593,7 @@ async fn an_address_in_words_is_looked_up_and_the_place_that_is_picked_begins_an
             token: bot.api.last_token(),
             request_id: bot.last_request(),
             order,
+            key: the_one_key(&bot),
         }]
     );
 }

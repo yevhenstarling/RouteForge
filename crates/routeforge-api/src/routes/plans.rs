@@ -1102,12 +1102,16 @@ mod tests {
         let (mut stream, ..) = watching(&api, &operator, plan_id).await;
         let mut stats = api.open(&operator, "/api/system/stats/events").await;
         stats.next_of("stats").await;
+        let own = "/api/orders/events?service_date=2026-10-12";
+        let mut orders = api.open(&operator, own).await;
+        orders.next_of("orders").await;
         assert!(stream.is_quiet_for(QUIET).await);
 
         let told = Instant::now();
         api.events().close();
         stream.ended().await;
         stats.ended().await;
+        orders.ended().await;
         let took = told.elapsed();
         assert!(took < Duration::from_secs(2), "{took:?}");
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 use actix_web::web::Bytes;
 use actix_web::{HttpResponse, get, web};
 use routeforge_domain::db::{queue, workers};
-use routeforge_domain::{OrdersChanged, SystemStats};
+use routeforge_domain::{OrdersChanged, PlanChanged, SystemStats};
 use utoipa_actix_web::service_config::ServiceConfig;
 
 use crate::app::{AppState, NotAllowed, NotLoggedIn};
@@ -53,6 +53,11 @@ async fn get_system_stats(
 /// orders again. Nothing makes up for one that was lost, so a reader also reads now
 /// and then without being told.
 ///
+/// And it sends a `plans` event, a `PlanChanged`, whenever a plan has changed, or one
+/// of its jobs has, or a plan is new. It names the plan and says nothing of it: a
+/// reader that shows a day and does not know the plan reads the plans of that day
+/// again. That is how a page shows a plan that was asked for elsewhere.
+///
 /// A line that starts with a colon is a comment, sent to keep the connection open.
 /// The stream ends when the token it was opened with expires.
 #[utoipa::path(
@@ -98,8 +103,14 @@ struct StatsWatch {
 impl Watch for StatsWatch {
     fn hears(&self, signal: &Signal) -> Heard {
         match signal {
-            // A change to any plan is a job queued, claimed or finished.
-            Signal::Plan(_) | Signal::Missed => Heard::Changed,
+            // A change to any plan is a job queued, claimed or finished. Which plan it
+            // was is passed on as well, for a page that shows the day of a plan it
+            // has not heard of: one that was asked for elsewhere (D79).
+            Signal::Plan(plan_id) => {
+                let changed = PlanChanged { plan_id: *plan_id };
+                stream::frame("plans", &changed).map_or(Heard::Changed, Heard::ChangedWith)
+            }
+            Signal::Missed => Heard::Changed,
             Signal::Progress(_) => Heard::Nothing,
             // Nothing that is counted here. This is the one stream a page of an
             // operator always has open, so it is where the word is passed on (D63).
@@ -231,7 +242,8 @@ mod tests {
         assert_eq!(first["queue"]["queued"], 0);
         assert!(stream.is_quiet_for(QUIET).await, "nothing has changed");
 
-        // A plan is asked for, which puts a job on the queue.
+        // A plan is asked for, which puts a job on the queue. The stream says which
+        // plan it is that has changed, and then how the queue stands.
         let asked = api
             .post(
                 Some(&operator),
@@ -240,6 +252,8 @@ mod tests {
             )
             .await;
         assert_eq!(asked.status, StatusCode::CREATED);
+        let the_plan = json!({ "plan_id": asked.body["id"] });
+        assert_eq!(stream.next_of("plans").await, the_plan);
         assert_eq!(stream.next_of("stats").await["queue"]["queued"], 1);
 
         // A worker takes it.
@@ -249,6 +263,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(stream.next_of("plans").await, the_plan);
         let stats = stream.next_of("stats").await;
         assert_eq!(
             stats["queue"],
@@ -268,6 +283,58 @@ mod tests {
         queue::announce_progress(&pool, &held.lease, progress, None)
             .await
             .unwrap();
+        assert!(stream.is_quiet_for(QUIET).await);
+    }
+
+    /// What lets a page show a plan that was asked for elsewhere: by chat, by a script,
+    /// or on another page (D79). The stream names the plan and says nothing of it.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_plan_that_changes_is_passed_on_by_its_id(pool: PgPool) {
+        let api = testing::api(&pool);
+        let _listening = api.listen().await;
+        let watcher = api.actor(Role::Operator).await;
+        let elsewhere = api.actor(Role::Admin).await;
+        let client = api.actor(Role::Client).await;
+        api.depot().await;
+        api.courier(10).await;
+        api.order(&client, 12).await;
+        let mut stream = api.open(&watcher, "/api/system/stats/events").await;
+        stream.next_of("stats").await;
+
+        // Somebody else asks for two plans, of two days.
+        let mut plans = Vec::new();
+        for day in [12, 13] {
+            let asked = json!({ "service_date": date(day) });
+            let plan = api.post(Some(&elsewhere), "/api/plans", asked).await;
+            assert_eq!(plan.status, StatusCode::CREATED);
+            let named = stream.until("plans", |_| true).await;
+            assert_eq!(named, json!({ "plan_id": plan.body["id"] }));
+            plans.push(plan.body["id"].as_str().unwrap().to_owned());
+        }
+
+        // Whatever becomes of a plan from then on is said the same way: its jobs
+        // worked off, and a discard. Nothing is said of what it was.
+        testing::work_off(&pool).await;
+        let discard = format!("/api/plans/{}/discard", plans[0]);
+        let discarded = api.post(Some(&elsewhere), &discard, Value::Null).await;
+        assert_eq!(discarded.status, StatusCode::OK, "{}", discarded.text);
+        let mut heard_of = std::collections::BTreeSet::new();
+        while let Ok(event) = tokio::time::timeout(QUIET, stream.next()).await {
+            match event.name.as_str() {
+                "plans" => {
+                    let said = event.data.as_object().expect("an object");
+                    assert_eq!(said.len(), 1, "the id and nothing else: {}", event.data);
+                    heard_of.insert(said["plan_id"].as_str().unwrap().to_owned());
+                }
+                "stats" => {}
+                other => panic!("an event that nothing here should cause: {other}"),
+            }
+        }
+        assert_eq!(heard_of, plans.iter().cloned().collect());
+
+        // An order is no plan.
+        api.order(&client, 14).await;
+        assert_eq!(stream.next().await.name, "orders");
         assert!(stream.is_quiet_for(QUIET).await);
     }
 

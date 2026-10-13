@@ -35,8 +35,15 @@ How an order is placed by chat:
 
 1. A person shares a location with the bot. Where the bot was given a geocoding service, they may write an address instead, and pick the place among those the service found (D72). The bot asks with buttons for what an order needs beside the place: a delivery or a pickup, how many parcels, which day. It shows what it is about to place (D58, D61).
 2. On the confirming button the bot shows the api its key and says which Telegram user it is talking to. The api answers with a short-lived token of that user's account, which it makes if this is the first it hears of them (D59, D60).
-3. With that token the bot places the order: as that person, with their rights and no others (D9).
+3. With that token the bot places the order: as that person, with their rights and no others (D9). It sends a key with it, so that an order whose answer was lost can be asked for again and is placed once (D76).
 4. The order announces its day in the database. The api passes the word on, and a page that shows that day reads its orders again, so the order is on the map (D63).
+
+How an order is placed on the page:
+
+1. Somebody opens an account on the page, which is a client's, or logs in. A click on the map begins an order there, for the day that is shown, and a button places it, with a key as the bot's has (D76, D80).
+2. An operator's page shows the order at once, as it shows one that was placed by chat (D63).
+3. The client's page lists their orders of the day, and has a stream of its own. The stream says when something has become of one of them, and nothing of anybody else's (D77).
+4. When an operator plans the day, the client's page shows the order as planned, and, once its route is stored, which courier has it and which stop of the route it is (D78). That is all a client is told of a route.
 
 How it is run:
 
@@ -506,9 +513,10 @@ CI builds the `solver` target in a job of its own, so a dependency that needs a 
 
 Everything the API serves as data is under `/api`. Beside it are `/healthz` and `/readyz`, the OpenAPI document at `/api/openapi.json` and Swagger UI at `/docs/`. The page is at the root, and what it loads under `/vendor/` (D52).
 
-Two endpoints answer with `text/event-stream` and go on answering: `/api/plans/{id}/events` and `/api/system/stats/events` (D50). A caller they refuse is answered as by any other endpoint, with a problem.
+Three endpoints answer with `text/event-stream` and go on answering: `/api/plans/{id}/events`, `/api/system/stats/events` (D50) and, since Phase 10, `/api/orders/events` (D77). A caller they refuse is answered as by any other endpoint, with a problem.
 
 - A thing is read with `GET`, made with `POST`, which answers `201`, replaced with `PUT` and changed in part with `PATCH`. What changes the state of a thing and is no edit of it is a `POST` to a path of its own: `/api/orders/{id}/cancel`, `/api/plans/{id}/cancel`, `/api/plans/{id}/discard`.
+- An order that is asked for again with the key it was placed with is answered `200`, with the order, and not `201`: nothing was made this time (D76).
 - An id is a UUID in the path.
 - Every error is `application/problem+json` (RFC 9457), a `Problem` of the domain crate: `type`, `title`, `status`, a `detail` in words, and `errors` with the fields that were refused, where it is known which.
 
@@ -541,7 +549,7 @@ Good to know: a path that is served, asked for with a method it does not take, i
 - A login gives a JWT signed with HS256. It names the user (`sub`) and the role, and when it was issued and expires (`iat`, `exp`). It is good for `JWT_TTL_SECS`, an hour by default, and there is no leeway. The key is `JWT_SECRET`, at least 32 bytes long. The binary has no default for it.
 - A token the bot is given for a Telegram user is of the same key and the same shape, and is read by the same check. It is good for `BOT_JWT_TTL_SECS`, a minute by default (D60).
 - The role is in the token, and nothing is looked up to check a request.
-- An account is opened as a client's, with an address and a password or by the bot for a Telegram user (D59). An admin makes operators and admins of them, and cannot change their own role.
+- An account is opened as a client's, with an address and a password or by the bot for a Telegram user (D59). Since Phase 10 the page has a button for the first (D80). An admin makes operators and admins of them, and cannot change their own role.
 - The first admin comes from `ADMIN_EMAIL` and `ADMIN_PASSWORD`, when the API starts and no account has that address. An account that is there is left as it is.
 
 Why:
@@ -566,6 +574,8 @@ Since Phase 8 a login is counted before anything is looked up or hashed, and onl
 | Open an account, log in, health, the document, the page | without a token | | |
 | Log in a Telegram user | no: the bot alone, by its key (D60) | no | no |
 | Orders: place, list, read, withdraw | their own | all | all |
+| Orders: where they are on their routes (D78) | their own | all | all |
+| Orders: watch (D77) | their own | their own | their own |
 | The depot: read | yes | yes | yes |
 | The depot: set | no | no | yes |
 | Couriers | no | yes | yes |
@@ -732,15 +742,16 @@ The API has one connection that listens on the two channels of D48, and since Ph
 | Endpoint | Events |
 |---|---|
 | `GET /api/plans/{id}/events` | `plan`: the plan. `jobs`: its route jobs, each a `RouteJob`. `progress`: a `RouteProgress`. |
-| `GET /api/system/stats/events` | `stats`: what `GET /api/system/stats` gives. `orders`: an `OrdersChanged`, the day an order was placed or withdrawn for (D63). |
+| `GET /api/system/stats/events` | `stats`: what `GET /api/system/stats` gives. `orders`: an `OrdersChanged`, the day an order was placed or withdrawn for (D63). `plans`: a `PlanChanged`, the plan that has changed (D79). |
+| `GET /api/orders/events?service_date=` | `orders`: an `OrdersChanged`, when something has become of an order of the caller's own for that day (D77). Since Phase 10. |
 
 A stream opens with everything it shows. After that:
 
 - It reads again when it is given a reason: a notification for its plan, or for any plan in the case of the stats. It sends what differs from what it last sent, and nothing if nothing does.
 - It reads at most every 200 ms, so a burst of changes is one read.
-- It reads without a reason too, every ten seconds for a plan and every two for the stats, as a worker polls (D33). A notification can be lost, and a worker comes and falls silent without one (D27).
+- It reads without a reason too, every ten seconds for a plan, as for one's own orders, and every two for the stats, as a worker polls (D33). A notification can be lost, and a worker comes and falls silent without one (D27).
 - When the listener has had to reconnect, and when a stream has fallen more than 1024 signals behind, the stream is told that it may have missed something, and reads.
-- Progress is passed on as it comes, with no read. So is the word that an order was placed or withdrawn.
+- Progress is passed on as it comes, with no read. So is the word that an order was placed or withdrawn, by the stats stream. That a plan has changed is passed on by the stats stream as well, and is a reason for it to read (D79). The stream of one's own orders passes nothing on: it reads, and speaks if what it read has changed (D77).
 - A comment line every 15 seconds keeps a quiet stream from being taken for a dead one.
 
 A stream ends when its reader has gone, when the token it was opened with expires, when the API is told to stop (D51), and when a read fails.
@@ -789,7 +800,7 @@ Not looked into: in those eight seconds the stream that was still open could not
 - **The login** is kept in `sessionStorage`, so it survives a reload and ends with the tab. Any `401` clears it and shows the login.
 - **Text from the API goes into the page as text**, never as HTML. An address or the name of a courier is typed by somebody. Since Phase 8 the browser is told as much: the page is served with a policy that lets it run its own script and no other (D69).
 - **On the map** the stops are dots on a canvas and the routes are lines in SVG above it. Leaflet draws a canvas in the order things were added to it. On one canvas a route would be hidden under dots that were drawn again after it, as they are when a plan takes its orders.
-- **A client** who logs in sees the depot and their own orders, and no planning. That is what the API lets a client read (D41).
+- **A client** who logs in sees the depot and their own orders, and no planning. That is what the API lets a client read (D41). Until Phase 10 a client could only look (D80).
 
 What the page can do beyond the list in the plan was decided by the project owner on 2026-10-11:
 
@@ -810,7 +821,16 @@ What Phase 9 added to it:
 - **A small chart in the row of a route,** of its length while it was searched for (D75).
 - **A route sheet:** the stops of a route in calling order, with what is on board after each. A click on a route's line opens it, and a row of it shows its stop on the map (D75).
 
-What the page does not do. Until Phase 7 it learned of an order that somebody else had placed only when Refresh was pressed. An operator's page hears of one now (D63). A client's has no stream, and still shows it after Refresh.
+What Phase 10 added to it, all of it in D80:
+
+- **An account opened on the page,** by a second button of the login.
+- **An order placed by a click on the map,** with a key that makes it safe to ask for again (D76). For whoever is logged in.
+- **A client's own orders as a list,** each with what has become of it, a button that withdraws a pending one, and for a planned one the courier and the stop (D78).
+- **A stream for a client's page** (D77), and for an operator's the plans that were asked for elsewhere (D79).
+
+So a client no longer only looks. What a client is shown is still what the API lets a client read (D41), which since Phase 10 includes where their own orders are on their routes.
+
+What the page learns only from Refresh. Until Phase 7 that was an order that somebody else had placed. An operator's page hears of one since then (D63), and a client's of their own since Phase 10 (D77). A plan that was asked for elsewhere shows on an operator's page since Phase 10 as well (D79). What is left is the depot and the couriers: a page that was open when an admin moved the one or added the other shows it after Refresh.
 
 The page has no tests of its own. The API's tests check that it is served and what it loads. What it does was tried in a browser: `docs/plan.md` says how.
 
@@ -1053,7 +1073,7 @@ What holds for everything:
 - **What changes something is confirmed:** placing an order, withdrawing one, asking for a plan. The first press asks, and only the second does.
 - **A draft is taken out before the API is asked,** and given back when the API would not have the order. So a second press that is already on its way finds nothing to place.
 - **The buttons for a day say the day they mean,** as `Tomorrow, Tue 13 Oct`. The days are those of the bot's clock (D62). A day that has passed since it was offered is refused, and asked for again.
-- **What the API says is what the person is told.** Its `detail` is written for a person (D39), and the bot makes a sentence of it. A failure that is the API's own is said in the bot's words. An order that got no answer is not said to have failed: it may have been stored, and the bot says that it cannot tell.
+- **What the API says is what the person is told.** Its `detail` is written for a person (D39), and the bot makes a sentence of it. A failure that is the API's own is said in the bot's words. An order that got no answer is not said to have failed: it may have been stored, and the bot says that it cannot tell. Since Phase 10 it says so only until the next press: the order goes out with a key, the draft is kept with it, and pressing again places the order if it was not placed and is answered with it either way (D76).
 - **The commands are a table in `chat`:** what each is called, and what Telegram's menu says of it. `/orders` lists the person's orders from today on, to look at or to withdraw. `/pending`, `/plan` and `/status` are an operator's, and each asks for the day with buttons.
 - **Every request carries `tg-<update id>` as its request id** (D42). So what a chat asked for is found in the API's log, and a plan that was asked for by chat in the log of every solver that worked on it.
 - **Private chats only.** In a group, everybody's presses would go into one person's order.
@@ -1067,7 +1087,7 @@ Why:
 - The commands are read in `chat` and not by teloxide's derive. One table then serves the reading, the help and the menu, and a test sends `/order 50.45 30.52` as a person does. The workspace no longer asks teloxide for its `macros` feature.
 - Typed coordinates were added by the project owner's choice on 2026-10-12. Not every client of Telegram can share a location, and they let the bot be tried without a phone.
 
-What it does not do: understand sentences (D58); show more than ten orders at once; or tell an order that was not placed from one that was placed and lost on the way back, which would take a key that makes a request safe to repeat. An address in words became a way to begin an order in Phase 8, for a bot that was given a service to ask where it is (D72).
+What it does not do: understand sentences (D58); or show more than ten orders at once. Until Phase 10 it could not tell an order that was not placed from one that was placed and lost on the way back. That took a key that makes the request safe to repeat, which it sends now (D76). An address in words became a way to begin an order in Phase 8, for a bot that was given a service to ask where it is (D72).
 
 Tests: the order of the phase, press by press, with nothing asked of the API before the last one; dropping it at each step; buttons that are out of date, another chat's, or made up; days that have passed; every command for a client and for an operator; a role that changes between two requests; the API away, refusing, failing, and silent after an order went out. How the three parts are tried together is D64.
 
@@ -1119,9 +1139,12 @@ Why:
 
 What it does not do:
 
-- A client's page has no stream (D41). It shows a new order after Refresh.
 - What a plan does to an order, taking it or giving it back, is the plan's to announce, and the page reads the orders again when its plan changes.
-- A plan that was asked for elsewhere, by chat for one, shows on a page after Refresh. Nothing tells a page that the day it shows has a new plan.
+
+What it did not do until Phase 10:
+
+- A client's page had no stream (D41), and showed a new order after Refresh. It has one of its own now, which says when something has become of an order of the client's, and nothing of anybody else's (D77). A repeat of a request that places nothing announces nothing either (D76).
+- A plan that was asked for elsewhere, by chat for one, showed on a page after Refresh. The stats stream names every plan that changes now, and a page that shows the day of a plan it did not know reads its plans again (D79).
 
 Measured in a headless Edge, against an API on the host: an order that was placed through the API with a Telegram user's token was on the map 0.37 seconds later, and its withdrawal after 0.37 seconds. An order of another day caused no read. An order that was stored behind everybody's back, by an `INSERT` that announces nothing, was shown 26 seconds later.
 
@@ -1464,3 +1487,150 @@ Tried in a headless Edge, against an API and solvers on the host. On a day of 30
 With two workers for four routes, the row of a route that was stored stayed the element it was while the two others were searched for, and its button opened its sheet while the plan was still at it. The rows of the searches were made anew, as they have to be.
 
 In the stack, on the day of 300 orders, the first length the page heard of each search was already its last, and the four charts were level lines. A search announces its first tour within a millisecond or so of starting, and the page opens the stream of a plan after the plan was asked for: which of the two is first is chance. So a row names the first length only where the search has got below it.
+
+### D76. A key makes placing an order safe to repeat (in place)
+
+`POST /api/orders` takes a key of the caller's making, in the header `Idempotency-Key`. Sent again with the same key, the request places nothing, and is answered with the order that key placed.
+
+- **The key** is 1 to 64 letters, digits, dots, underscores and hyphens: the alphabet of a request id (D42). It is a type of the domain crate, `IdempotencyKey`, with no feature, so the bot makes what the API takes.
+- **It is optional.** A request without one is an order of its own every time, as it always was.
+- **It is the caller's own.** `orders.idempotency_key` is unique together with `client_id` (migration 0008). Two clients who make up the same key have placed two orders.
+- **The answers.**
+  - `201` with the order, when this request placed it.
+  - `200` with the order as it stands by then, pending or planned or withdrawn, when the key had placed it before.
+  - `422`, naming the header, when the key has placed another order than the one this request asks for, and when what was sent is no key.
+- **It is one statement still.** `orders::place` is the insert of `orders::create` with a conflict that sets the key to what it is already, which returns the row that has it. Whether that row is this request's own is read off its id, against the id that was sent. Only then is its day announced (D63).
+- **A key is kept as long as its order.** Nothing ends it.
+
+Who sends one:
+
+- **The bot.** A draft has a key from the moment it is begun, and another whenever it is changed. When no answer comes, the draft stays, with its key, and the bot says that pressing again cannot place the order twice.
+- **The page.** The key is of the order as the form asks for it. Asked for again unchanged, it goes out with the key it had (D80).
+
+Why:
+
+- A header, and not a field of the body: `OrderRequest` stays what an order is, and what makes a request safe to repeat is said of the request. `Idempotency-Key` is the name such a header commonly has.
+- A conflict that updates, and not `DO NOTHING`: the trap of D59. `DO NOTHING` returns no row to the request that came second. The update takes the lock of the row, so a second request that arrives while the first is on its way waits for it. If the first commits, the second is given its row. If it is rolled back, the second places the order.
+- By the id, and not by `xmax`: the application makes the ids (D11). So it knows its own row without asking after a column of PostgreSQL's bookkeeping.
+- `200` for a repeat: whoever asks can tell that nothing was placed this time. The bot and the page take either for the order.
+- `422` for a key that has placed another order: answered with that other order, whoever asked would take this one for placed. The bot and the page cannot come to it, since each changes the key with the order. It is for a caller with a fault.
+- A text that is no key is refused, and not passed over: whoever sent it takes the request for one that is safe to repeat.
+- For each client: a key somebody else has used would otherwise be a key that is taken, and to be told so is to be told something of somebody else's orders.
+- The bot does not ask again by itself. One press is one request (D9, D61), and each request waits up to ten seconds for its answer: a person would wait half a minute in silence where a press settles it.
+- Kept for good: there is no clock to compare and nothing to clean up. It costs a column and an entry in an index for each order that has one.
+
+What it does not do:
+
+- Make asking for a plan safe to repeat. A day has one plan in progress, so the second request is refused anyway (D30).
+- Outlive the bot. A draft is in memory (D61). A bot that was stopped between two presses has lost the draft, and its key with it.
+- Say that an order is the same as one without a key. Two requests without a key are two orders.
+
+Tests: a key places once, and every repeat is answered with the same order, also when it was withdrawn or planned since; four requests at once with one key are one order, and one that waits for a request that is then rolled back places the order itself; the same key from another client is another order; a repeat announces nothing; the schema refuses an empty key and one of 65 letters; the API answers `201`, then `200` with the same body, and `422` for each of five ways an order can differ, and for each of five texts that are no key; the gate comes before the key; the bot sends its key in the header the API's document has for it (D64), with the same key on the second press whether the first request was lost on the way there or on the way back, and with another key for an order that was changed.
+
+Tried in a headless Edge, in the stack: the answer to an order was failed in the browser after the API had sent it. The page said that the order may or may not be placed, and kept it in the form. Another page showed that it was placed. The second press was answered `200`, and the day had the order once. And by hand, with `curl`: `201`, then `200` with the same id, `422` for another order under that key, and one order.
+
+### D77. A stream says when something has become of one's own orders (in place)
+
+`GET /api/orders/events?service_date=` is a third event stream (D50), for anybody with a token. It sends an `orders` event, an `OrdersChanged`, when it opens and whenever something has become of an order the caller placed for that day: it was placed, here or elsewhere, or withdrawn, a plan has taken it, its route was stored, or a plan has given it back.
+
+- **It says nothing of anybody else's orders.** No signal is passed on as it comes. An order of the day that was placed or withdrawn, any plan that has changed, and the word that something may have been missed are each a reason to read. The read is of the caller's own orders of the day and of where they are on their routes (D78). The event goes out only when that differs from what was read last.
+- **The event is the one the stats stream has** (D63). It names the day and no order, and whoever hears it reads the orders of the day again.
+- **It reads without a reason every ten seconds,** as the stream of a plan does. So a word that was lost costs ten seconds, and a page that reads this stream needs no reads of its own beside it.
+- **It is the caller's own, whoever the caller is.** An operator who opens it hears of the orders they placed themselves. Everybody's are on the stats stream.
+
+Why:
+
+- A notification names a day, or a plan, and nobody (D48, D63). Passed on as it comes, it would tell every client who watches a day that somebody has placed an order for it. So the stream has to read, and has to keep what it read, to know whether what changed was the caller's.
+- Any plan is a reason to read, and not only the plan of the day: a notification of a plan names the plan and not its day, and to look the day up would cost the read that looking at the orders costs.
+- What it keeps is each order's id and status, and where the planned ones are. That is all that can change of an order in a way its client sees. Which plan holds an order is not among it: to its client the order is planned, whichever plan that is by.
+- The same event as the stats stream, and not the orders themselves: one handler on the page serves both, and the read that follows is the one the page makes anyway, in pages (D44).
+- A stream of its own, and not the stats stream opened to clients: that one shows the queue and the workers, which are an operator's (D41).
+
+What it costs: every stream of this kind reads when any plan changes, at most five times a second each (D50). A read is two queries by the index on `orders.client_id`.
+
+Good to know: a page that picks another day opens the stream of that day, and leaves the one it had. The API finds a stream without a reader when it next writes to it, and a quiet stream writes a comment every fifteen seconds (D50). Until then the stream that was left reads as the others do. Three that one page had left were still open when the API was stopped a little later, and ended with it.
+
+What it does not do: tell a client of a plan. A client sees no plan (D41), and hears only what a plan did to an order of theirs.
+
+Tests: the stream opens with the day; an order placed, withdrawn, taken by a plan, put on a route and given back by a discard are one event each, with silence between them; somebody else's order, placed, withdrawn, planned and put on a route, is silence, and so are an order of one's own of another day and the progress of a search; an operator hears of their own orders alone; an order that was stored behind everybody's back is found by the read that nobody asked for; the stream reads when it may have missed something; it ends with its token, to the second, and when the API is told to stop.
+
+Measured in a headless Edge, in the stack, with a client's page and an admin's side by side. The admin pressed Plan with two seconds a route, and the client's page said where its order was 2.7 seconds later: first that a plan had taken it and its route was still searched for, then `Van 3 has it: stop 1 of 11`. While a third account placed an order for the same day, the client's page showed nothing new and asked the API nothing. With logins good for twenty seconds, the stream ended after 21.0 seconds and the page was at the login a second later. And the API had stopped 1.3 seconds after it was told to, with such a stream open.
+
+### D78. Whoever placed an order is told where it is on its route (in place)
+
+Decided with the project owner on 2026-10-13, as one of four things beyond the list of Phase 10.
+
+`GET /api/orders/stops?service_date=` gives, for each order of the day that is on a stored route, an `OrderStop`: the order, the name of its courier, which call of the route it is, counted from 0, and how many calls the route has. A client gets those of their own orders, and an operator and an admin all of them, as with `GET /api/orders`.
+
+- **An order is on a route from the moment the route is stored.** While the route is still searched for, the order is planned and has no stop.
+- **The calls are counted over the whole route,** and not over the rows that are one client's.
+- **One query serves the endpoint and the stream of D77.**
+
+This changes what a client may read (D41). Until now a client was told nothing of a route. Now they are told the name of the courier that has their order, its place in the round, and the length of the round in calls. Of the route itself they are told nothing: not its other calls, its line or its length.
+
+Why:
+
+- A list for a day, and not `GET /api/orders/{id}/stop`: the page shows a day, so it is one request, and an order whose route is still searched for is simply not in the list. One by one, each such order would be a `404` in the browser's console.
+- Not a field of `Order`: every query of an order would join two tables more, the solver's among them, which reads orders to route them and has no use for where they were.
+- The length of the round is no secret of anybody's: it is a number of calls, and no call is named.
+- No time: a route has none. The order of the calls is all a plan says (D1).
+
+What it does not do: say where the courier is. Nothing does (D74).
+
+Tests: an order is found on its route once the route is stored, and not before; two clients whose orders share two routes are each given their own, counted along the whole route; everybody's are given oldest order first; an order that is pending, of another day, or of somebody with no orders is on none; a plan that is discarded leaves none; a client and an operator through the API; the day has to be said.
+
+### D79. An operator's page hears of a plan that was asked for elsewhere (in place)
+
+Decided with the project owner on 2026-10-13, as one of four things beyond the list of Phase 10.
+
+The stats stream sends a `plans` event, a `PlanChanged`, whenever a plan has changed, or one of its jobs has, or a plan is new. It carries the id of the plan and nothing else.
+
+- **In the API** the stream passes the notification of D48 on, and reads the queue again as it did before. `Heard::ChangedWith` is that: an event to send on, and a reason to read.
+- **On the page** an id that is neither the plan that is shown nor known to be of another day makes the page read the plans of its day again, once, however many words come in a third of a second. If the newest plan of the day is one the page did not know, it is shown, as the newest plan of a day is when the day is opened. An id that is not among the plans of the day is of another day, and is remembered as that until another day is shown.
+
+Why:
+
+- The id alone, as the notification has it (D48). The stream would have to read the plan to say its day, for every word of every plan, and most pages show another day.
+- The stats stream, because it is the one stream an operator's page always has open (D63).
+- Remembered as of another day: a plan is announced a dozen times while it is made, and each would otherwise be a read of the plans of a day it is not of. On a day that the demonstration plans elsewhere, a page read its plans once for it.
+
+What it does not do: tell a client anything. And a page that shows an older plan of a day, picked by hand, reads the plans of the day again at each word of a newer one.
+
+Measured in a headless Edge: a plan that a script asked for was shown on a page that nobody touched 0.33 seconds later against an API on the host, and 0.37 in the stack, with its routes being searched for.
+
+Tests: the stream names each of two plans that somebody else asked for, and names them again as their jobs are worked off and as one is discarded, with the id and nothing else; an order is no plan; the queue is read again after the plan is named.
+
+### D80. The page takes an account and an order, and lists a client's own (in place)
+
+What Phase 10 gave the page. Two of these were on its list. The others were taken by the project owner on 2026-10-13: that the list and the map point at each other, and that an operator and an admin can place an order by a click as well.
+
+- **An account.** The login has a second button. It opens an account with the address and the password of the form, through `POST /api/auth/register`, and logs in to it.
+- **An order by a click on the map,** for whoever is logged in.
+  - A click puts a marker there and opens a form: a delivery or a pickup, one to five parcels as the bot offers, and an address for people to read, if somebody likes. The order is for the day that is shown. Another click moves it.
+  - A day that has passed takes none. That is the page's rule: the API takes any day.
+  - Nothing is asked of the API before the button that places the order is pressed.
+- **Placed with a key (D76).** The key is 128 random bits, and is of the order as the form asks for it. When no answer comes, the order stays in the form, and the page says that pressing again cannot place it twice. Pressed again unchanged, it goes out with the key it had. Changed, it is another order and gets another key.
+- **What is clicked for itself keeps its click.** The stops, the depot, the lines of the routes and the vans are made with `bubblingMouseEvents: false`. So a click on a route's line opens its sheet, as before, and begins no order under it.
+- **"Your orders", for a client:** a row for each order of the day, with what has become of it. A pending one has a button that withdraws it. A planned one says `Van 3 has it: stop 12 of 86`, once its route is stored (D78).
+- **The list and the map point at each other.** A row shows its order on the map, with a ring round it. A click on an order marks its row.
+- **The streams.** A client's page opens the stream of D77 for the day it shows, and opens it anew when another day is picked. An operator's page takes the `plans` event of D79 from the stats stream.
+
+Why:
+
+- The same form for a client and for an operator: the API lets anybody with a token place an order, as their own (D41).
+- No list for an operator. An admin's orders are the demo orders (D46), two thousand of them on a large day. An operator has the routes and their sheets (D75).
+- The rows of the list are kept, as those of the routes are (D75). A row is made anew only when what it says has changed, so a button in it is still there when the mouse is let go.
+- `crypto.getRandomValues` and not `crypto.randomUUID`: a page has the second only where it was served over TLS or from the machine it is shown on.
+- The key is of what the form asks for, and not of the form: an order that was changed after it went out is another order, and the API would refuse it under the old key (D76).
+- The click on the map does not move the map. While Leaflet shows a move, it passes over the next one it is asked for (D75).
+
+What it does not do:
+
+- A client sees no route, no van and no sheet (D41).
+- An operator has no way to withdraw an order on the page. The API has one.
+- A place cannot be typed. The bot takes coordinates, and an address where it has a service to ask (D72).
+- When an answer is lost, the order may show in the list of a client while the form still says that it may or may not be placed: the stream has said so. Pressing again says the same, and closes the form.
+
+Found while it was tried: a click on the line of a route left a black box round the whole route. Leaflet listens for the focus of whatever has a tooltip. To the browser a line that is listened to like that is one a click gives the focus to, and it draws the outline of the focus as a box. That was so since Phase 9, which made the lines something to click. The page takes that outline off. Nothing on the map is reached by keyboard.
+
+The page has no tests of its own (D52). How it was tried is in `docs/plan.md`.

@@ -200,6 +200,24 @@ pub struct NewOrder {
     pub demand: u32,
 }
 
+impl NewOrder {
+    /// Whether `order` is the order this asks for: the same client's, of the same
+    /// kind, for the same day and place, with the same address and demand.
+    ///
+    /// A request that comes with a key the client has used before is answered with
+    /// the order that key placed (D76). This says whether that is an answer to the
+    /// request at all, or the key was used for something else. How the order stands
+    /// by now, pending or planned or withdrawn, is not part of what was asked for.
+    pub fn asks_for(&self, order: &Order) -> bool {
+        self.client_id == order.client_id
+            && self.kind == order.kind
+            && self.service_date == order.service_date
+            && self.location == order.location
+            && self.address == order.address
+            && self.demand == order.demand
+    }
+}
+
 /// Which orders to list. Every field that is set narrows the list.
 ///
 /// Orders are listed oldest first, which is the order of their ids (D11). So a list is
@@ -383,6 +401,31 @@ pub struct RouteStop {
     pub demand: u32,
 }
 
+/// Where a planned order is on its route: who calls, and when in the round (D78).
+///
+/// An order has one from the moment its route is stored. Before that, while the route
+/// is still searched for, it is planned and has none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct OrderStop {
+    pub order_id: OrderId,
+    /// The name of the courier whose route the order is on.
+    pub courier: String,
+    /// Which call of the route it is, counted from 0.
+    pub position: u32,
+    /// How many calls the route has.
+    pub stops: u32,
+}
+
+/// The day whose orders are asked about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
+pub struct OrderDay {
+    /// The day the orders are for.
+    pub service_date: NaiveDate,
+}
+
 /// What storing a finished route needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewRoute {
@@ -402,6 +445,53 @@ pub struct NewRoute {
 mod tests {
     use super::*;
     use crate::text::testing::assert_text_round_trips;
+
+    #[test]
+    fn an_order_is_what_was_asked_for_if_nothing_that_was_asked_for_differs() {
+        let asked = NewOrder {
+            client_id: UserId::generate(),
+            kind: OrderKind::Delivery,
+            service_date: NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+            location: LatLon::new(50.45, 30.52).unwrap(),
+            address: Some("Khreshchatyk St, 22".to_owned()),
+            demand: 2,
+        };
+        let placed = Order {
+            id: OrderId::generate(),
+            client_id: asked.client_id,
+            kind: asked.kind,
+            status: OrderStatus::Pending,
+            service_date: asked.service_date,
+            location: asked.location,
+            address: asked.address.clone(),
+            demand: asked.demand,
+            plan_id: None,
+            created_at: Utc::now(),
+        };
+        assert!(asked.asks_for(&placed));
+
+        // How the order stands by now is not what was asked for.
+        let planned = Order {
+            status: OrderStatus::Planned,
+            plan_id: Some(PlanId::generate()),
+            ..placed.clone()
+        };
+        assert!(asked.asks_for(&planned));
+
+        let differing: [fn(&mut NewOrder); 6] = [
+            |asked| asked.client_id = UserId::generate(),
+            |asked| asked.kind = OrderKind::Pickup,
+            |asked| asked.service_date = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap(),
+            |asked| asked.location = LatLon::new(50.45, 30.520_001).unwrap(),
+            |asked| asked.address = None,
+            |asked| asked.demand = 3,
+        ];
+        for (at, differ) in differing.into_iter().enumerate() {
+            let mut other = asked.clone();
+            differ(&mut other);
+            assert!(!other.asks_for(&placed), "difference {at}");
+        }
+    }
 
     #[test]
     fn every_enumeration_has_one_text_everywhere() {

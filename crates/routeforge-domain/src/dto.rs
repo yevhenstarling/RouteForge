@@ -11,7 +11,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::geo::LatLon;
-use crate::ids::UserId;
+use crate::ids::{PlanId, UserId};
 use crate::job::{QueueDepth, WorkerInfo};
 use crate::model::{NewOrder, OrderKind, Role, RouteBudget, User};
 
@@ -154,12 +154,25 @@ pub struct SystemStats {
     pub workers: Vec<WorkerInfo>,
 }
 
-/// What an `orders` event of the stats stream says: an order of this day was placed or
-/// withdrawn, so whoever shows the day reads its orders again (D63).
+/// What an `orders` event says: the orders of this day have changed, so whoever shows
+/// the day reads its orders again.
+///
+/// On the stats stream it is an order of anybody's that was placed or withdrawn (D63).
+/// On the stream of somebody's own orders it is one of theirs, and whatever became of
+/// it: placed, withdrawn, taken by a plan, put on a route or given back (D77).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct OrdersChanged {
     pub service_date: NaiveDate,
+}
+
+/// What a `plans` event of the stats stream says: this plan has changed, or one of its
+/// jobs has, or it is new (D79). It names the plan and says nothing of it. Whoever
+/// shows a day reads the plans of that day again if the plan is one they do not know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PlanChanged {
+    pub plan_id: PlanId,
 }
 
 /// Why a request was refused, in the shape of RFC 9457 (`application/problem+json`).

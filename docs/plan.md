@@ -37,6 +37,12 @@ Confirmed with the project owner:
 - **The vans of Phase 9 are reckoned on the page.** Each page moves its own vans along the stored routes, from the time since they set out on that page. Decided on 2026-10-13, while the phase was built. Reckoning from the clock of the database, positions sent in through an endpoint, and a simulator inside the system were offered beside it and not taken (D74).
 - **Phase 9 has one thing beyond its list:** the map and the route sheet point at each other. A sheet that follows its van, with the length of every leg stored for it, was offered beside that and not taken (D75).
 - **A route by road keeps the way it takes.** The solver asks the OSRM server for it, and it is stored with the route. That turns round the choice of 2026-10-12, for a label and straight lines (D73).
+- **Phase 10 has four things beyond its list.** All four that were offered on 2026-10-13, while the phase was built, were taken:
+  - the list of a client's orders and the map point at each other (D80);
+  - an operator and an admin place an order by a click as well (D80);
+  - an operator's page hears of a plan that was asked for elsewhere (D79);
+  - a client is told which courier has their order and which stop of the route it is (D78). That one changes what a client may read (D41).
+- **The key that makes an order safe to repeat is a header, and the bot does not ask again by itself.** Both were settled in the phase's plan. The header is `Idempotency-Key`. When no answer comes, the bot keeps the order open and says that pressing again cannot place it twice (D76).
 
 Derived from the description:
 
@@ -87,12 +93,12 @@ RouteForge/
 | 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | built; not tried against Telegram yet |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | L | done; free text for the bot was not built |
 | 9 | More to see on the map | Routes along the streets, vans driving them, a route getting shorter while it is searched for | M | done |
-| 10 | The client's page | A client placing an order on the page and seeing it planned, beside an operator's page | M | todo |
+| 10 | The client's page | A client placing an order on the page and seeing it planned, beside an operator's page | L | done |
 | 11 | Free text for the bot | An order placed by a sentence | M | not decided on; needs an Anthropic API key |
 
 **Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58). In the end one thing was dropped there: the LLM part, for which there was no key.
 
-Phases 9 to 11 were added when all of that was done, and nothing depends on any of them. Each stands by itself, so they can be taken in any order, or left. Phases 9 and 10 make a demonstration show more. Phase 11 is the one part of the approved description that is not built.
+Phases 9 to 11 were added when all of that was done, and nothing depends on any of them. Each stands by itself, so they can be taken in any order, or left. Phases 9 and 10 make a demonstration show more, and both are built. Phase 11 is the one part of the approved description that is not built.
 
 ## Phase 0: skeleton and tooling
 
@@ -463,7 +469,7 @@ Found while it was tried, and guarded against since:
 What is left, for whoever goes on:
 
 - The try with Telegram, as "Needed from the project owner" says. Free text with a key is Phase 11 now.
-- The known limits in the README. Each is a thing that was looked at and left. Phase 10 takes up two of them: a client's page that hears of nothing, and an order that can be placed twice.
+- The known limits in the README. Each is a thing that was looked at and left. Phase 10 took up two of them: a client's page that hears of nothing, and an order that can be placed twice.
 - Lines along the streets on the map. The routes are found by road and drawn straight (D66). That is in Phase 9 now.
 - A route that is searched through tours which overload its courier. The search takes up none, which can keep it from a shorter one where the loads are tight (D65).
 
@@ -550,9 +556,9 @@ What is left, for whoever goes on:
 
 ## Phase 10: the client's page
 
-Not begun, and not planned beyond this list. Added by the project owner on 2026-10-13.
+Built. What it was to hold was listed by the project owner on 2026-10-13, and how it was built was planned when the phase began. The request named Phase 9, which had been built and merged the same day. Asked which phase was meant, the project owner said this one. Four things beyond the list were offered there and all four were taken, and they are among the decisions at the top of this plan. With them the phase was sized M and came out L.
 
-What it is to hold:
+What it was to hold, as it was listed:
 
 - **An account opened on the page,** and an order placed there by a click on the map, and withdrawn there.
 - **A client's page that hears of its orders:** one that was placed elsewhere, and one that a plan has taken, with nobody pressing Refresh.
@@ -560,12 +566,105 @@ What it is to hold:
 
 Done when, in two browser windows: somebody opens an account on the page and places an order by a click on the map. The operator's page shows it at once. The operator plans the day, and the client's page shows the order as planned, with nobody pressing Refresh. And an order that is sent twice with the same key is stored once, so that the bot can say for certain whether an order was placed.
 
-What is known so far:
+All of that was shown, on the host and in the stack as a clone has it.
 
-- **A client can do nothing on the page today.** One who logs in sees the depot and their own orders (D52). The page has no way to open an account, and none to place or to withdraw an order. The API has had all three since Phase 4: `register`, `create_order` and `cancel_order`.
-- **A client's page has no stream.** The two streams there are, of a plan and of the queue, are for operators and admins (D41, D50). An operator's page hears of an order through the second (D63). What a client may hear of is their own orders, and nothing of anybody else's.
-- **An order can be placed twice today.** When the answer to it is lost on the way back, the bot says that it cannot tell whether the order was placed, and the person may press again (D61). That is among the known limits in the README, and so is the page of a client that shows a new order only after Refresh.
-- **The bot's requests are held to the API's document** (D64). Whatever carries the key, a header or a field, has to be in `openapi.json` before the bot's tests answer it.
+Delivered:
+
+- **A key that makes placing an order safe to repeat (D76).**
+  - In `routeforge-domain`: `IdempotencyKey`. Migration `0008_order_key.sql`, with `orders.idempotency_key`, which is unique for a client. `orders::place`, which is the statement of `create` with a conflict that changes nothing and returns the row that has the key. A repeat tells nobody. `NewOrder::asks_for` says whether an order is the one a request asks for.
+  - In the API: `POST /api/orders` takes the header `Idempotency-Key`. It answers `201` for a new order, `200` with the stored one for a repeat, and `422` for what is no key and for a key that has placed another order.
+  - In the bot: a draft has a key, which goes out with its order. When no answer comes, the draft stays, and the next press asks for the same order with the same key. A draft that is changed gets another. `FakeApi` places an order once for each key, as the API does, and can place one and lose the answer.
+- **Where a planned order is on its route (D78).** `OrderStop`, `routes::stops_of_day`, and `GET /api/orders/stops?service_date=`: the courier's name, which call of the route, and of how many. A client gets it for their own orders.
+- **A stream of one's own orders (D77).** `GET /api/orders/events?service_date=`, for anybody with a token, and `Pace::orders_every`. It says when something has become of an order of the caller's, and nothing of anybody else's.
+- **A plan that was asked for elsewhere (D79).** The stats stream names every plan that changes, in a `plans` event, a `PlanChanged`. `Heard::ChangedWith` is what a stream makes of a signal that is both: an event to send on, and a reason to read.
+- **The page (D80).**
+  - The login opens an account.
+  - A click on the map begins an order for the day that is shown, for whoever is logged in. It is placed with a key, and stays in the form when no answer comes.
+  - A client has a list of their orders: pending, planned with the courier and the stop, or withdrawn, and a button that withdraws. A row shows its order on the map, and a click on an order marks its row.
+  - A client's page opens the stream of its orders for the day it shows. An operator's shows a plan that was asked for elsewhere.
+  - Stops, the depot, the lines of routes and the vans keep their clicks to themselves.
+- The README says what a client has on the page. Two of its limits are gone, and four that are new are there. D76 to D80 are in the decision log, and D39, D41, D50, D52, D61 and D63 say what changed for them. `CLAUDE.md` has the rules that are easy to break here.
+
+The API has two endpoints more, 31 in all, and no new setting. In `openapi.json` there are the two operations, the header and the `200` of `create_order`, the third event of the stats stream in its words, and the schemas `OrderStop` and `PlanChanged`. Nothing was added to `Cargo.toml`, and the compose file and `.env.example` are as they were. The solver was not touched.
+
+Tests: 25 more. 11 are in the domain crate, which has 146 now, 12 in the API (145) and 2 in the bot (80). They hold:
+
+- a key to its letters and its length, and a key that is made to being one that no other is like;
+- an order with a key to being placed once, whoever asks again and however often, also when it was withdrawn or planned since, and four requests at once to being one order;
+- a request that waits for one that is then rolled back to placing the order itself;
+- a key to being its client's own, a repeat to announcing nothing, and the schema to refusing an empty key and one of 65 letters;
+- the API to `201`, then `200` with the same body, to `422` for each of five ways an order can differ and for each of five texts that are no key, and to asking for the token first;
+- where an order is to the whole route, counted from 0, for one client and for all, and to nothing before the route is stored and after its plan is discarded;
+- the stream of one's orders to one event for each thing that becomes of an order, with silence between, and to silence for whatever somebody else places, withdraws or has planned;
+- that stream to reading without a reason and when it may have missed something, to opening with its day, and to ending with its token and with the API;
+- the stats stream to naming each plan that changes, by its id and nothing else;
+- the bot to the same key on the second press, whether the first request was lost on the way there or on the way back, to another key for an order that was changed, and to the header the API's document has for it.
+
+The tests were tried against 60 faults put into the code on purpose: 21 in the domain crate, three of them in the migration, 29 in the API and 10 in the bot. One of them was no fault. Each of the other 59 made a test fail, one of them only after its test was changed:
+
+- **No fault:** one key for every draft, in the place where a draft is begun. A draft is given another key with every answer it gets, and it cannot go out before it has had three. So the key it begins with is never sent. Put in where the key of an order that goes out is made, the same fault failed its test.
+- **A test that waited without end.** With a stream of one's orders that opened with nothing, one test did not fail: it hung. It reads what a stream opens with, and there was nothing to read. It waits thirty seconds now, and fails.
+- **One fault needed a database of its own:** a key unique among all clients together. The index is in the migration and the statement names it, and a statement is checked against a database when it is compiled. So the tests of that fault were built against a database with the faulted schema.
+
+Before the faults were run, two were plain from reading, and each got its test first: nothing would have failed for a stream that looks where the orders of everybody are, since no test put somebody else's order on a route while a stream was watched; and nothing for an order that was changed by a button of an earlier question after it had gone out, and was sent with the key it had before.
+
+That second test showed something else. The bot gave a draft another key in two places, and the second, where the day of a draft has passed, came to nothing: such a draft cannot go out before it has a day again, and gets its key with that. It is gone.
+
+Among the others: an empty text, a space and 65 letters taken for a key; every key that is made the same; a key not stored; a repeat announced, reported as placed now, and answered `201`; an order with a key reported as there before; the schema taking an empty key, and one of any length; an order of another demand, address, place or client taken for the one that was asked for; a key that has placed another order answered with that order; a key that is none passed over; a key read and not used; an order placed without being looked at; the calls of a route counted among one client's rows, and from one; the stops of everybody, and of every day, given for one; a client told where everybody's orders are, and an operator only of their own; each of the two new paths registered after the one that takes an id; the word of an order passed on unread, whoever placed it; a stream deaf to an order, to a plan, and to having missed something; one that reads the orders of everybody, or of every day; one that does not look where the orders are, or how they stand; one that speaks at every read, or never reads unasked; the stats stream not naming the plan, naming another, naming it under another event, and not reading the queue again; the bot sending no key, a key of its own making, one under another header, a new one for every press, and one for every order; an order that got no answer said not to be placed, dropped, and given another key for the next press.
+
+Tried by hand, with the development database left alone. First with the API and a solver of four workers on the host, against a database made for it. Then in the stack: a clone of the phase branch in a directory of its own, with no `.env`, under another project name and on other ports, from images that were built there. The page was looked at in a headless Edge driven over the DevTools protocol, each page in a browser of its own, and the pictures were looked at.
+
+- **The stack, as a clone has it.** Built and up in 44 seconds, with the layers of the dependencies there already, and then, on a new volume, up in 9.8 seconds, with four solvers, the API healthy and the bot idling. The API's log began with the warning that it runs on the demonstration's values. The images are 140, 133 and 134 MB, as they were. `docker compose down` took 3.1 seconds.
+- **The "Done when", in two windows.** Somebody opened an account on the page, after a password of five letters was refused with the reason. A click on the map opened the form, and nothing was asked of the API until the button was pressed. The order was in their list as pending, and on the admin's page 0.34 seconds after the press, with nobody touching that page. The admin generated 40 orders and pressed Plan, with two seconds a route. The client's row said in turn that the order waits for its day to be planned, that a plan has taken it and its route is still searched for, and `Van 3 has it: stop 1 of 11`: that last 2.7 seconds after Plan was pressed. The client's page had asked nothing about plans.
+- **Taken back.** The admin discarded the plan, and the client's order was pending again. The client withdrew it, and the admin's page showed the withdrawal.
+- **Somebody else.** A third account placed an order for the same day. The admin's page showed it. The client's page showed nothing new, and in the two seconds after it asked the API nothing.
+- **An answer that was lost on its way back.** The answer to the client's order was failed in the browser, after the API had sent it. The page said that the order may or may not be placed, and to press again, and kept it in the form. The admin's page showed that it was placed. The second press was answered `200`, and the day had the order once.
+- **A key is of the order as it is asked for.** After a lost answer the parcels were changed from one to three before the button was pressed again. That went out with another key, and both orders were there: the one that got no answer, and the changed one. Pressed again unchanged, an order went out with the key it had, and was there once.
+- **The same by hand,** against the stack, with `curl`: `201`, then `200` with the same id, `422` for another order under that key and for a key of two words, and one order.
+- **The list and the map.** A click on an order marked its row and put a ring round it, and began no order under it. A row brought the map to its order.
+- **An operator.** The admin placed an order by a click. A click on an order began none. A click on the line of a route opened its sheet and began none, and a click on a van began none.
+- **A plan from elsewhere.** A script asked for a plan of the day the admin's page showed. The page showed it 0.37 seconds later, with its routes being searched for, and the client's page said where its order was on it. For a plan of another day the page read the plans of its own day once, and not once for each word of that plan, and showed what it had shown.
+- **The corners.** A day that had passed took no order, and the page said why. The stream that was open was of the day that was shown, after each change of the day. An order that was open went with the day, and was dropped when the day was one that had passed. After a reload the list and the stream were there again. Somebody else who logged in at the same browser saw nothing of the one before: no order, no ring, and an empty form.
+- **A login that ends,** with logins good for twenty seconds, on the host: the stream of a client ended after 21.0 seconds, for its token, and the page was at the login 22.1 seconds after it was logged in to, saying that the login had ended.
+- **The API stopped with a client's stream open,** in the stack: it had stopped 1.3 seconds after `docker compose stop api`, and the stream had ended because the API was stopping.
+- **The demonstration,** with `scripts/demo.ps1 scaling` on a new volume of that stack, since the statement that stores an order was changed: 15.2 seconds with one solver and 4.6 with four, the same four routes of 300 stops, 126.13 km. Those are the numbers of Phases 8 and 9.
+- **In every run** the browser held nothing against the page but its own notes of what was brought about on purpose: the password that was refused, the answer that was lost, and the depot that was asked for before there was one. The only hosts the pages asked were the API and the tile server.
+- **The tests, on Linux,** as in Phases 7 to 9: the whole workspace in a container of the image the `Dockerfile` builds on, 268 seconds with the compiling, all of it green.
+
+Not tried, because nothing of it was changed: the failure run of the demonstration, `scripts/demo.sh`, and the stack with the roads. The bot was tried as before, against stand-ins (D64).
+
+Where it differs from what was planned:
+
+- A draft of the bot's is given another key in one place, and not in two. The fault pass found the second to come to nothing.
+- An operator's page reads its orders again when it shows a plan that it heard of. Such a plan may have taken its orders already, and the page counted them as pending until the plan was done.
+- The images were built from Git Bash, with `BUILDX_BAKE_ENTITLEMENTS_FS=0`, and not from PowerShell. Both get round the same trap.
+- The page says `1 order` where it said `1 orders`. A client often has one.
+
+Found while it was tried, and guarded against since:
+
+- **A box round a route.** A click on the line of a route left a black box round the whole route. Leaflet listens for the focus of whatever has a tooltip, the browser takes a line that is listened to like that for one a click gives the focus to, and it draws the outline of the focus as a box. That was so since Phase 9, which made the lines something to click, and was not seen there. The page takes the outline off (D80).
+- **A page that showed an order five seconds late,** where the other showed it in a third of a second. It was the driver: with two tabs in one browser, the timers of the tab behind are held back. Each page has a browser of its own now, and the trap is among the known ones.
+- **A plan from elsewhere with its orders counted as pending,** which is above.
+
+Seen, and left:
+
+- When an answer is lost, the client's own stream may put the order into their list while the form still says that it may or may not be placed. Pressing again says the same, and closes the form (D80).
+- A stream that its page has left, for the stream of another day, stays with the API until it next writes and finds nobody there. Three of one page's were still open when the API was stopped, and ended with it (D77).
+
+What later phases need from it:
+
+- Phase 11: an order that a model asks for has to go through the draft, as a button's does. `Chats::place` sends the draft's key. A tool that built an `OrderRequest` and called `create_order` by itself would need a key that it keeps from one turn of the model to the next, or a second answer of the model's places a second order (D76).
+- Phase 11: `FakeApi::lose_next_answer` places an order and loses its answer. `fail_next` with `Failure::Away` is the request that never arrived.
+- The next migration is number 0009.
+- A new path of one word under `/api/orders` has to be registered before `/api/orders/{id}`.
+
+What is left, for whoever goes on:
+
+- An operator cannot withdraw an order on the page, and nobody can type a place there.
+- A client sees no route, no van and no sheet, and is told no time: a route has none (D78).
+- The page hears nothing of the depot or the couriers. A page that was open when an admin moved the one or added the other shows it after Refresh.
+- Nothing limits how many accounts are opened or how many streams one person holds. Both are among the known limits in the README.
+- The try with Telegram, as "Needed from the project owner" says, and Phase 11.
 
 ## Phase 11: free text for the bot
 
@@ -599,7 +698,7 @@ What is known so far:
 - **Two route jobs finishing at once** must not each see the other as unfinished. The plan row's counter update serializes them; Phase 2 has a test for it.
 - **`NOTIFY` can be missed** on a listener reconnect, and an expired lease sends none, so workers always poll as well, and so do the event streams of the API (D50). A payload has to be shorter than 8000 bytes. A change to a plan is announced by its id alone, and the progress of a search leaves its route out when it would not fit (D48, D49).
 - **Browser `EventSource` cannot send an `Authorization` header.** The page reads the SSE stream with `fetch`.
-- **An endless response hangs a test that reads its body to the end.** `Api::send` in the API's tests takes what an event stream opens with and drops the rest, and `Api::open` reads a stream one event at a time. Without the first, the test of who may call what would never return from the stats stream.
+- **An endless response hangs a test that reads its body to the end.** `Api::send` in the API's tests takes what an event stream opens with and drops the rest, and `Api::open` reads a stream one event at a time. Without the first, the test of who may call what would never return from the stats stream. A stream that opens with nothing hangs `Api::send` all the same: a test that reads one that way wraps it in `soon`.
 - **A graceful stop waits for an endless response.** actix-web drains its connections when it is told to stop and cuts no body short. The streams have to be ended first (D51).
 - **A token is accepted through the second it expires in.** jsonwebtoken refuses one when `exp` is less than now, not when it is equal. A stream that ended at `exp` could be opened again for the rest of that second, so it ends a second later (D50).
 - **Leaflet draws a canvas in the order things were added to it.** Dots that are drawn again cover a line that was there before them. The page draws its lines in SVG, above the canvas of the dots (D52). A tooltip that is given a string takes it as HTML, so the page gives it an element.
@@ -652,7 +751,15 @@ What is known so far:
 - **JavaScript shifts in 32 bits.** `31 << 30` is not thirty-one times two to the thirtieth. The page reads the numbers of an encoded line with multiplication, and the domain crate, which has 64 bits, refuses a number of more than seven letters.
 - **OSRM's length of a way is not the length of its line from point to point.** Measured along great circles between its points, a way came out 0.2 % shorter than OSRM says it is. Whatever compares the two has to allow for that.
 - **PowerShell rounds a fraction away in `[math]::Min(1, 0.5)`.** With a whole number among its arguments it takes the function for whole numbers, and the answer is `0`. Write `1.0`. It made every great-circle length nought in a script that checked the lengths of Phase 8, and none of the repository's scripts has it: `scripts/demo.ps1` takes the least of whole numbers.
-
+- **`/api/orders/{id}` takes any one word.** A path is given to the first route it fits. `/api/orders/stops`, registered after the route that takes an id, is answered `400`: `stops` is no UUID. A path of one word under a path that takes an id has to be registered before it (D77, D78).
+- **`ON CONFLICT DO UPDATE` is how one statement answers with the row that was there** (D59, D76). On an index that covers only some rows the statement has to say which: `ON CONFLICT (client_id, idempotency_key) WHERE idempotency_key IS NOT NULL`. Whether the row that comes back is new is read off its id, which the application made.
+- **A function that returns nothing can stand in a `CASE`.** `CASE WHEN … THEN pg_notify(…) END` notifies for some rows and not for others, in the statement that changes them. sqlx reads the column as an optional unit.
+- **utoipa says of an optional header that it may be null.** Of an optional query parameter it does not. `nullable = false` among the attributes of the parameter puts that right, and `min_length`, `max_length` and `pattern` are taken there too.
+- **A line with a tooltip takes the focus of a click.** Leaflet listens for the focus of whatever has a tooltip. To Chromium an SVG element that is listened to like that is one a click gives the focus to, and it draws the outline of the focus as a box round the whole element: a black rectangle round a route. `.leaflet-interactive:focus { outline: none; }` in the page's style takes it off (D80).
+- **A click on something on the map is a click on the map as well.** Leaflet passes the click of a layer on to the map unless the layer was made with `bubblingMouseEvents: false`. What is not `interactive` lets the click through to the map and has nothing to say about it.
+- **`crypto.randomUUID` is there only where the page is trusted:** over TLS, or from the machine itself. Served over plain HTTP from another machine, a page has `crypto.getRandomValues` and no more.
+- **A tab that is not in front is slow to show what it heard.** In a headless Edge with two tabs, the timers of the tab behind are held back. A page reads its orders a third of a second after it hears of one, by a timer, and the tab behind showed the order 5.4 seconds late where the one in front took 0.37. To try two pages at once, give each a browser of its own: another `--remote-debugging-port`, another `--user-data-dir`.
+- **An answer is lost on its way back, in a browser, at the stage of the response.** `Fetch.enable` with `requestStage: 'Response'` and then `Fetch.failRequest`: the request has reached the API, and the page gets an error. At the stage of the request it never arrives, which is the other case. What is let through at that stage is let through with `Fetch.continueResponse`.
 ## Needed from the project owner
 
 - `sqlx-cli` on any machine where a query or a migration is changed. The command that installs it is at the top of `scripts/sqlx-prepare`.
@@ -670,6 +777,7 @@ What is known so far:
 
   With `GEOCODER_URL` set as well, step 4 has a second way in: write an address where the location was shared, and press the button of the place.
 - For Phase 9: nothing new. The lines along the streets show where an OSRM server is asked, which takes the roads that `scripts/osrm-prepare` fetches. An OSRM server that was started before Phase 9 takes a way through 500 positions and no more: `docker compose up` makes it anew from the compose file as it is now.
+- For Phase 10: nothing. An account for the client's page is opened on the page, and the admin is the one the stack starts with.
 - For Phase 11, the free text of the bot: the decision whether to build it, and an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58). The phase is not begun without the key.
 - The owner said on 2026-10-12 that the bootcamp holds the project to nothing formal: no rubric, and no word on whether the bot may come without its LLM part. If that changes, the README's paragraph on the bot is where the difference from the approved description is said.
 
@@ -687,3 +795,4 @@ What is known so far:
 10. Load: on the page, each route says the most its van has on board, and none says more than the van carries. With the demo city's vans, three of four leave the depot full (D65).
 11. Numbers: `cargo run -p routeforge-tsp --release --example quality` and `cargo bench -p routeforge-tsp` print what the README's tables were made from.
 12. The map: while a plan is searched for, each route has a chart in its row that falls, for seconds if the day has 1200 orders. When the plan is done, a van sets out along each route and is back within a minute, and the page says that the vans are simulated. The button in a route's row, or a click on its line, opens its sheet, and a row of the sheet shows its stop. With the roads of step 9 the stored routes follow the streets, and so do the vans (D73 to D75).
+13. The client's page, in two windows on one day. In the first, press "Open an account" with an address and a password of your own, click the map, and place the order: it is in your list as pending. In the second, as the admin, the order is on the map with nobody pressing Refresh. Press Plan there: the first window shows the order as planned, and then which van has it and which stop it is. Discard the plan, and it is pending again; withdraw it, and the admin's window says so. And by hand: `POST /api/orders` twice with the same `Idempotency-Key` is answered `201` and then `200`, with one order (D76 to D80).

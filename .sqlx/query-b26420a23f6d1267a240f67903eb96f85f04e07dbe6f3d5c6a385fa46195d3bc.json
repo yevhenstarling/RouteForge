@@ -1,0 +1,60 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT stops.order_id, couriers.name AS courier, stops.position,\n                  (SELECT count(*) FROM route_stops AS calls\n                   WHERE calls.route_id = stops.route_id) AS \"calls!\"\n           FROM orders\n           JOIN route_stops AS stops ON stops.order_id = orders.id\n           JOIN routes ON routes.id = stops.route_id\n           JOIN couriers ON couriers.id = routes.courier_id\n           WHERE orders.service_date = $1\n             AND ($2::uuid IS NULL OR orders.client_id = $2)\n           ORDER BY orders.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "order_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "route_stops",
+            "name": "order_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "courier",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "route_stops",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "calls!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "b26420a23f6d1267a240f67903eb96f85f04e07dbe6f3d5c6a385fa46195d3bc"
+}

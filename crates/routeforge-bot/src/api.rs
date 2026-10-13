@@ -18,8 +18,8 @@ use anyhow::Context;
 use chrono::NaiveDate;
 use reqwest::{Client, RequestBuilder};
 use routeforge_domain::{
-    Depot, Order, OrderFilter, OrderId, OrderRequest, Plan, PlanFilter, PlanRequest, Problem,
-    Session, TelegramLogin,
+    Depot, IdempotencyKey, Order, OrderFilter, OrderId, OrderRequest, Plan, PlanFilter,
+    PlanRequest, Problem, Session, TelegramLogin,
 };
 use serde::de::DeserializeOwned;
 
@@ -62,10 +62,14 @@ pub(crate) trait Api: Send + Sync + 'static {
         request_id: &str,
     ) -> impl Future<Output = Result<Session, Failure>> + Send;
 
+    /// Places an order, once for each key (D76): asked again with the key of an
+    /// order that was placed, the API answers with that order and places nothing.
+    /// So an order whose answer was lost can be asked for again.
     fn create_order(
         &self,
         who: &Caller<'_>,
         order: &OrderRequest,
+        key: &IdempotencyKey,
     ) -> impl Future<Output = Result<Order, Failure>> + Send;
 
     /// One page of the orders that pass the filter, oldest first (D44).
@@ -217,8 +221,17 @@ impl Api for HttpApi {
         self.answer(asked, &self.service_key, request_id).await
     }
 
-    async fn create_order(&self, who: &Caller<'_>, order: &OrderRequest) -> Result<Order, Failure> {
-        let asked = self.client.post(self.url("/api/orders")).json(order);
+    async fn create_order(
+        &self,
+        who: &Caller<'_>,
+        order: &OrderRequest,
+        key: &IdempotencyKey,
+    ) -> Result<Order, Failure> {
+        let asked = self
+            .client
+            .post(self.url("/api/orders"))
+            .header(IdempotencyKey::HEADER, key.as_str())
+            .json(order);
         self.answer(asked, who.token, who.request_id).await
     }
 

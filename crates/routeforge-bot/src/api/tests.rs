@@ -14,7 +14,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::*;
-use crate::testing::{a_delivery, a_depot, a_plan, a_user, an_order, date, documented};
+use crate::testing::{
+    a_delivery, a_depot, a_plan, a_user, an_order, date, documented, documented_headers,
+};
 
 const KEY: &str = "the key the bot shows, in the tests of its requests";
 const TOKEN: &str = "the.token.of-the-person";
@@ -130,7 +132,8 @@ async fn everything_else_is_asked_with_the_token_of_the_person() {
     let plan = a_plan(date(13), me);
 
     answers(&server, "create_order", None, sent(201, &order)).await;
-    let placed = api.create_order(&WHO, &a_delivery(date(13), 2)).await;
+    let key = IdempotencyKey::new("press-1").unwrap();
+    let placed = api.create_order(&WHO, &a_delivery(date(13), 2), &key).await;
     assert_eq!(placed.unwrap(), order);
     let request = asked_as_the_person(&server).await;
     assert_eq!(
@@ -143,6 +146,20 @@ async fn everything_else_is_asked_with_the_token_of_the_person() {
             "demand": 2,
         })
     );
+    // With the key that makes it safe to ask again (D76), in the header the API's
+    // own document has for it. A header by another name would be passed over there
+    // without a word, and the order placed twice after all.
+    assert_eq!(header(&request, IdempotencyKey::HEADER), "press-1");
+    assert_eq!(documented_headers("create_order"), [IdempotencyKey::HEADER]);
+    server.reset().await;
+
+    // Asked again, the API answers `200` and not `201`, with the order it has. To
+    // the bot that is the order all the same.
+    answers(&server, "create_order", None, sent(200, &order)).await;
+    let again = api.create_order(&WHO, &a_delivery(date(13), 2), &key).await;
+    assert_eq!(again.unwrap(), order);
+    let request = asked_as_the_person(&server).await;
+    assert_eq!(header(&request, IdempotencyKey::HEADER), "press-1");
     server.reset().await;
 
     answers(&server, "get_order", Some(order.id), sent(200, &order)).await;

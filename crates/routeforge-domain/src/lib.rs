@@ -24,20 +24,23 @@ mod text;
 
 pub use dto::{
     CourierChange, DemoCreated, DemoRequest, FieldError, Login, OrderRequest, OrdersChanged,
-    PlanRequest, Problem, RoleChange, Session, SystemStats, TelegramLogin,
+    PlanChanged, PlanRequest, Problem, RoleChange, Session, SystemStats, TelegramLogin,
 };
 pub use geo::{
     DistanceProvider, DistanceTable, Distances, EARTH_RADIUS_M, Haversine, InvalidLatLon,
     InvalidPolyline, LatLon, Planar, Polyline, Projection, haversine_m,
 };
-pub use ids::{CourierId, DepotId, JobId, OrderId, PlanId, RouteId, UserId, WorkerId};
+pub use ids::{
+    CourierId, DepotId, IdempotencyKey, InvalidKey, JobId, OrderId, PlanId, RouteId, UserId,
+    WorkerId,
+};
 pub use job::{
     Job, JobKind, JobPayload, JobProgress, JobStatus, QueueDepth, RouteJob, RouteProgress,
     WorkerInfo,
 };
 pub use model::{
     Courier, Credentials, Depot, NewCourier, NewDepot, NewOrder, NewPlan, NewRoute, NewUser, Order,
-    OrderFilter, OrderKind, OrderStatus, Plan, PlanCounts, PlanFilter, PlanStatus, Role, Route,
-    RouteBudget, RouteStop, UnlimitedBudget, User,
+    OrderDay, OrderFilter, OrderKind, OrderStatus, OrderStop, Plan, PlanCounts, PlanFilter,
+    PlanStatus, Role, Route, RouteBudget, RouteStop, UnlimitedBudget, User,
 };
 pub use text::UnknownVariant;

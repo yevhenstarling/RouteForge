@@ -25,6 +25,17 @@ What there is to see on the page:
 - **Vans that drive the routes** of a plan that is done. They are simulated. Each page moves its own along the stored routes, at a speed at which the longest route takes a minute. Nothing tracks a courier, and the project is not to.
 - **A route sheet** for each stored route: its stops in the order the courier calls, with what is on board after each. A click on a route's line opens its sheet, and a row of the sheet shows its stop on the map.
 - **The queue and the workers,** as they are.
+- **A plan that was asked for elsewhere,** by chat, by a script or in another window: a page that shows its day shows the plan as it is made.
+
+And what a client has, in a second window:
+
+- **An account.** "Open an account" on the login makes one, with an address and a password of your choosing. It is a client's: it places orders and sees its own.
+- **An order by a click on the map,** for the day that is shown. An operator and the admin can place one that way too.
+- **A list of your orders,** which says what has become of each: pending, planned or withdrawn. A pending one can be withdrawn there. It hears of all that by itself.
+
+With the admin's window on the same day, the order is on the admin's map as it is placed. Plan the day there, and the client's order goes from pending to planned, and then says who has it: `Van 3 has it: stop 12 of 86`. That is all a client is told of a route.
+
+An order is placed once. The page and the bot send a key with it, so when the answer is lost on its way back, the order can be asked for again and the API answers with the one it has.
 
 That login, and the key that signs the tokens, are in this repository for everybody to read. They are for a demonstration on your own machine, which is the only place the ports are open to. Set your own in a `.env` before opening them to anything else: `.env.example` lists every setting. Until you do, the API says so in its log every time it starts.
 
@@ -185,10 +196,12 @@ What the system does not do, or does only up to a point:
 - **A login is counted by its address.** After five tries in a minute the next is refused, so somebody who knows an address can keep its owner out for as long as they keep trying. The count is in the memory of the one API.
 - **A token lasts until it expires.** A role that an admin changes applies from the user's next login, an hour later at the most.
 - **Nothing limits the bot's endpoint,** or how many accounts it makes. The bot's key is one key, and changing it means starting both again.
-- **An order can be placed twice** when its answer is lost on the way back and the person presses again. There is no key that makes the request safe to repeat.
+- **Nothing limits how many accounts are opened on the page** either. Each costs the API one hashed password, of which it does four at a time.
 - **A message that Telegram refuses for coming too fast** is logged and not sent again.
-- **A client's page has no live stream.** It shows a new order, and anybody's page a plan that was asked for elsewhere, after Refresh.
-- **Nothing limits how many event streams one person holds open.**
+- **A client is told where their order is in the round, and not when.** A route has no times. And a client sees no route, no van and no sheet.
+- **On the page an operator can place an order, and cannot withdraw one.** The API lets them. A place cannot be typed there either: it is clicked.
+- **The depot and the couriers are read when the page is.** One that an admin has moved or added shows on a page that was open after Refresh.
+- **Nothing limits how many event streams one person holds open,** and since a client has a stream too, that is anybody with an account.
 - **One address search a second,** for all the chats of the bot together, which is what the public service allows.
 - **A route of more than 2000 stops** is more than the OSRM server is started for, and is searched for on great circles.
 - **The page is tried by hand.** The tests check that it is served and what it loads, and not what it does.

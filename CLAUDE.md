@@ -25,7 +25,7 @@ The whole stack, as somebody who has just cloned the repository gets it (D54):
 docker compose up --build --scale solver=4
 ```
 
-The page with the map is then at `http://127.0.0.1:8080/` and Swagger UI at `http://127.0.0.1:8080/docs/`. The admin is `admin@example.com` with the password `routeforge`, unless `.env` says otherwise. On a database with no depot and no courier, an admin gets a button on the page that sets up a demo city.
+The page with the map is then at `http://127.0.0.1:8080/` and Swagger UI at `http://127.0.0.1:8080/docs/`. The admin is `admin@example.com` with the password `routeforge`, unless `.env` says otherwise. On a database with no depot and no courier, an admin gets a button on the page that sets up a demo city. A client's account is opened on the page, by the second button of the login (D80).
 
 `scripts/demo.ps1` (or `.sh`, which needs `curl` and `jq`) makes the scaling run and the failure run on that stack (D57). It plans tomorrow, and on that day it cancels and discards the plans that are in its way.
 
@@ -77,9 +77,14 @@ An API that is to take a bot needs `BOT_SERVICE_KEY` as well, of at least 32 byt
 - A job's heartbeat, its search and the announcer of its progress belong to the job's future. Put one of them into a task of its own and a job that is dropped keeps its lease, or its thread (D34). An event stream of the API is likewise a value its response owns, with no task behind it (D50).
 - A change to a plan or to one of its jobs goes through `db::queue`, which tells whoever watches the plan, in the transaction of the change. A new way to change either has to tell them too, with the plan's id and nothing else as the payload (D48).
 - An order that is placed or withdrawn announces its day on `routeforge_orders`, in the statement of the change. A new way to change an order that no plan announces has to do the same, with the day and nothing else as the payload (D63).
+- An order is placed through `orders::place`, once for each key of a client. A request that places nothing announces nothing, and is answered `200` and not `201`. A key answers for one order: the handler compares what was asked for with what the key placed, and refuses the rest (D76).
+- The stream of somebody's own orders passes no signal on as it comes. A signal is a reason to read, the read is of the caller's own orders, and the stream speaks only when that read differs from the last. Anything else tells a client of somebody else's order (D77).
+- Of a route, a client is told where their own order is on it and nothing else. `routes::stops_of_day` is the one query that says it, for the endpoint and for the stream, and it counts the calls of the whole route (D78).
+- `/api/orders/stops` and `/api/orders/events` are registered before `/api/orders/{id}`. A path goes to the first route it fits, and any word fits `{id}`. A new path of one word under `/api/orders` has to stand before it too.
 - The bot asks the API with a token of the person it is talking to. Its key is for `telegram_login` and for nothing else, and it keeps no token from one update to the next (D9, D60).
 - In the bot, `chat.rs` has no teloxide in it, and `telegram.rs` decides nothing. What the bot says and does is written in `chat.rs` and tested against `FakeApi` (D61).
 - In the bot, what changes something is done by the press of a confirming button and by nothing before it (D9, D61).
+- In the bot, a draft's key changes when the draft does, and at no other time. Between two presses of the same order it stays, or the second press places a second order (D76). One press is one request: the bot does not ask again by itself.
 - A request of the bot's that is new, or goes to another path, needs its operation in `crates/routeforge-api/openapi.json`: the bot's tests answer only where that document says (D64).
 - Neither the Telegram token nor the bot's key may reach a log. Never format a teloxide `Bot`: its `Debug` shows the token (D62).
 - What a person writes to the bot goes to the geocoding service, if there is one, and nowhere else: not into a log, and not into an error. A reqwest error names the address it asked, query and all, so it goes through `without_url()` first (D72).
@@ -89,7 +94,9 @@ An API that is to take a bot needs `BOT_SERVICE_KEY` as well, of at least 32 byt
 - The page is served with a policy that names its one `<script>` and its one `<style>` by their hash, and allows no other inline code (D69). So the page has one of each, without attributes, and no `style` attribute and no handler in an attribute anywhere. What the browser refuses shows in its console and nowhere else.
 - The page makes its SVG with Leaflet's `L.SVG.create`, and names no namespace: to the test that reads the page for other hosts, a namespace is an address (D75).
 - What moves on the page is a simulation, and the page says so beside it. Nothing reports where a courier is, and nothing is to: tracking is among what the approved description rules out. The vans are reckoned on the page, from the routes as they are stored (D74).
-- The list of routes on the page replaces a row only when what it says has changed. Written anew with every event of a search, a button in a row cannot be pressed (D75).
+- The list of routes on the page replaces a row only when what it says has changed. Written anew with every event of a search, a button in a row cannot be pressed (D75). The list of a client's orders is kept the same way (D80).
+- A click on the map begins an order. Whatever is drawn on the map and is clicked for itself, a stop, the depot, the line of a route or a van, is made with `bubblingMouseEvents: false`, or a click on it begins an order under it (D80).
+- On the page, the key of an order is of what the form asks for. It is kept while that is unchanged, so that an order whose answer was lost goes out again with the key it had, and made anew when it changes (D76, D80).
 - `rust-toolchain.toml` and the base image in the `Dockerfile` name the same compiler. Change them together (D10).
 - `docker compose up` has to work on a clone with no `.env`. A variable the compose file hands to a service needs a fallback there when the binary has no default for it. A test in `crates/routeforge-api/src/config.rs` holds the fallbacks of the `api` service to what the API starts with, and one in `crates/routeforge-bot/src/config.rs` those of the `bot` service (D54). The bot and the API have to fall back to the same `BOT_SERVICE_KEY`. The three values that are no secrets are constants of the API as well, which warns when it starts on one of them: change them in both places (D70).
 - What asks a service outside the stack is off on a clone: OSRM is behind a compose profile, and the bot's geocoder has no value to fall back on (D8, D67, D72).

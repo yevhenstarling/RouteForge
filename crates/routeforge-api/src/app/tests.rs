@@ -46,6 +46,8 @@ const MATRIX: &[(&str, &str, Needs)] = &[
     ("post", "/api/auth/telegram", Needs::Bot),
     ("post", "/api/orders", Needs::Anyone),
     ("get", "/api/orders", Needs::Anyone),
+    ("get", "/api/orders/stops", Needs::Anyone),
+    ("get", "/api/orders/events", Needs::Anyone),
     ("get", "/api/orders/{id}", Needs::Anyone),
     ("post", "/api/orders/{id}/cancel", Needs::Anyone),
     ("get", "/api/depot", Needs::Anyone),
@@ -476,6 +478,7 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
     for named in [
         "Order",
         "OrderRequest",
+        "OrderStop",
         "TelegramLogin",
         "Plan",
         "PlanRequest",
@@ -500,11 +503,16 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
         "JobProgress",
         "JobStatus",
         "OrdersChanged",
+        "PlanChanged",
     ] {
         assert!(schemas.get(named).is_some(), "no schema for {named}");
     }
     // A stream says that it is one, and what a caller who is kept out is answered.
-    for path in ["/api/plans/{id}/events", "/api/system/stats/events"] {
+    for path in [
+        "/api/plans/{id}/events",
+        "/api/system/stats/events",
+        "/api/orders/events",
+    ] {
         let responses = &document["paths"][path]["get"]["responses"];
         let stream = &responses["200"]["content"]["text/event-stream"];
         assert_eq!(stream["schema"]["type"], "string", "{path}");
@@ -560,6 +568,34 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
             "schema": { "type": "string", "format": "uuid" },
         }])
     );
+
+    // Placing an order says what makes it safe to repeat, and that a repeat is
+    // answered with the order and another status (D76). The bot reads the name of the
+    // header from here.
+    let placing = &document["paths"]["/api/orders"]["post"];
+    assert_eq!(
+        placing["parameters"],
+        json!([{
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "What makes the request safe to repeat: 1 to 64 letters, digits, \
+                dots, underscores or hyphens, made up by the caller. A UUID will do",
+            "required": false,
+            "schema": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9._-]+$",
+            },
+        }])
+    );
+    for status in ["200", "201"] {
+        assert_eq!(
+            placing["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Order",
+            "{status}"
+        );
+    }
 
     // Nothing in the document points at a schema it does not have.
     let text = document.to_string();
