@@ -802,6 +802,13 @@ What Phase 8 added to it:
 - **Beside the stops of a route, the most its courier has on board** along it, and how much the courier carries: `at most 131 of 132 on board` (D65).
 - **A plan is drawn from its own depot** (D71). When the depot has been moved since the plan was made, the plan's depot is on the map as well, as a grey dashed ring.
 
+What Phase 9 added to it:
+
+- **A stored route is drawn along the streets it takes,** where it was measured by road and the routing service gave its way (D73). A search under way is a dashed straight line, as before.
+- **Vans that drive the routes of a plan that is done.** They are a simulation, which the page says beside them (D74).
+- **A small chart in the row of a route,** of its length while it was searched for (D75).
+- **A route sheet:** the stops of a route in calling order, with what is on board after each. A click on a route's line opens it, and a row of it shows its stop on the map (D75).
+
 What the page does not do. Until Phase 7 it learned of an order that somebody else had placed only when Refresh was pressed. An operator's page hears of one now (D63). A client's has no stream, and still shows it after Refresh.
 
 The page has no tests of its own. The API's tests check that it is served and what it loads. What it does was tried in a browser: `docs/plan.md` says how.
@@ -1390,3 +1397,57 @@ Good to know:
 - The solver logs the length of the way beside the length of the route when it stores one, as `path_m` beside `distance_m`. Two that differ by more than a fraction of a percent are a line of another route.
 
 Tests: the format's published example read and written; lines of random positions read back as they were written; text that is no line refused, in JSON as well; a route stored with its way beside routes without one, and each read with its own; the check that keeps a way off a route on great circles. The request as OSRM takes it, longitude first; each way of failing, by its name; the first route of an answer; fewer than two positions not asked about. A route by road stored with the way of the order it is driven in, on a ring that is driven one way and on the same ring driven the other, of which one has the search's tour turned round; a route stored by road without a way when the service gives none; a route on great circles asking for none; the lease kept while the way is waited for, and the wait ended by a cancel; the compose file starting the server for a way one position longer than its longest table; a route read through the API with its way.
+
+### D74. The vans on the map are a simulation, and each page reckons its own (in place)
+
+Decided with the project owner on 2026-10-13. Three other ways were offered and not taken: reckoning from the clock of the database, positions sent in through an endpoint by a script that plays the couriers, and a simulator inside the system that writes positions for the streams to pass on.
+
+- **A van for each stored route of a plan that is done.** It drives along what the route is drawn with: the way along the streets where the route has one, and the straight legs where it has none (D73).
+- **Each page moves its own.** Where a van is, is reckoned from the route as it is stored and from the time since the vans set out on that page. The API is asked nothing for it, nothing is stored, and no clock is compared with another.
+- **They set out when the page sees the plan done.** For a page that watched, that is when the last route is stored. For a page that opens the plan later, or is told to read it again, it is when the plan is shown.
+- **One speed for all,** at which the longest route of the plan takes a minute. A van with a shorter route is back sooner.
+- **A button stops them, and sends them out again.** Where the browser is asked for less motion (`prefers-reduced-motion`) they do not set out by themselves, and the button is how they start.
+- **They are called simulated** where they are shown, and in the README.
+
+Why:
+
+- The approved description has live GPS tracking of couriers among what the project will not do. A van that is moved for show does not change that, as long as nothing reports where a courier is and nothing keeps it. An endpoint that takes positions would be the first half of tracking, whoever sends them.
+- Each page for itself, and not from the clock of the database, because it needs nothing new and has nothing to go wrong. Two pages that watch a plan hear that it is done within a fraction of a second of each other, and so their vans agree. What is given up is a page that is opened later: it starts the vans at the depot, where a shared clock would show them on their way, or back. For that the API would have to say how long ago the plan was done, as a span and not as a time (D6), and the plan's stream would have one event more.
+- A minute for the longest route, and not a speed in kilometres an hour. By road the routes of the demonstration are four times as long as on great circles. At forty kilometres an hour and a minute for an hour, the one day would be over in under a minute and the other would take four.
+- The time is read when a picture is drawn. A tab that was hidden draws none, and shows the vans where they have got to when it is looked at again.
+- A van is a disc in a pane of its own above the depot, drawn by Leaflet in SVG like the lines. Nothing in it needs an exception from the policy of the page (D69).
+
+What it does not do:
+
+- A van does not wait at a stop, and nothing says which stops it has called at. A sheet that follows its van was offered on 2026-10-13 and not taken. It would need the length of every leg of a route, which is not stored (D73).
+- Refresh, and picking the plan again, send the vans out again from the depot.
+- A plan that is not done has no vans, and a discarded one loses them.
+
+### D75. The chart of a search and the route sheet are the page's (in place)
+
+Both are made of what the page has already, and the API was not changed for either.
+
+- **The chart.** Each `progress` event of the plan's stream says how long the best route of a search is by then (D49). The page keeps those lengths for each route job, and draws them in the route's row as a small staircase: a length holds until the search announces a shorter one.
+  - Across is the share of the plan's budget that is used up: of its time if it has one, and of its moves otherwise. So the line reaches the right edge as the search ends.
+  - Up is the length, from the shortest so far to 2 % above it. What is longer runs off the top, and the row says the first length in words.
+  - It is the length as the search measures it. By road that is a little off the length the route is stored with (D66), and the number beside the chart is the stored one.
+- **The route sheet.** A stored route has a button that opens it as a list: the depot with what the van leaves with, each stop with its number, whether it is a delivery or a pickup, its address or its position, the parcels that come off or on, and what is on board after it, and the depot again with what the van brings back.
+- **The map and the sheet point at each other.** A click on the line of a stored route opens its sheet, and the line of the open sheet is drawn thicker. A press on a row of the sheet moves the map to that stop and puts a ring round it. This is the one thing in Phase 9 beyond its list, taken by the project owner on 2026-10-13.
+- **The list of routes is no longer written anew with every event.** A row is replaced only when what it says has changed.
+
+Why:
+
+- Nothing stores what a search announces (D49), and the chart does not change that. So a page that did not see a search has no chart of it, and a page that came in the middle has the rest. The lengths are kept while the page is logged in, so that Refresh and a look at another plan do not lose them.
+- The scale of the chart. A route loses a fifth of its length in the first quarter of a second and a hundredth or two in all the seconds after (D49). On a scale from the first length to the last that is a cliff and a flat line. With 5 % above the shortest, the fall that goes on took the lowest third of the chart or less. With 2 % it takes up to four fifths.
+- The same share for every route, and not each chart stretched to its own fall: so the charts of a plan can be compared, and a route that gained nothing shows a flat line and not a small gain made large.
+- The loads of the sheet and the words `at most 131 of 132 on board` come from one function. The sheet is the sum written out (D65).
+- The rows had to stay. While a plan is searched for, the list was written anew up to sixteen times a second, and a button that is replaced between the press of the mouse and its release is not pressed. The same would lose the place of whoever moves through the page by keyboard.
+- The chart is SVG that the page makes with Leaflet's own function for it. So the page names no namespace, and the test that it names no host but the tile server holds as it is (D52).
+
+What they do not do:
+
+- The sheet has no distances. The length of a leg is not stored, only that of the whole route (D73).
+- A search that was over before its first announcement has no chart: a chart takes two lengths.
+- Neither is there for a client, who sees no plan (D41).
+
+Tried in a headless Edge, against an API and solvers on the host. On a day of 300 orders on four vans, the chart of each route fell once, a quarter of a second in, and stood: one went from 146.97 km to 129.49 km. On a day of 1200 orders the charts went on falling for one to six of the ten seconds: one route went from 78.64 km to 63.87 km at once, and to 62.84 km in four steps after. A sheet of 86 stops left the depot with 131 on board and came back with 37, and the most in its column was the 131 its row names. A row brought the map to its stop, which was in the Dnipro: a demo order is a random point (D46).

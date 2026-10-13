@@ -98,6 +98,26 @@
   li .name { font-weight: 600; }
   li .numbers { font-variant-numeric: tabular-nums; text-align: right; }
   li .detail { grid-column: 2 / 4; color: var(--muted); }
+  /* The length of a route while it was searched for. It is stretched to the width of
+     its row, and its lines keep their thickness all the same. */
+  li .chart { grid-column: 2 / 4; width: 100%; height: 30px; }
+  .chart path { fill: none; vector-effect: non-scaling-stroke; }
+  .chart .floor { stroke: var(--line); stroke-width: 1; }
+  .chart .fall { stroke-width: 1.6; stroke-linejoin: round; }
+  button.small { padding: 1px 8px; font-size: 12px; }
+  li .sheet { grid-column: 2 / 4; justify-self: start; margin: 2px 0; }
+
+  /* The route sheet: long for a long route, so it scrolls by itself. */
+  #sheet-rows { max-height: 44vh; overflow-y: auto; margin-top: 6px; border: 1px solid var(--line); border-radius: 5px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 3px 6px; text-align: left; vertical-align: baseline; border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; font-size: 12px; font-weight: 600; color: var(--muted); background: var(--wash); }
+  tr:last-child td { border-bottom: 0; }
+  .count { text-align: right; white-space: nowrap; }
+  tr.stop { cursor: pointer; }
+  tr.stop:hover { background: var(--wash); }
+  tr.shown, tr.shown:hover { background: #e3edfb; }
+  tr.depot td { color: var(--muted); }
 
   #login-view { flex: 1; display: grid; place-items: center; }
   #login { display: grid; gap: 10px; width: 300px; padding: 22px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
@@ -176,6 +196,25 @@
       <h2>Routes</h2>
       <ul id="route-list"></ul>
       <p id="routes-total" class="note"></p>
+      <div id="vans" hidden>
+        <div class="row"><button type="button" id="drive">Drive the routes</button></div>
+        <p id="vans-note" class="note"></p>
+      </div>
+    </section>
+
+    <section id="sheet" hidden>
+      <h2>Route sheet</h2>
+      <p id="sheet-line"></p>
+      <p class="note">A row shows its stop on the map.</p>
+      <div id="sheet-rows">
+        <table>
+          <thead>
+            <tr><th class="count">#</th><th>Stop</th><th class="count">Parcels</th><th class="count">On board</th></tr>
+          </thead>
+          <tbody id="sheet-body"></tbody>
+        </table>
+      </div>
+      <div class="row"><button type="button" id="sheet-close">Close</button></div>
     </section>
 
     <section id="system" hidden>
@@ -213,6 +252,20 @@ const SESSION = 'routeforge.session';
 // How often the orders of the day are read again without anybody having said that one
 // was placed. Whoever places one says so, but a word like that can be lost.
 const ORDERS_EVERY_MS = 30000;
+// How much of a route's length the chart of its search shows: from the shortest length
+// so far up to this share above it, and what is longer runs off the top. A search
+// loses a fifth of the length in its first quarter of a second, and a hundredth or two
+// in all the seconds after (D49). On a scale from the first length to the last that is
+// a cliff and a flat line, and the fall that goes on would not be seen.
+const CHART_SHARE = 0.02;
+// The chart as it is reckoned. It is stretched to the row it is shown in.
+const CHART = { width: 100, height: 30 };
+// How thick the line of a stored route is, and that of the route whose sheet is open.
+const ROUTE_WEIGHT = 3;
+const OPEN_ROUTE_WEIGHT = 5.5;
+// How long the vans take over the longest route of a plan, in milliseconds. They all
+// drive at one speed, so a van with a shorter route is back sooner (D74).
+const DRIVE_MS = 60000;
 
 const $ = (id) => document.getElementById(id);
 
@@ -229,6 +282,8 @@ const state = {
   jobs: [],             // its route jobs
   progress: new Map(),  // job id -> what its search last announced
   routes: [],           // its stored routes
+  sheetOf: null,        // the courier whose route sheet is open
+  shownStop: null,      // the order whose stop the sheet last showed on the map
   stats: null,
 };
 
@@ -241,6 +296,15 @@ let lines = null;
 const markers = new Map();      // order id -> its dot on the map
 const provisional = new Map();  // job id -> the dashed line of a search under way
 const ways = new Map();         // route id -> the way of a stored route, as points
+const searches = new Map();     // job id -> the lengths its search announced, for its chart
+const rows = new Map();         // job id -> its row in the list of routes, and what it says
+const routeLines = new Map();   // courier id -> the line of its stored route on the map
+let sheetSays = '';             // what the open route sheet was last written from
+const vans = new Map();         // route id -> a van on the map, and the track it drives
+let drive = null;               // { since, speed, frame } while the vans are on their way
+let setOutFor = null;           // the plan whose vans have set out by themselves
+let haveDriven = false;         // whether the vans of the shown plan have driven here
+let areBack = false;            // whether they got to the end of their routes
 const link = { plan: null, stats: null };  // whether each stream is open; null if not wanted
 let stopWatchingPlan = () => {};
 let stopWatchingStats = () => {};
@@ -282,26 +346,28 @@ function colourOf(courierId) {
 }
 
 /**
- * The most a courier has on board along a route (D65). It leaves the depot with every
- * delivery. A delivery comes off at its stop, and a pickup comes on at its own.
+ * What a courier has on board along a route (D65): first as it leaves the depot, and
+ * then after each stop. It leaves with every delivery. A delivery comes off at its
+ * stop, and a pickup comes on at its own.
  */
-function mostOnBoard(stops) {
+function onBoardAlong(stops) {
   let onBoard = 0;
   for (const stop of stops) {
     if (stop.kind === 'delivery') onBoard += stop.demand;
   }
-  let most = onBoard;
+  const loads = [onBoard];
   for (const stop of stops) {
     onBoard += stop.kind === 'pickup' ? stop.demand : -stop.demand;
-    most = Math.max(most, onBoard);
+    loads.push(onBoard);
   }
-  return most;
+  return loads;
 }
 
 /** What a stored route has its courier carry, in words: `at most 131 of 132 on board`. */
 function carried(route) {
   const courier = state.couriers.find((known) => known.id === route.courier_id);
-  const most = mostOnBoard(route.stops);
+  // The route sheet writes out the same loads, so the two cannot disagree.
+  const most = Math.max(...onBoardAlong(route.stops));
   return courier ? `at most ${most} of ${courier.capacity} on board` : `at most ${most} on board`;
 }
 
@@ -512,6 +578,8 @@ function makeMap() {
   dots = L.canvas({ padding: 0.5 }).addTo(map);
   lines = L.svg({ padding: 0.5 }).addTo(map);
   map.createPane('depot').style.zIndex = 450;
+  // The vans drive above everything that stands still.
+  map.createPane('vans').style.zIndex = 460;
   tiles = L.tileLayer(TILES, { maxZoom: 19, attribution: TILE_CREDIT });
   let warned = false;
   tiles.on('tileerror', () => {
@@ -519,7 +587,7 @@ function makeMap() {
     warned = true;
     say('The map tiles cannot be loaded. Everything else is drawn without them.');
   });
-  for (const name of ['routes', 'provisional', 'stops', 'depot']) {
+  for (const name of ['routes', 'provisional', 'stops', 'depot', 'mark', 'vans']) {
     layers[name] = L.layerGroup().addTo(map);
   }
   let wanted = true;
@@ -588,6 +656,8 @@ async function loadPlanDepot() {
     const announced = state.progress.get(job.job_id);
     if (announced && job.status === 'running') drawProvisional(job, announced);
   }
+  // The vans waited for the place they set out from.
+  vansSetOut();
 }
 
 /** Which courier each order of the shown plan is with: by its routes, and by its jobs. */
@@ -689,19 +759,120 @@ function drawProvisional(job, progress) {
 
 function drawRoutes() {
   layers.routes.clearLayers();
+  routeLines.clear();
   const depot = depotOfPlan();
   if (!depot) return;
   for (const route of state.routes) {
     const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)} ${along(route)}${drawn(route)}, `
-      + `${route.stops.length} stops, ${carried(route)}`;
+      + `${route.stops.length} stops, ${carried(route)}. A click opens its sheet.`;
     const track = trackOf(route, depot);
-    L.polyline(track, { renderer: lines, color: colourOf(route.courier_id), weight: 3, opacity: 0.95 })
+    const weight = state.sheetOf === route.courier_id ? OPEN_ROUTE_WEIGHT : ROUTE_WEIGHT;
+    const line = L.polyline(track, { renderer: lines, color: colourOf(route.courier_id), weight, opacity: 0.95 })
       .bindTooltip(tip(words), { sticky: true })
+      .on('click', () => openSheet(route.courier_id))
       .addTo(layers.routes);
+    routeLines.set(route.courier_id, line);
     // The route is stored: what the search had on the way has served.
     const job = state.jobs.find((known) => known.courier_id === route.courier_id);
     if (job) dropProvisional(job.job_id);
   }
+}
+
+/**
+ * Sends a van along each stored route of the shown plan. They all drive at one speed,
+ * at which the longest route takes `DRIVE_MS`.
+ *
+ * This is a simulation, for showing a plan (D74). Nothing tracks a courier, and the
+ * project is not to. Where a van is, is reckoned here from the route as it is stored
+ * and from the time since the vans set out, and from nothing else.
+ */
+function startVans() {
+  stopVans();
+  const depot = depotOfPlan();
+  if (!depot) return;
+  let longest = 0;
+  for (const route of state.routes) {
+    const points = trackOf(route, depot).map((place) => L.latLng(place));
+    // How far along the track each of its points is, in metres.
+    const upTo = [0];
+    for (let at = 1; at < points.length; at += 1) {
+      upTo.push(upTo[at - 1] + map.distance(points[at - 1], points[at]));
+    }
+    const length = upTo[upTo.length - 1];
+    // A route without stops goes nowhere.
+    if (!(length > 0)) continue;
+    const marker = L.circleMarker(points[0], {
+      pane: 'vans', radius: 8, color: '#111', weight: 2, fillColor: colourOf(route.courier_id), fillOpacity: 1,
+    }).bindTooltip(tip(`${nameOf(route.courier_id)}, simulated`)).addTo(layers.vans);
+    vans.set(route.id, { points, upTo, length, marker, next: 1 });
+    longest = Math.max(longest, length);
+  }
+  if (vans.size === 0) return;
+  haveDriven = true;
+  drive = { since: performance.now(), speed: longest / DRIVE_MS, frame: 0 };
+  drive.frame = requestAnimationFrame(moveVans);
+  renderVans();
+}
+
+/** Puts every van where it has got to by `now`, and asks to be called for the next picture. */
+function moveVans(now) {
+  if (drive === null) return;
+  const driven = Math.max(0, now - drive.since) * drive.speed;
+  let onTheWay = false;
+  for (const van of vans.values()) {
+    const gone = Math.min(driven, van.length);
+    // Time only goes on, so the leg a van is on is the one it was on, or a later one.
+    while (van.next < van.points.length - 1 && van.upTo[van.next] < gone) van.next += 1;
+    const from = van.points[van.next - 1];
+    const to = van.points[van.next];
+    const leg = van.upTo[van.next] - van.upTo[van.next - 1];
+    const share = leg > 0 ? (gone - van.upTo[van.next - 1]) / leg : 1;
+    van.marker.setLatLng([from.lat + (to.lat - from.lat) * share, from.lng + (to.lng - from.lng) * share]);
+    if (gone < van.length) onTheWay = true;
+  }
+  if (onTheWay) drive.frame = requestAnimationFrame(moveVans);
+  else stopVans(true);
+}
+
+/** Takes the vans off the map. `back` says that they got to the end of their routes. */
+function stopVans(back = false) {
+  if (drive !== null) cancelAnimationFrame(drive.frame);
+  drive = null;
+  vans.clear();
+  if (layers.vans) layers.vans.clearLayers();
+  areBack = back;
+  renderVans();
+}
+
+/**
+ * Sends the vans out by themselves, once for each plan that is shown: when the page
+ * sees that the plan is done, and has its routes and the depot to draw them from. A
+ * plan that is no longer done has no vans.
+ */
+function vansSetOut() {
+  const plan = state.plan;
+  if (!plan || plan.status !== 'done') {
+    stopVans();
+    return;
+  }
+  renderVans();
+  if (setOutFor === plan.id) return;
+  if (state.routes.length === 0 || state.routes.length < plan.routes_total || !depotOfPlan()) return;
+  setOutFor = plan.id;
+  // Not for somebody who has asked their machine for less motion. The button is there.
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  startVans();
+}
+
+function renderVans() {
+  const plan = state.plan;
+  $('vans').hidden = !plan || plan.status !== 'done' || state.routes.length === 0;
+  let button = haveDriven ? 'Drive again' : 'Drive the routes';
+  if (drive !== null) button = 'Stop the vans';
+  $('drive').textContent = button;
+  $('vans-note').textContent = 'The vans are simulated: nothing tracks a courier. Each drives its route, all at '
+    + `one speed, at which the longest route takes ${DRIVE_MS / 1000} seconds.`
+    + (areBack ? ' They are back at the depot.' : '');
 }
 
 function fit() {
@@ -781,14 +952,86 @@ function renderPlan() {
   $('discard').disabled = !plan || plan.status !== 'done';
 }
 
+/**
+ * Keeps what a search announced as its best length, for the chart of its route. Nothing
+ * stores these but the page that heard them (D49), so a route whose search this page
+ * did not see has no chart.
+ */
+function noteLength(progress) {
+  let search = searches.get(progress.job_id);
+  if (!search || search.attempt !== progress.attempt) {
+    search = { attempt: progress.attempt, since: performance.now(), points: [] };
+    searches.set(progress.job_id, search);
+  }
+  const last = search.points[search.points.length - 1];
+  if (last && last.moves >= progress.iterations) return;
+  search.points.push({
+    after: performance.now() - search.since,
+    moves: progress.iterations,
+    metres: progress.best_cost_m,
+  });
+}
+
+/**
+ * The length of a route as its search went on, as a small chart: a staircase, since a
+ * length holds until the search announces a shorter one.
+ *
+ * Across is the share of the plan's budget that was used, so the line reaches the right
+ * edge as the search ends. Up is the length, from the shortest so far to `CHART_SHARE`
+ * above it. It is the length as the search measures it, which by road is a little off
+ * the length the route is stored with (D66).
+ */
+function chartOf(search, budget, colour) {
+  const points = search.points;
+  if (points.length < 2) return null;
+  const { width, height } = CHART;
+  const first = points[0].metres;
+  const least = points[points.length - 1].metres;
+  const span = least * CHART_SHARE || 1;
+  const within = (share) => Math.min(1, Math.max(0, share));
+  const across = (point) => {
+    const used = budget.time_ms !== null ? point.after / budget.time_ms : point.moves / budget.iterations;
+    return (width * within(used)).toFixed(2);
+  };
+  // A unit is left free above and below, so that the line is whole at either edge.
+  const down = (point) => (1 + (height - 2) * (1 - within((point.metres - least) / span))).toFixed(2);
+  let fall = `M${across(points[0])} ${down(points[0])}`;
+  for (const point of points.slice(1)) fall += `H${across(point)}V${down(point)}`;
+
+  // Leaflet makes the elements, as it does for its own lines.
+  const part = (name, attributes) => {
+    const element = L.SVG.create(name);
+    for (const [attribute, value] of Object.entries(attributes)) element.setAttribute(attribute, value);
+    return element;
+  };
+  const words = `The length of the best route while it was searched for: ${km(first)} at first, `
+    + `${km(least)} at last. The chart shows the last ${Math.round(CHART_SHARE * 100)} percent.`;
+  const chart = part('svg', {
+    class: 'chart', viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': words,
+  });
+  const title = part('title', {});
+  title.textContent = words;
+  chart.append(title, part('path', { class: 'floor', d: `M0 ${height - 0.5}H${width}` }),
+    part('path', { class: 'fall', d: fall, stroke: colour }));
+  return chart;
+}
+
 function renderRoutes() {
   const list = $('route-list');
-  list.replaceChildren();
   const discarded = state.plan !== null && state.plan.status === 'discarded';
+  // The rows are kept from one drawing to the next, and a row is made anew only when
+  // what it says has changed. A search announces itself several times a second, and
+  // what is pressed in a row has to be there still when the mouse is let go.
+  if (state.jobs.map((job) => job.job_id).join() !== [...rows.keys()].join()) {
+    rows.clear();
+    list.replaceChildren();
+  }
   for (const job of state.jobs) {
     const route = state.routes.find((stored) => stored.courier_id === job.courier_id);
     const progress = state.progress.get(job.job_id) || job.progress;
     const worker = state.stats && state.stats.workers.find((known) => known.id === job.worker_id);
+    const heard = searches.get(job.job_id);
+    const search = heard && heard.attempt === job.attempt && heard.points.length > 1 ? heard : null;
 
     let stands = { queued: 'waiting for a worker', running: 'searching', done: 'stored',
       failed: 'failed', cancelled: 'stopped' }[job.status];
@@ -803,17 +1046,142 @@ function renderRoutes() {
     } else if (progress && job.status === 'running') {
       numbers = km(progress.best_cost_m);
       stands += `, ${moves(progress.iterations)}`;
+      if (search) stands += `, from ${km(search.points[0].metres)}`;
     }
+
+    const colour = colourOf(job.courier_id);
+    const name = nameOf(job.courier_id);
+    const detail = `${job.order_ids.length} stops, ${stands}`;
+    const stored = route !== undefined;
+    const open = stored && state.sheetOf === job.courier_id;
+    const says = JSON.stringify([colour, name, numbers, detail, search ? search.points.length : 0, stored, open]);
+    const before = rows.get(job.job_id);
+    if (before && before.says === says) continue;
 
     const row = el('li');
     const swatch = el('span', 'swatch');
-    swatch.style.background = colourOf(job.courier_id);
-    row.append(swatch, el('span', 'name', nameOf(job.courier_id)), el('span', 'numbers', numbers),
-      el('span', 'detail', `${job.order_ids.length} stops, ${stands}`));
-    list.append(row);
+    swatch.style.background = colour;
+    row.append(swatch, el('span', 'name', name), el('span', 'numbers', numbers), el('span', 'detail', detail));
+    if (stored) {
+      const sheet = el('button', 'small sheet', open ? 'Close the sheet' : 'Route sheet');
+      sheet.type = 'button';
+      sheet.setAttribute('aria-expanded', String(open));
+      sheet.addEventListener('click', () => (open ? closeSheet() : openSheet(job.courier_id)));
+      row.append(sheet);
+    }
+    if (search && state.plan) row.append(chartOf(search, state.plan.budget, colour));
+    if (before) before.row.replaceWith(row);
+    else list.append(row);
+    rows.set(job.job_id, { says, row });
   }
   $('routes').hidden = state.jobs.length === 0;
   $('routes-total').textContent = totalOf(state.routes);
+}
+
+/** Where a stop is, in words: the address its order came with, or else its position. */
+function placeOf(stop) {
+  const order = state.orders.get(stop.order_id);
+  if (order && order.address) return order.address;
+  return `${stop.location.lat.toFixed(5)}, ${stop.location.lon.toFixed(5)}`;
+}
+
+/** A row of the route sheet, with a cell for each text and its class. */
+function sheetRow(className, cells) {
+  const row = el('tr', className);
+  for (const [text, cellClass] of cells) row.append(el('td', cellClass, text));
+  return row;
+}
+
+/**
+ * The route sheet: the stops of the route that was picked in the order the courier
+ * calls, with what is on board after each (D65). It is written anew only when it would
+ * say something else, so that the place it was scrolled to is kept.
+ */
+function renderSheet() {
+  const route = state.routes.find((stored) => stored.courier_id === state.sheetOf) || null;
+  $('sheet').hidden = route === null;
+  for (const [courierId, line] of routeLines) {
+    const open = courierId === state.sheetOf;
+    line.setStyle({ weight: open ? OPEN_ROUTE_WEIGHT : ROUTE_WEIGHT });
+    if (open) line.bringToFront();
+  }
+  if (route === null) {
+    // No sheet, or its route is gone with its plan.
+    state.sheetOf = null;
+    state.shownStop = null;
+    sheetSays = '';
+    $('sheet-body').replaceChildren();
+    layers.mark.clearLayers();
+    return;
+  }
+
+  const name = nameOf(route.courier_id);
+  const places = route.stops.map(placeOf);
+  const says = JSON.stringify([route.id, name, places]);
+  if (says !== sheetSays) {
+    sheetSays = says;
+    $('sheet-line').textContent = `${name}: ${route.stops.length} stops, ${km(route.distance_m)} `
+      + `${along(route)}, ${carried(route)}.`;
+    const loads = onBoardAlong(route.stops);
+    const written = [sheetRow('depot', [['', 'count'], ['Leaves the depot', ''], ['', 'count'], [loads[0], 'count']])];
+    route.stops.forEach((stop, at) => {
+      const pickup = stop.kind === 'pickup';
+      const row = sheetRow('stop', [
+        ['', 'count'],
+        [`${pickup ? 'Pickup' : 'Delivery'}, ${places[at]}`, ''],
+        [`${pickup ? '+' : '−'}${stop.demand}`, 'count'],
+        [loads[at + 1], 'count'],
+      ]);
+      // The number is a button, for whoever has no mouse. A press anywhere in the row
+      // does the same.
+      const number = el('button', 'small', at + 1);
+      number.type = 'button';
+      number.title = 'Show this stop on the map';
+      row.firstChild.append(number);
+      row.dataset.order = stop.order_id;
+      row.addEventListener('click', () => showStop(stop));
+      written.push(row);
+    });
+    written.push(sheetRow('depot',
+      [['', 'count'], ['Back at the depot', ''], ['', 'count'], [loads[loads.length - 1], 'count']]));
+    $('sheet-body').replaceChildren(...written);
+  }
+  for (const row of $('sheet-body').children) {
+    row.classList.toggle('shown', state.shownStop !== null && row.dataset.order === state.shownStop);
+  }
+}
+
+function openSheet(courierId) {
+  if (state.sheetOf !== courierId) {
+    state.shownStop = null;
+    layers.mark.clearLayers();
+  }
+  state.sheetOf = courierId;
+  renderSheet();
+  renderRoutes();
+  $('sheet').scrollIntoView({ block: 'nearest' });
+}
+
+function closeSheet() {
+  state.sheetOf = null;
+  renderSheet();
+  renderRoutes();
+}
+
+/** Shows a stop of the open sheet on the map: goes to it, and puts a ring round it. */
+function showStop(stop) {
+  state.shownStop = stop.order_id;
+  const where = point(stop.location);
+  layers.mark.clearLayers();
+  L.circleMarker(where, {
+    pane: 'depot', radius: 13, color: '#111', weight: 2.5, fill: false, interactive: false,
+  }).addTo(layers.mark);
+  // Near enough to tell the stop from its neighbours, and no further off than the map
+  // is already.
+  map.setView(where, Math.max(map.getZoom(), 15));
+  renderSheet();
+  const marker = markers.get(stop.order_id);
+  if (marker) marker.openTooltip();
 }
 
 /**
@@ -885,6 +1253,8 @@ async function loadOrders() {
   state.orders = orders;
   drawStops();
   renderDay();
+  // The addresses of the stops are those of their orders.
+  renderSheet();
 }
 
 /** Reads the orders again shortly, once, however often it is asked in between. */
@@ -905,6 +1275,8 @@ async function loadRoutes(planId) {
   drawRoutes();
   colourStops();
   renderRoutes();
+  renderSheet();
+  vansSetOut();
 }
 
 function forgetPlan() {
@@ -917,14 +1289,19 @@ function forgetPlan() {
   state.planDepot = null;
   state.jobs = [];
   state.routes = [];
+  state.sheetOf = null;
   state.progress.clear();
   ways.clear();
+  setOutFor = null;
+  haveDriven = false;
+  stopVans();
   dropAllProvisional();
   drawDepot();
   drawRoutes();
   colourStops();
   renderPlan();
   renderRoutes();
+  renderSheet();
   renderLink();
 }
 
@@ -1007,6 +1384,7 @@ function searchAnnounced(progress) {
   const before = state.progress.get(progress.job_id);
   if (before && before.attempt === progress.attempt && before.iterations > progress.iterations) return;
   state.progress.set(progress.job_id, progress);
+  noteLength(progress);
   if (!job) return;
   drawProvisional(job, progress);
   renderRoutes();
@@ -1140,10 +1518,20 @@ function leave(why) {
   }
   Object.assign(state, {
     session: null, depot: null, planDepot: null, couriers: [], orders: new Map(), plans: [], planId: null,
-    plan: null, jobs: [], routes: [], stats: null,
+    plan: null, jobs: [], routes: [], sheetOf: null, shownStop: null, stats: null,
   });
   state.progress.clear();
   ways.clear();
+  searches.clear();
+  rows.clear();
+  routeLines.clear();
+  sheetSays = '';
+  setOutFor = null;
+  haveDriven = false;
+  stopVans();
+  $('route-list').replaceChildren();
+  $('sheet-body').replaceChildren();
+  $('sheet').hidden = true;
   if (map !== null) {
     for (const name of Object.keys(layers)) layers[name].clearLayers();
     markers.clear();
@@ -1224,6 +1612,8 @@ $('demo').addEventListener('submit', (event) => {
   act($('generate'), generateOrders).then(renderDay);
 });
 $('set-up').addEventListener('click', () => act($('set-up'), setUpDemoCity));
+$('sheet-close').addEventListener('click', closeSheet);
+$('drive').addEventListener('click', () => (drive !== null ? stopVans() : startVans()));
 
 state.session = rememberedSession();
 if (state.session) start();
