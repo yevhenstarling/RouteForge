@@ -401,6 +401,31 @@ pub struct RouteStop {
     pub demand: u32,
 }
 
+/// Where a planned order is on its route: who calls, and when in the round (D78).
+///
+/// An order has one from the moment its route is stored. Before that, while the route
+/// is still searched for, it is planned and has none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct OrderStop {
+    pub order_id: OrderId,
+    /// The name of the courier whose route the order is on.
+    pub courier: String,
+    /// Which call of the route it is, counted from 0.
+    pub position: u32,
+    /// How many calls the route has.
+    pub stops: u32,
+}
+
+/// The day whose orders are asked about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
+pub struct OrderDay {
+    /// The day the orders are for.
+    pub service_date: NaiveDate,
+}
+
 /// What storing a finished route needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewRoute {

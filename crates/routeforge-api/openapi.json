@@ -399,6 +399,37 @@
         ],
         "type": "string"
       },
+      "OrderStop": {
+        "description": "Where a planned order is on its route: who calls, and when in the round (D78).\n\nAn order has one from the moment its route is stored. Before that, while the route\nis still searched for, it is planned and has none.",
+        "properties": {
+          "courier": {
+            "description": "The name of the courier whose route the order is on.",
+            "type": "string"
+          },
+          "order_id": {
+            "$ref": "#/components/schemas/OrderId"
+          },
+          "position": {
+            "description": "Which call of the route it is, counted from 0.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stops": {
+            "description": "How many calls the route has.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "courier",
+          "position",
+          "stops"
+        ],
+        "type": "object"
+      },
       "OrdersChanged": {
         "description": "What an `orders` event of the stats stream says: an order of this day was placed or\nwithdrawn, so whoever shows the day reads its orders again (D63).",
         "properties": {
@@ -1916,6 +1947,58 @@
           }
         ],
         "summary": "Place an order",
+        "tags": [
+          "orders"
+        ]
+      }
+    },
+    "/api/orders/stops": {
+      "get": {
+        "description": "For each order of the day that is on a stored route: the name of its courier, which\ncall of the route it is, counted from 0, and how many calls the route has. Oldest\norder first. An order that is pending or withdrawn is not among them, and neither is\none that a plan has taken and whose route is still searched for.\n\nA client gets those of their own orders. That is all a client is told of a route:\nnot its other calls, its line or its length.",
+        "operationId": "list_order_stops",
+        "parameters": [
+          {
+            "description": "The day the orders are for.",
+            "in": "query",
+            "name": "service_date",
+            "required": true,
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/OrderStop"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Where each order of the day is that is on a route"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No token was sent, or the one sent is not valid or has expired"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Say where the orders of a day are on their routes",
         "tags": [
           "orders"
         ]

@@ -6,10 +6,16 @@
 //!
 //! Placing an order can be made safe to repeat, with a key of the caller's making
 //! (D76).
+//!
+//! Of the route a plan puts an order on, whoever placed the order is told where the
+//! order is on it, and nothing else (D78).
 
 use actix_web::{HttpRequest, HttpResponse, get, post, web};
 use routeforge_domain::db::orders::{self, Placed};
-use routeforge_domain::{IdempotencyKey, Order, OrderFilter, OrderId, OrderRequest, OrderStatus};
+use routeforge_domain::db::routes;
+use routeforge_domain::{
+    IdempotencyKey, Order, OrderDay, OrderFilter, OrderId, OrderRequest, OrderStatus, OrderStop,
+};
 use utoipa_actix_web::service_config::ServiceConfig;
 use uuid::Uuid;
 
@@ -22,6 +28,9 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
     config
         .service(create_order)
         .service(list_orders)
+        // Before the route that takes an id: a path is given to the first route it
+        // fits, and `stops` fits `{id}` as any word does.
+        .service(list_order_stops)
         .service(get_order)
         .service(cancel_order);
 }
@@ -129,6 +138,38 @@ async fn list_orders(
         filter.client_id = Some(user.id);
     }
     Ok(web::Json(orders::list(&state.pool, &filter).await?))
+}
+
+/// Say where the orders of a day are on their routes
+///
+/// For each order of the day that is on a stored route: the name of its courier, which
+/// call of the route it is, counted from 0, and how many calls the route has. Oldest
+/// order first. An order that is pending or withdrawn is not among them, and neither is
+/// one that a plan has taken and whose route is still searched for.
+///
+/// A client gets those of their own orders. That is all a client is told of a route:
+/// not its other calls, its line or its length.
+#[utoipa::path(
+    tag = "orders",
+    security(("bearer" = [])),
+    // Named here as well as in the arguments: utoipa describes a query it finds
+    // there only if it is listed.
+    params(OrderDay),
+    responses(
+        (status = 200, description = "Where each order of the day is that is on a route",
+            body = [OrderStop]),
+        NotLoggedIn,
+    )
+)]
+#[get("/api/orders/stops")]
+async fn list_order_stops(
+    user: AuthUser,
+    state: web::Data<AppState>,
+    query: web::Query<OrderDay>,
+) -> Result<web::Json<Vec<OrderStop>>, ApiError> {
+    let whose = (!user.is_staff()).then_some(user.id);
+    let stops = routes::stops_of_day(&state.pool, query.service_date, whose).await?;
+    Ok(web::Json(stops))
 }
 
 /// Read one order
@@ -416,6 +457,98 @@ mod tests {
                 .is_quiet_for(std::time::Duration::from_millis(300))
                 .await
         );
+    }
+
+    /// Where an order is on its route is the one thing of a route that a client is
+    /// told, and a client is told it of their own orders alone (D78).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_client_is_told_where_their_own_orders_are_on_their_routes(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        let ada = api.actor(Role::Client).await;
+        let bob = api.actor(Role::Client).await;
+        api.depot().await;
+        api.courier(100).await;
+        let adas_first = api.order(&ada, 12).await;
+        let bobs = api.order(&bob, 12).await;
+        let adas_second = api.order(&ada, 12).await;
+        // Of another day, and no plan takes it.
+        api.order(&ada, 13).await;
+
+        let stops = "/api/orders/stops?service_date=2026-10-12";
+        let none = api.get(Some(&ada), stops).await;
+        assert_eq!((none.status, &none.body), (StatusCode::OK, &json!([])));
+
+        let asked = api
+            .post(
+                Some(&operator),
+                "/api/plans",
+                json!({ "service_date": date(12) }),
+            )
+            .await;
+        assert_eq!(asked.status, StatusCode::CREATED);
+        // The plan takes the orders. They are planned from then on, and on no route
+        // until the search for it is over.
+        assert!(testing::work_one(&pool).await);
+        let read = api
+            .get(Some(&ada), &format!("/api/orders/{adas_first}"))
+            .await;
+        assert_eq!(read.body["status"], "planned");
+        assert_eq!(api.get(Some(&ada), stops).await.body, json!([]));
+        testing::work_off(&pool).await;
+
+        // What stands in for the solver calls in the reverse of the order the orders
+        // were placed in. Each is counted along the whole route, the other's call
+        // included, and each of the two is told of their own alone.
+        assert_eq!(
+            api.get(Some(&ada), stops).await.body,
+            json!([
+                { "order_id": adas_first, "courier": "Van", "position": 2, "stops": 3 },
+                { "order_id": adas_second, "courier": "Van", "position": 0, "stops": 3 },
+            ])
+        );
+        assert_eq!(
+            api.get(Some(&bob), stops).await.body,
+            json!([{ "order_id": bobs, "courier": "Van", "position": 1, "stops": 3 }])
+        );
+        for role in [Role::Operator, Role::Admin] {
+            let staff = api.actor(role).await;
+            let all = api.get(Some(&staff), stops).await;
+            let of: Vec<&str> = all
+                .body
+                .as_array()
+                .expect("a list of stops")
+                .iter()
+                .map(|stop| stop["order_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                of,
+                [adas_first.as_str(), bobs.as_str(), adas_second.as_str()],
+                "{role}"
+            );
+        }
+        let other_day = api
+            .get(Some(&ada), "/api/orders/stops?service_date=2026-10-13")
+            .await;
+        assert_eq!(other_day.body, json!([]));
+
+        // The day has to be said. And `stops` is no id of an order.
+        for (unreadable, why) in [
+            ("/api/orders/stops", "missing field `service_date`"),
+            ("/api/orders/stops?service_date=monday", "invalid"),
+        ] {
+            let reply = api.get(Some(&ada), unreadable).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{unreadable}");
+            assert_eq!(reply.content_type.as_deref(), Some(PROBLEM_JSON));
+            let detail = reply.body["detail"].as_str().unwrap();
+            assert!(detail.contains(why), "{detail}");
+        }
+
+        // A plan that is taken back takes its routes with it.
+        let discard = format!("/api/plans/{}/discard", asked.body["id"].as_str().unwrap());
+        let discarded = api.post(Some(&operator), &discard, Value::Null).await;
+        assert_eq!(discarded.status, StatusCode::OK, "{}", discarded.text);
+        assert_eq!(api.get(Some(&ada), stops).await.body, json!([]));
     }
 
     #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]

@@ -40,7 +40,7 @@ pub use job::{
 };
 pub use model::{
     Courier, Credentials, Depot, NewCourier, NewDepot, NewOrder, NewPlan, NewRoute, NewUser, Order,
-    OrderFilter, OrderKind, OrderStatus, Plan, PlanCounts, PlanFilter, PlanStatus, Role, Route,
-    RouteBudget, RouteStop, UnlimitedBudget, User,
+    OrderDay, OrderFilter, OrderKind, OrderStatus, OrderStop, Plan, PlanCounts, PlanFilter,
+    PlanStatus, Role, Route, RouteBudget, RouteStop, UnlimitedBudget, User,
 };
 pub use text::UnknownVariant;

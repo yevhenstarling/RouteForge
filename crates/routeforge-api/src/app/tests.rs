@@ -46,6 +46,7 @@ const MATRIX: &[(&str, &str, Needs)] = &[
     ("post", "/api/auth/telegram", Needs::Bot),
     ("post", "/api/orders", Needs::Anyone),
     ("get", "/api/orders", Needs::Anyone),
+    ("get", "/api/orders/stops", Needs::Anyone),
     ("get", "/api/orders/{id}", Needs::Anyone),
     ("post", "/api/orders/{id}/cancel", Needs::Anyone),
     ("get", "/api/depot", Needs::Anyone),
@@ -476,6 +477,7 @@ async fn the_document_describes_what_the_api_takes_and_gives(pool: PgPool) {
     for named in [
         "Order",
         "OrderRequest",
+        "OrderStop",
         "TelegramLogin",
         "Plan",
         "PlanRequest",

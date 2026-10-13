@@ -3,14 +3,18 @@
 //! A route is written once, when its route job completes, and is read for the map. It
 //! is deleted only together with the other routes of its plan: when the plan fails or
 //! is cancelled (D20), or is discarded after it was done (D30).
+//!
+//! Whoever placed an order may ask where it is on its route, and is told that and
+//! nothing else of the route: see [`stops_of_day`] (D78).
 
+use chrono::NaiveDate;
 use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use super::{DbError, parsed, unsigned};
 use crate::geo::{LatLon, Polyline};
-use crate::ids::{PlanId, RouteId};
-use crate::model::{NewRoute, Route, RouteStop};
+use crate::ids::{PlanId, RouteId, UserId};
+use crate::model::{NewRoute, OrderStop, Route, RouteStop};
 
 /// Stores a route and its stops in the order given.
 ///
@@ -110,16 +114,198 @@ pub async fn list_for_plan(
     Ok(routes)
 }
 
+/// Where the orders of a day are on their routes, oldest order first (D78): those of
+/// one client, or of everybody.
+///
+/// Only an order whose route is stored is on one. An order that is pending or
+/// withdrawn is left out, and so is one that a plan has taken and whose route is still
+/// searched for. A plan that ends early, or is discarded, deletes its routes (D20,
+/// D30), so what is found here is always of the plan that holds the order now.
+pub async fn stops_of_day(
+    executor: impl PgExecutor<'_>,
+    service_date: NaiveDate,
+    client_id: Option<UserId>,
+) -> Result<Vec<OrderStop>, DbError> {
+    // How many calls the route has is counted over the whole route, and not over the
+    // rows that are left when one client's orders are picked out.
+    let rows = sqlx::query!(
+        r#"SELECT stops.order_id, couriers.name AS courier, stops.position,
+                  (SELECT count(*) FROM route_stops AS calls
+                   WHERE calls.route_id = stops.route_id) AS "calls!"
+           FROM orders
+           JOIN route_stops AS stops ON stops.order_id = orders.id
+           JOIN routes ON routes.id = stops.route_id
+           JOIN couriers ON couriers.id = routes.courier_id
+           WHERE orders.service_date = $1
+             AND ($2::uuid IS NULL OR orders.client_id = $2)
+           ORDER BY orders.id"#,
+        service_date,
+        client_id.map(|id| id.0),
+    )
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(OrderStop {
+                order_id: row.order_id.into(),
+                courier: row.courier,
+                position: u32::try_from(row.position).map_err(|_| {
+                    DbError::Unreadable(format!("route_stops.position is {}", row.position))
+                })?,
+                stops: unsigned(row.calls, "the calls of a route")?,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::PgPool;
 
     use super::*;
     use crate::db::testing::{self, date};
-    use crate::db::{couriers, orders};
+    use crate::db::{couriers, orders, queue};
     use crate::geo::Distances;
     use crate::ids::{CourierId, OrderId};
     use crate::model::{OrderKind, Role};
+
+    /// Where each order of a client is, as (order, courier, position, calls).
+    async fn where_are(
+        pool: &PgPool,
+        day: u32,
+        client_id: Option<UserId>,
+    ) -> Vec<(OrderId, String, u32, u32)> {
+        stops_of_day(pool, date(day), client_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stop| (stop.order_id, stop.courier, stop.position, stop.stops))
+            .collect()
+    }
+
+    /// A courier with a name of its own, to tell the routes apart by.
+    async fn van(pool: &PgPool, name: &str) -> CourierId {
+        let new = crate::model::NewCourier {
+            name: name.to_owned(),
+            capacity: 100,
+        };
+        couriers::create(pool, &new).await.unwrap().id
+    }
+
+    #[sqlx::test]
+    async fn an_order_is_found_on_its_route_once_the_route_is_stored(pool: PgPool) {
+        let ada = testing::user(&pool, Role::Client).await;
+        let bob = testing::user(&pool, Role::Client).await;
+        let plan = testing::plan(&pool, date(12)).await;
+        let mut adas = Vec::new();
+        let mut bobs = Vec::new();
+        for _ in 0..3 {
+            adas.push(testing::order(&pool, ada.id, date(12)).await.id);
+            bobs.push(testing::order(&pool, bob.id, date(12)).await.id);
+        }
+        let pending = testing::order(&pool, ada.id, date(12)).await;
+        let other_day = testing::order(&pool, ada.id, date(13)).await;
+        let all: Vec<OrderId> = adas.iter().chain(&bobs).copied().collect();
+        orders::mark_planned(&pool, plan.id, &all).await.unwrap();
+
+        // A plan has taken them, and no route is stored yet: they are on none.
+        assert!(where_are(&pool, 12, None).await.is_empty());
+
+        // Two routes. Ada's orders are scattered over both, among Bob's.
+        let (north, south) = (van(&pool, "North").await, van(&pool, "South").await);
+        let route = |courier_id, stops: Vec<OrderId>| NewRoute {
+            plan_id: plan.id,
+            courier_id,
+            distance_m: 100,
+            distances: Distances::GreatCircle,
+            path: None,
+            stops,
+        };
+        insert(
+            &pool,
+            &route(north, vec![bobs[0], adas[2], bobs[1], adas[0]]),
+        )
+        .await
+        .unwrap();
+        // One of them is stored, and the other is still searched for.
+        assert_eq!(
+            where_are(&pool, 12, Some(ada.id)).await,
+            [
+                (adas[0], "North".to_owned(), 3, 4),
+                (adas[2], "North".to_owned(), 1, 4),
+            ]
+        );
+        insert(&pool, &route(south, vec![adas[1], bobs[2]]))
+            .await
+            .unwrap();
+
+        // Oldest order first. Where an order is, is counted along its whole route: of
+        // four calls and of two, whoever's the other calls are.
+        assert_eq!(
+            where_are(&pool, 12, Some(ada.id)).await,
+            [
+                (adas[0], "North".to_owned(), 3, 4),
+                (adas[1], "South".to_owned(), 0, 2),
+                (adas[2], "North".to_owned(), 1, 4),
+            ]
+        );
+        assert_eq!(
+            where_are(&pool, 12, Some(bob.id)).await,
+            [
+                (bobs[0], "North".to_owned(), 0, 4),
+                (bobs[1], "North".to_owned(), 2, 4),
+                (bobs[2], "South".to_owned(), 1, 2),
+            ]
+        );
+        // Everybody's, for whoever may see them all, in the order they were placed.
+        let everybodys: Vec<OrderId> = where_are(&pool, 12, None)
+            .await
+            .into_iter()
+            .map(|(order_id, ..)| order_id)
+            .collect();
+        let mut placed = all.clone();
+        placed.sort();
+        assert_eq!(everybodys, placed);
+
+        // An order that no plan has taken is on no route, and neither is anything of
+        // another day or of somebody who has no orders.
+        assert!(!all.contains(&pending.id));
+        assert!(where_are(&pool, 13, Some(ada.id)).await.is_empty());
+        assert!(where_are(&pool, 14, None).await.is_empty());
+        let nobody = testing::user(&pool, Role::Client).await;
+        assert!(where_are(&pool, 12, Some(nobody.id)).await.is_empty());
+        assert_eq!(
+            orders::get(&pool, other_day.id).await.unwrap().unwrap().id,
+            other_day.id
+        );
+    }
+
+    /// A plan that is taken back takes its routes with it (D20, D30), and its orders
+    /// are on none again.
+    #[sqlx::test]
+    async fn an_order_is_on_no_route_once_its_plan_is_taken_back(pool: PgPool) {
+        let routing = testing::routing(&pool, date(12), 2, 2).await;
+        let worker = crate::ids::WorkerId::generate();
+        for _ in 0..2 {
+            let job = queue::claim(&pool, worker, testing::LONG)
+                .await
+                .unwrap()
+                .unwrap();
+            testing::complete_route(&pool, &job).await.unwrap();
+        }
+        let stored: Vec<OrderId> = where_are(&pool, 12, None)
+            .await
+            .into_iter()
+            .map(|(order_id, ..)| order_id)
+            .collect();
+        let mut planned = routing.order_ids();
+        planned.sort();
+        assert_eq!(stored, planned);
+
+        assert!(queue::discard_plan(&pool, routing.plan.id).await.unwrap());
+        assert!(where_are(&pool, 12, None).await.is_empty());
+    }
 
     /// The schema repeats the values of the enumeration in a check (D19). Each of them
     /// is stored and read back, so the two cannot drift apart unnoticed.
