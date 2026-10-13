@@ -359,7 +359,7 @@ mod tests {
     use super::*;
     use crate::error::PROBLEM_JSON;
     use crate::stream::EVENT_STREAM;
-    use crate::testing::{self, Actor, Api, Reply, date};
+    use crate::testing::{self, Actor, Api, Reply, date, soon};
 
     /// How long a stream is listened to before it is taken to have nothing to say.
     const QUIET: Duration = Duration::from_millis(300);
@@ -447,7 +447,11 @@ mod tests {
         let bob = api.actor(Role::Client).await;
         api.depot().await;
         api.courier(100).await;
-        api.order(&ada, 12).await;
+        // An order of her own that no plan will take: she has withdrawn it.
+        let adas = api.order(&ada, 12).await;
+        let cancel = format!("/api/orders/{adas}/cancel");
+        let reply = api.post(Some(&ada), &cancel, Value::Null).await;
+        assert_eq!(reply.status, StatusCode::OK);
         let mut stream = api.open(&ada, EVENTS).await;
         stream.next_of("orders").await;
 
@@ -459,6 +463,24 @@ mod tests {
         assert_eq!(reply.status, StatusCode::OK);
         api.order(&bob, 12).await;
         assert!(stream.is_quiet_for(QUIET).await, "somebody else's orders");
+
+        // A plan takes that order of somebody else's, and stores the route it is on.
+        let asked = json!({ "service_date": date(12) });
+        let plan = api.post(Some(&operator), "/api/plans", asked).await;
+        assert_eq!(plan.status, StatusCode::CREATED);
+        testing::work_off(&pool).await;
+        let stops = "/api/orders/stops?service_date=2026-10-12";
+        let found = api.get(Some(&bob), stops).await;
+        assert_eq!(
+            found.body.as_array().map(Vec::len),
+            Some(1),
+            "{}",
+            found.text
+        );
+        assert!(
+            stream.is_quiet_for(QUIET).await,
+            "somebody else's order on its route"
+        );
 
         // An order of one's own of another day, and a plan that takes it and stores
         // its route.
@@ -554,7 +576,9 @@ mod tests {
         let api = testing::api(&pool);
         let ada = api.actor(Role::Client).await;
 
-        let opened = api.get(Some(&ada), EVENTS).await;
+        // What a stream opens with is all that is read of it here. One that opened
+        // with nothing would be waited for without end, so it is waited for so long.
+        let opened = soon(api.get(Some(&ada), EVENTS)).await;
         assert_eq!(opened.status, StatusCode::OK);
         assert_eq!(opened.content_type.as_deref(), Some(EVENT_STREAM));
         assert_eq!(

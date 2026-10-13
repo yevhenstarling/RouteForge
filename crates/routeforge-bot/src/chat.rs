@@ -838,7 +838,9 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
         match drafts.get_mut(&sender.chat).filter(|draft| draft.id == id) {
             Some(draft) => {
                 note(draft);
-                // Another order now than the one its key may have been sent with.
+                // Another order now than the one its key may have gone out with. A
+                // key answers for one order (D76): asked for with the old one, the
+                // API would refuse the order for not being the one it has.
                 draft.key = IdempotencyKey::generate();
                 draft.question(sender.today, true)
             }
@@ -880,8 +882,9 @@ impl<A: Api, G: Geocoder> Chats<A, G> {
             return question;
         };
         if !on_offer(day, sender.today) {
+            // It cannot go out again before it has a day, and it gets another key
+            // with that day, in `fill`: it is another order then.
             draft.day = None;
-            draft.key = IdempotencyKey::generate();
             let mut question = draft.question(sender.today, true);
             question.text = format!("That day is no longer on offer.\n\n{}", question.text);
             self.put_back(sender.chat, draft);

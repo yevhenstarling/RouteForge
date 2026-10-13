@@ -1395,6 +1395,33 @@ async fn every_order_goes_out_with_a_key_of_its_own() {
         .map(|order| order.service_date)
         .collect();
     assert_eq!(days, [date(13), date(13), date(13), date(14)]);
+
+    // The same with a button of an earlier question, pressed where it is still
+    // shown, on another telephone: three parcels and not two. With the key of the
+    // order of two the API would refuse it, as not the order that key placed.
+    let located = bot.shares(30, 50.4501, 30.5234).await;
+    let parcels = bot.presses(&located, "Delivery").await;
+    let which_day = bot.presses(&parcels, "2").await;
+    let shown = bot.presses(&which_day, "Tomorrow, Tue 13 Oct").await;
+    bot.api.lose_next_answer();
+    let unknown = bot.presses(&shown, "Place the order").await;
+    assert!(unknown.text.starts_with(NO_ANSWER), "{}", unknown.text);
+    let changed = bot.presses(&parcels, "3").await;
+    assert_eq!(
+        changed.text,
+        "A delivery of 3 parcels to 50.45010, 30.52340, on Tue 13 Oct.\nPlace this order?"
+    );
+    let placed = bot.presses(&changed, "Place the order").await;
+    assert_eq!(
+        placed.text,
+        "Placed: a delivery of 3 parcels to 50.45010, 30.52340, on Tue 13 Oct.\n\
+         It is pending until that day is planned. /orders shows it."
+    );
+    let keys = bot.api.keys();
+    assert_eq!(keys.len(), 6);
+    assert_ne!(keys[4], keys[5], "the order was changed between the two");
+    let parcels: Vec<u32> = bot.api.orders().iter().map(|order| order.demand).collect();
+    assert_eq!(parcels, [2, 2, 2, 2, 2, 3]);
 }
 
 /// An order that is on its way to the API is no longer the chat's to change. If the
