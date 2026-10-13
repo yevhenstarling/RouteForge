@@ -763,6 +763,10 @@ mod tests {
             Polyline::new(&text[..text.len() - 1]),
             Err(InvalidPolyline::BrokenOff)
         );
+        // And in the middle of the latitude of a third point. The two points before it
+        // are a line by themselves, and it is not that line that was sent.
+        let third_begun = format!("{text}_");
+        assert_eq!(Polyline::new(third_begun), Err(InvalidPolyline::BrokenOff));
         let latitude_alone = format!("{text}_ibE");
         assert_eq!(
             Polyline::new(latitude_alone),
