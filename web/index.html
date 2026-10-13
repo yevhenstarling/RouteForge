@@ -240,6 +240,7 @@ let dots = null;
 let lines = null;
 const markers = new Map();      // order id -> its dot on the map
 const provisional = new Map();  // job id -> the dashed line of a search under way
+const ways = new Map();         // route id -> the way of a stored route, as points
 const link = { plan: null, stats: null };  // whether each stream is open; null if not wanted
 let stopWatchingPlan = () => {};
 let stopWatchingStats = () => {};
@@ -307,6 +308,61 @@ function carried(route) {
 /** What a stored route's length was measured along: `by road`, or `as the crow flies`. */
 function along(route) {
   return ALONG[route.distances] || String(route.distances);
+}
+
+/**
+ * What is to be said of how a stored route is drawn. A route by road is drawn along
+ * the streets it takes, unless the routing service did not say which they are (D73).
+ */
+function drawn(route) {
+  return route.distances === 'road' && !route.path ? ', drawn from stop to stop' : '';
+}
+
+/**
+ * The points of a line that is written as an encoded polyline with six decimal places
+ * (D73): each point as how far it is from the one before, the latitude first, five bits
+ * to a letter. The API sends nothing as a line that is not one.
+ */
+function pointsOf(line) {
+  const points = [];
+  let at = 0;
+  const number = () => {
+    let written = 0;
+    let bits = 0;
+    let six;
+    do {
+      six = line.charCodeAt(at) - 63;
+      at += 1;
+      // Not with `<<`, which reckons in 32 bits where a number may take 35.
+      written += (six & 31) * 2 ** bits;
+      bits += 5;
+    } while (six >= 32);
+    // The lowest bit is the sign: a number below nought was written as its complement.
+    return written % 2 === 1 ? -(written + 1) / 2 : written / 2;
+  };
+  let lat = 0;
+  let lon = 0;
+  while (at < line.length) {
+    lat += number();
+    lon += number();
+    points.push([lat / 1e6, lon / 1e6]);
+  }
+  return points;
+}
+
+/**
+ * What a stored route is drawn with: the way it takes along the streets, where it has
+ * one, and otherwise the straight line from the depot through its stops and back.
+ */
+function trackOf(route, depot) {
+  if (route.path) {
+    // The routes are read again whenever their plan changes, and a way is thousands
+    // of points.
+    if (!ways.has(route.id)) ways.set(route.id, pointsOf(route.path));
+    const way = ways.get(route.id);
+    if (way.length > 1) return way;
+  }
+  return [point(depot.location), ...route.stops.map((stop) => point(stop.location)), point(depot.location)];
 }
 
 function nameOf(courierId) {
@@ -636,11 +692,10 @@ function drawRoutes() {
   const depot = depotOfPlan();
   if (!depot) return;
   for (const route of state.routes) {
-    const stops = route.stops.map((stop) => point(stop.location));
-    const round = [point(depot.location), ...stops, point(depot.location)];
-    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)} ${along(route)}, `
+    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)} ${along(route)}${drawn(route)}, `
       + `${route.stops.length} stops, ${carried(route)}`;
-    L.polyline(round, { renderer: lines, color: colourOf(route.courier_id), weight: 3, opacity: 0.95 })
+    const track = trackOf(route, depot);
+    L.polyline(track, { renderer: lines, color: colourOf(route.courier_id), weight: 3, opacity: 0.95 })
       .bindTooltip(tip(words), { sticky: true })
       .addTo(layers.routes);
     // The route is stored: what the search had on the way has served.
@@ -744,7 +799,7 @@ function renderRoutes() {
     let numbers = '';
     if (route) {
       numbers = km(route.distance_m);
-      stands += `, ${along(route)}, ${carried(route)}`;
+      stands += `, ${along(route)}${drawn(route)}, ${carried(route)}`;
     } else if (progress && job.status === 'running') {
       numbers = km(progress.best_cost_m);
       stands += `, ${moves(progress.iterations)}`;
@@ -863,6 +918,7 @@ function forgetPlan() {
   state.jobs = [];
   state.routes = [];
   state.progress.clear();
+  ways.clear();
   dropAllProvisional();
   drawDepot();
   drawRoutes();
@@ -1087,6 +1143,7 @@ function leave(why) {
     plan: null, jobs: [], routes: [], stats: null,
   });
   state.progress.clear();
+  ways.clear();
   if (map !== null) {
     for (const name of Object.keys(layers)) layers[name].clearLayers();
     markers.clear();

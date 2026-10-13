@@ -553,6 +553,10 @@
         ],
         "type": "string"
       },
+      "Polyline": {
+        "description": "A line on the map as text: an encoded polyline with six decimal places (D73).\n\nIt is the format OSRM writes the way of a route in, and it is short. Each point is\nwritten as how far it is from the point before, the latitude first, five bits to a\nletter. So a point of a way along streets takes some four letters, where two\nnumbers in JSON take forty.\n\nA value of this type decodes into two positions or more, and holds nothing else:\n[`Polyline::new`] and deserialization both check.",
+        "type": "string"
+      },
       "Problem": {
         "description": "Why a request was refused, in the shape of RFC 9457 (`application/problem+json`).",
         "properties": {
@@ -668,6 +672,17 @@
           },
           "id": {
             "$ref": "#/components/schemas/RouteId"
+          },
+          "path": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Polyline",
+                "description": "The way the round trip takes along the streets, from the depot through the\nstops and back: an encoded polyline with six decimal places, latitude first\n(D73). A route by road has it if the routing service gave it. A route without\none is drawn straight from stop to stop."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "plan_id": {
             "$ref": "#/components/schemas/PlanId"
@@ -2438,7 +2453,7 @@
     },
     "/api/plans/{id}/routes": {
       "get": {
-        "description": "Those that are stored so far, each with its stops in the order the courier calls.\nA plan that failed, was cancelled or was discarded has none.",
+        "description": "Those that are stored so far, each with its stops in the order the courier calls.\nA plan that failed, was cancelled or was discarded has none.\n\nA route that was measured by road says the way it takes along the streets as\n`path`, if the routing service gave it. A route without one is drawn from stop to\nstop.",
         "operationId": "list_plan_routes",
         "parameters": [
           {

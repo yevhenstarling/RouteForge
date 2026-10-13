@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::geo::{Distances, LatLon};
+use crate::geo::{Distances, LatLon, Polyline};
 use crate::ids::{CourierId, DepotId, OrderId, PlanId, RouteId, UserId};
 use crate::text::text_enum;
 
@@ -364,6 +364,11 @@ pub struct Route {
     /// What that length was measured along. Roads, where the solver has a routing
     /// service to ask and was answered, and great circles otherwise (D66).
     pub distances: Distances,
+    /// The way the round trip takes along the streets, from the depot through the
+    /// stops and back: an encoded polyline with six decimal places, latitude first
+    /// (D73). A route by road has it if the routing service gave it. A route without
+    /// one is drawn straight from stop to stop.
+    pub path: Option<Polyline>,
     /// In the order the courier calls.
     pub stops: Vec<RouteStop>,
 }
@@ -386,6 +391,9 @@ pub struct NewRoute {
     pub distance_m: u64,
     /// What the distance was measured along.
     pub distances: Distances,
+    /// The way the route takes along the streets, if it was measured by road and the
+    /// routing service gave its way (D73).
+    pub path: Option<Polyline>,
     /// The orders in the order the courier calls.
     pub stops: Vec<OrderId>,
 }

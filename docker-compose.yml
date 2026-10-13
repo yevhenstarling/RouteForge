@@ -118,16 +118,19 @@ services:
   #   in .env:                  COMPOSE_PROFILES=osrm and OSRM_URL=http://osrm:5000
   #   docker compose up --build --scale solver=4
   #
-  # A solver that is given OSRM_URL asks this service for the distances of each route.
-  # A route it gets no answer for is searched for on great circles, and says so (D66).
-  # So nothing waits for this service, and it may come up late or not at all.
+  # A solver that is given OSRM_URL asks this service for the distances of each route,
+  # and then for the way the route takes along the streets, which the map draws (D73).
+  # A route it gets no distances for is searched for on great circles, and says so
+  # (D66). So nothing waits for this service, and it may come up late or not at all.
   osrm:
     image: &osrm ghcr.io/project-osrm/osrm-backend:v26.10.0-debian
     profiles: ["osrm"]
     # `ch`: the roads as scripts/osrm-prepare contracts them, which answers a table
     # quickest. A table has a row for the depot and one for each stop of a route, and
-    # the demonstration makes days of up to 2000 orders.
-    command: ["osrm-routed", "--algorithm", "ch", "--max-table-size", "2001", "/data/kyiv.osrm"]
+    # the demonstration makes days of up to 2000 orders. The way of a route starts at
+    # the depot and ends there, which is one position more. Left to itself the server
+    # takes a table of 100 positions and a way through 500.
+    command: ["osrm-routed", "--algorithm", "ch", "--max-table-size", "2001", "--max-viaroute-size", "2002", "/data/kyiv.osrm"]
     volumes:
       - ./osrm:/data:ro
     ports:

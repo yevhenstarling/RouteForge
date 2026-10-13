@@ -181,6 +181,7 @@ pub(crate) async fn complete_route(pool: &PgPool, job: &ClaimedJob) -> Option<Pl
         courier_id: *courier_id,
         distance_m: 1_000,
         distances: Distances::GreatCircle,
+        path: None,
         stops: order_ids.clone(),
     };
     routes::insert(completion.conn(), &route).await.unwrap();

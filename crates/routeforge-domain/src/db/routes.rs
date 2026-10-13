@@ -8,7 +8,7 @@ use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use super::{DbError, parsed, unsigned};
-use crate::geo::LatLon;
+use crate::geo::{LatLon, Polyline};
 use crate::ids::{PlanId, RouteId};
 use crate::model::{NewRoute, Route, RouteStop};
 
@@ -31,18 +31,19 @@ pub async fn insert(executor: impl PgExecutor<'_>, new: &NewRoute) -> Result<Rou
     let order_ids: Vec<Uuid> = new.stops.iter().map(|order| order.0).collect();
     sqlx::query!(
         "WITH route AS (
-             INSERT INTO routes (id, plan_id, courier_id, distance_m, distances)
-             VALUES ($1, $2, $3, $4, $5)
+             INSERT INTO routes (id, plan_id, courier_id, distance_m, distances, path)
+             VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id
          )
          INSERT INTO route_stops (route_id, position, order_id)
          SELECT route.id, (stop.number - 1)::integer, stop.order_id
-         FROM route, unnest($6::uuid[]) WITH ORDINALITY AS stop (order_id, number)",
+         FROM route, unnest($7::uuid[]) WITH ORDINALITY AS stop (order_id, number)",
         id.0,
         new.plan_id.0,
         new.courier_id.0,
         distance_m,
         new.distances.as_str(),
+        new.path.as_ref().map(Polyline::as_str),
         &order_ids,
     )
     .execute(executor)
@@ -55,9 +56,13 @@ pub async fn list_for_plan(
     executor: impl PgExecutor<'_>,
     plan_id: PlanId,
 ) -> Result<Vec<Route>, DbError> {
-    // One row per stop, and one row with nulls for a route without stops.
+    // One row per stop, and one row with nulls for a route without stops. The way a
+    // route takes is tens of thousands of letters, so it comes with the first row of
+    // its route alone, and not once for every stop.
     let rows = sqlx::query!(
         r#"SELECT routes.id, routes.courier_id, routes.distance_m, routes.distances,
+                  CASE WHEN stops.position IS NULL OR stops.position = 0
+                       THEN routes.path END AS path,
                   stops.order_id AS "order_id?", orders.kind AS "kind?",
                   orders.lat AS "lat?", orders.lon AS "lon?", orders.demand AS "demand?"
            FROM routes
@@ -83,6 +88,8 @@ pub async fn list_for_plan(
                 courier_id: row.courier_id.into(),
                 distance_m,
                 distances: parsed(&row.distances)?,
+                // The first row of the route, which is the one the path comes with.
+                path: row.path.map(Polyline::new).transpose()?,
                 stops: Vec::new(),
             });
         }
@@ -127,6 +134,7 @@ mod tests {
                 courier_id: courier.id,
                 distance_m: 100,
                 distances,
+                path: None,
                 stops: Vec::new(),
             };
             insert(&pool, &route).await.unwrap();
@@ -153,6 +161,7 @@ mod tests {
         .unwrap();
         let listed = list_for_plan(&pool, plan.id).await.unwrap();
         assert_eq!(listed.last().unwrap().distances, Distances::GreatCircle);
+        assert_eq!(listed.last().unwrap().path, None);
 
         // And nothing else is stored there.
         let error = sqlx::query("UPDATE routes SET distances = 'by_rail' WHERE plan_id = $1")
@@ -169,6 +178,90 @@ mod tests {
     fn is_violation_of(error: &DbError, constraint: &str) -> bool {
         matches!(error, DbError::Sqlx(sqlx::Error::Database(database))
             if database.constraint() == Some(constraint))
+    }
+
+    /// A line from the depot of the tests `turn` degrees to the north-east and back.
+    fn there_and_back(turn: f64) -> Polyline {
+        let at = |lat, lon| LatLon::new(lat, lon).unwrap();
+        let depot = at(50.45, 30.52);
+        Polyline::through(&[depot, at(50.45 + turn, 30.52 + turn), depot]).unwrap()
+    }
+
+    /// Each route is read with its own way and no other's, whether it has many stops,
+    /// none, or no way at all (D73).
+    #[sqlx::test]
+    async fn a_route_by_road_keeps_the_way_it_takes(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let plan = testing::plan(&pool, date(12)).await;
+        let mut expected = Vec::new();
+        for (stops, distances, path) in [
+            (3, Distances::Road, Some(there_and_back(0.01))),
+            (0, Distances::Road, Some(there_and_back(0.02))),
+            // By road, and the service did not say which way.
+            (2, Distances::Road, None),
+            (2, Distances::GreatCircle, None),
+            (1, Distances::Road, Some(there_and_back(0.03))),
+        ] {
+            let courier = testing::courier(&pool, 10).await;
+            let mut order_ids = Vec::new();
+            for _ in 0..stops {
+                order_ids.push(testing::order(&pool, client.id, date(12)).await.id);
+            }
+            let new = NewRoute {
+                plan_id: plan.id,
+                courier_id: courier.id,
+                distance_m: 100,
+                distances,
+                path: path.clone(),
+                stops: order_ids,
+            };
+            insert(&pool, &new).await.unwrap();
+            expected.push((courier.id, stops, path));
+        }
+
+        let listed: Vec<(CourierId, usize, Option<Polyline>)> = list_for_plan(&pool, plan.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|route| (route.courier_id, route.stops.len(), route.path))
+            .collect();
+        assert_eq!(listed, expected);
+    }
+
+    /// On great circles the straight line from stop to stop is the way, and the schema
+    /// keeps a line along streets from being stored for such a route.
+    #[sqlx::test]
+    async fn only_a_route_by_road_has_a_way(pool: PgPool) {
+        let plan = testing::plan(&pool, date(12)).await;
+        let courier = testing::courier(&pool, 10).await;
+        let route = NewRoute {
+            plan_id: plan.id,
+            courier_id: courier.id,
+            distance_m: 100,
+            distances: Distances::GreatCircle,
+            path: Some(there_and_back(0.01)),
+            stops: Vec::new(),
+        };
+        let error = insert(&pool, &route).await.unwrap_err();
+        assert!(is_violation_of(&error, "routes_path_check"), "{error:?}");
+        assert!(list_for_plan(&pool, plan.id).await.unwrap().is_empty());
+
+        // What is stored there is a line, or the route cannot be read.
+        let by_road = NewRoute {
+            distances: Distances::Road,
+            ..route
+        };
+        insert(&pool, &by_road).await.unwrap();
+        sqlx::query("UPDATE routes SET path = 'not a line' WHERE plan_id = $1")
+            .bind(plan.id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = list_for_plan(&pool, plan.id).await.unwrap_err();
+        assert!(
+            matches!(&error, DbError::Unreadable(what) if what.contains("line")),
+            "{error:?}"
+        );
     }
 
     #[sqlx::test]
@@ -190,6 +283,7 @@ mod tests {
                 courier_id: courier.id,
                 distance_m: 12_345,
                 distances: Distances::GreatCircle,
+                path: None,
                 stops: calling_order.clone(),
             },
         )
@@ -232,6 +326,7 @@ mod tests {
                 courier_id: courier.id,
                 distance_m: 1_000 * stops as u64,
                 distances: Distances::GreatCircle,
+                path: None,
                 stops: order_ids.clone(),
             };
             insert(&pool, &new).await.unwrap();
@@ -245,6 +340,7 @@ mod tests {
             courier_id: courier.id,
             distance_m: 5,
             distances: Distances::GreatCircle,
+            path: None,
             stops: vec![stranger.id],
         };
         insert(&pool, &elsewhere).await.unwrap();
@@ -278,6 +374,7 @@ mod tests {
             courier_id: courier,
             distance_m: 100,
             distances: Distances::GreatCircle,
+            path: None,
             stops,
         };
         let first = testing::courier(&pool, 10).await.id;
@@ -317,6 +414,7 @@ mod tests {
             courier_id: courier.id,
             distance_m: 0,
             distances: Distances::GreatCircle,
+            path: None,
             stops: Vec::new(),
         };
         insert(&pool, &route).await.unwrap();
@@ -363,6 +461,7 @@ mod tests {
             courier_id: courier.id,
             distance_m: u64::MAX,
             distances: Distances::GreatCircle,
+            path: None,
             stops: Vec::new(),
         };
         let error = insert(&pool, &route).await.unwrap_err();

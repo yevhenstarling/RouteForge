@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use sqlx::PgExecutor;
 
-use crate::geo::InvalidLatLon;
+use crate::geo::{InvalidLatLon, InvalidPolyline};
 use crate::model::UnlimitedBudget;
 use crate::text::UnknownVariant;
 
@@ -101,6 +101,12 @@ impl From<UnknownVariant> for DbError {
 
 impl From<InvalidLatLon> for DbError {
     fn from(invalid: InvalidLatLon) -> Self {
+        Self::Unreadable(invalid.to_string())
+    }
+}
+
+impl From<InvalidPolyline> for DbError {
+    fn from(invalid: InvalidPolyline) -> Self {
         Self::Unreadable(invalid.to_string())
     }
 }

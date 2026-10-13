@@ -579,6 +579,7 @@ async fn a_completion_stores_the_results_together_with_the_job(pool: PgPool) {
         courier_id,
         distance_m: 4_200,
         distances: Distances::GreatCircle,
+        path: None,
         stops: order_ids,
     };
 
@@ -1039,6 +1040,7 @@ async fn two_routes_finishing_together_mark_the_plan_done_once(pool: PgPool) {
         courier_id,
         distance_m: 1_000,
         distances: Distances::GreatCircle,
+        path: None,
         stops: order_ids,
     };
     routes::insert(completion.conn(), &route).await.unwrap();
@@ -1341,6 +1343,7 @@ async fn a_discarded_date_is_planned_afresh_with_every_order(pool: PgPool) {
         courier_id: courier.id,
         distance_m: 1_000,
         distances: Distances::GreatCircle,
+        path: None,
         stops: all.clone(),
     };
     routes::insert(&pool, &route).await.unwrap();

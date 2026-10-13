@@ -798,7 +798,7 @@ What the page can do beyond the list in the plan was decided by the project owne
 
 What Phase 8 added to it:
 
-- **Beside the length of a route, what it was measured along:** `by road` or `as the crow flies` (D66). The lines stay straight, from stop to stop. Drawing them along the streets was offered beside it and not taken, on 2026-10-12.
+- **Beside the length of a route, what it was measured along:** `by road` or `as the crow flies` (D66). The lines stayed straight, from stop to stop. Drawing them along the streets was offered beside it and not taken, on 2026-10-12. Phase 9 draws them so (D73).
 - **Beside the stops of a route, the most its courier has on board** along it, and how much the courier carries: `at most 131 of 132 on board` (D65).
 - **A plan is drawn from its own depot** (D71). When the depot has been moved since the plan was made, the plan's depot is on the map as well, as a grey dashed ring.
 
@@ -1190,7 +1190,7 @@ Why:
 - The label is the route's and not the plan's, because the fallback is. A plan whose server went away in the middle has routes of both kinds, and says so route by route.
 - The mean, and not the shorter or the longer of the two directions: a tour is then as long to the search as the mean of driving it one way round and the other. So what is short to the search is short on the road, whichever way it is driven in the end. Between great circles the two directions are the same and the mean is what they are, so nothing changed for a solver without OSRM.
 - `POST`, because the positions of a route of three hundred stops make an address of several kilobytes, which a server may refuse for its length. In a body `annotations` is a list, where in an address it is a word. The server refuses the word there.
-- Decided with the project owner on 2026-10-12: the page says what a route was measured along, and draws its lines straight. Lines along the streets would take the geometry of every leg from OSRM, and somewhere to keep it.
+- Decided with the project owner on 2026-10-12: the page says what a route was measured along, and draws its lines straight. Lines along the streets would take the geometry of every leg from OSRM, and somewhere to keep it. That was turned round the day after: since Phase 9 a route by road keeps its way, and the page draws it (D73).
 
 What it does not do:
 
@@ -1218,7 +1218,7 @@ Tests: the request as OSRM takes it, longitude first; the table read back; each 
 ### D67. OSRM is a service of the stack behind a profile, on roads that are fetched once (in place)
 
 - **A service with a profile.** `osrm` in `docker-compose.yml` has the profile `osrm`, so `docker compose up` leaves it out. `COMPOSE_PROFILES=osrm` and `OSRM_URL=http://osrm:5000` in `.env` put it in and point the solvers at it.
-- **The image is OSRM's own,** `ghcr.io/project-osrm/osrm-backend:v26.10.0-debian`, by its tag. It is started as `osrm-routed --algorithm ch --max-table-size 2001`.
+- **The image is OSRM's own,** `ghcr.io/project-osrm/osrm-backend:v26.10.0-debian`, by its tag. It is started as `osrm-routed --algorithm ch --max-table-size 2001 --max-viaroute-size 2002`.
 - **The roads are prepared once, by a script.** `scripts/osrm-prepare`, as `.ps1` and as `.sh`, fetches the extract of Kyiv that BBBike publishes, 34 MB, into `osrm/`, and runs `osrm-extract` with the car profile and `osrm-contract` on it, with the tools of the same image. On the development machine that took 16 seconds, used half a gigabyte of memory at the most, and left 106 MB.
 - **`osrm/` is nobody's but the machine's.** Git ignores it, and so does the build context of the images.
 - **Nothing waits for it.** It has no health check, and the solvers do not depend on it. A solver that gets no answer falls back, route by route (D66), so the server may come up late, or not at all.
@@ -1230,6 +1230,7 @@ Why:
 - A city and not a country: the demonstration's orders are in Kyiv (D46), and a city is prepared in seconds on a laptop.
 - `ch`, contraction hierarchies, answers a table quickest. Its price is that the whole map is prepared again for any change, which here is never.
 - `--max-table-size 2001`: the server's default is a hundred positions, and a route has a position for each stop and one for the depot. The demonstration makes days of up to 2000 orders (D46), and no route has more stops than its day has orders.
+- `--max-viaroute-size 2002`, since Phase 9: the way of a route is asked for from the depot through the stops and back to the depot, which is one position more than its table has (D73). The server's default is five hundred.
 - The tag ends in `-debian` because that is what the release is published as. `v26.10.0` alone is no image.
 
 Good to know:
@@ -1339,3 +1340,53 @@ What it does not do: understand a sentence (D58), complete an address while it i
 Tried against the public service, with eight requests in all, a second apart or more. `Хрещатик 22` near the depot gave the address, the post office in it and one more thing that is at it. Without the depot it gave the same address first. `Соборна 10` gave that address in three towns round Kyiv. A line of letters gave nothing. The first try showed that one address comes back three times under one name, which is why the bot now asks for ten.
 
 Tests: the dialogue against a fake of the service and of the API: one place and several, none, a press that is out of date or made up, a new search in the place of the old, the service away and busy, the API not saying where the depot is, what is and is not sent, more places and longer names than a message takes, and the bound on what is kept. The requests against a server that answers as Nominatim does: the query, the name the bot gives, the pace, a search that would wait too long, places under one name, and the words kept out of what is said of a failure. The whole bot against stand-ins for Telegram, the API and the service (D64).
+
+### D73. A route by road keeps the way it takes, and the map draws it (in place)
+
+Turns round a choice of 2026-10-12, when the project owner took a label on the route over lines along the streets (D66). The lines were asked for on 2026-10-13, as part of Phase 9.
+
+- **The solver asks for the way.** When the search for a route is over, and it is settled which way round the route is driven (D66), the solver asks the route service of the OSRM server for the way from the depot through the stops in that order and back. That is one request for a route, as the table is.
+- **Only a route that was measured by road has a way.** A solver without an OSRM server asks nobody. A route that fell back on great circles asks for none either: its length is the straight lines from stop to stop, and so is its way.
+- **A route that gets no way is stored without it.** A service that does not answer within `OSRM_TIMEOUT_SECS`, that refuses, or that answers what is no line is a warning in the solver's log and nothing more. The route is still `road`, and the page says that it is drawn from stop to stop.
+- **The way is waited for with the heartbeat beside it** (D34), as the table is. The search is over by then and the route is not stored yet, so a lease that ran out there would have another worker search for the whole route again.
+- **It is asked for with `continue_straight` off,** which makes it the way that was measured. More on that below.
+- **It is stored with the route,** in `routes.path`, as text: an encoded polyline with six decimal places, latitude first, which is how OSRM writes it. A check of the schema lets only a route by road have one.
+- **The API gives it with the route,** as `path`, and `null` where there is none.
+- **The page draws a stored route along its way,** and a route without one from stop to stop. A search under way is a dashed straight line, as it was (D49).
+
+Why:
+
+- The solver and not the API: the solver is the service that asks OSRM and is given `OSRM_URL` (D66, D67). Asked for by the API when a page wants a line, the lines would be there only while the server is, the API would have its first service to ask, and a way would be asked for with every look at it.
+- With the route and not in a table of its own: the way is of this route in this order. It goes when the route goes, with its plan (D20, D30).
+- `continue_straight` off, because the table measures every leg by itself, whichever way the courier faces at its ends. For cars the route service makes a way go on from a stop in the direction it came to it, unless it is told otherwise, and that is another way and a longer one. Asked both ways for the same stops in the same order, against the server of D67:
+
+  | | Legs longer than the table has them | The longest by | The whole way |
+  |---|---|---|---|
+  | 75 stops, the service's default | 26 of 76 | 1.3 km | 1.1 % longer |
+  | 330 stops, the service's default | 153 of 331 | 2.2 km | 1.6 % longer |
+  | Either, with `continue_straight` off | none | 0.1 m | the same to the metre |
+
+- An encoded polyline and not a list of positions: a point of a way takes four letters so, and some forty as two numbers in JSON. Six decimal places are a tenth of a metre. The type that holds one, `Polyline`, decodes it when it is made, as `LatLon` checks its numbers. So what is stored and what is sent is a line, whatever the service answered.
+- The whole way and not the outline the service gives unasked: the outline is made for a picture of the whole route, and cuts the corners that show when the map is looked at close up.
+- A search under way is not drawn along the streets. It announces its best route four times a second (D49), and each announcement would be a request to the server.
+- `list_for_plan` reads a row for each stop of a route. The way is selected with the first row of its route alone, so that a route of three hundred stops does not carry its way three hundred times.
+
+What it takes, measured against the server of D67 on the development machine:
+
+- **Time.** The way through 75 stops took 17 ms, through 330 stops 71 ms, and through 500 positions 155 ms.
+- **Room.** A way has a point every 35 metres or so. For the demonstration's day of 300 orders on four vans, with twenty million moves a route, the four ways had 2067 to 5174 points and were 8 to 20 thousand letters. The answer of `GET /api/plans/{id}/routes` for that day was 110 kB.
+- **The limit.** Left to itself the server takes a way through 500 positions, and refuses a longer one with `TooBig`. The stack starts it with `--max-viaroute-size 2002`: a table has the depot and the stops, and a way comes back to the depot (D67).
+- **The line against the length.** Measured from point to point along great circles, each of those four ways came to within 0.2 % of the length its route is stored with, which is OSRM's own measure of the same way.
+
+What it does not do:
+
+- A way begins and ends on the road nearest the depot, and passes each stop on the road nearest to it (D66). The depot of the demonstration is 23 metres from its road.
+- A way is asked for once. A route that was stored while the server was away stays straight until its day is planned again, and so does every route that was stored before this.
+- Nothing says how far along its way a route has got to each stop. The length of the legs is not stored, only that of the whole.
+
+Good to know:
+
+- In the body of a `POST`, OSRM takes `steps`, `continue_straight` and `skip_waypoints` as booleans and refuses them as words, and takes `overview` as a word and refuses it as a boolean. `continue_straight` may also be the word `default`.
+- The solver logs the length of the way beside the length of the route when it stores one, as `path_m` beside `distance_m`. Two that differ by more than a fraction of a percent are a line of another route.
+
+Tests: the format's published example read and written; lines of random positions read back as they were written; text that is no line refused, in JSON as well; a route stored with its way beside routes without one, and each read with its own; the check that keeps a way off a route on great circles. The request as OSRM takes it, longitude first; each way of failing, by its name; the first route of an answer; fewer than two positions not asked about. A route by road stored with the way of the order it is driven in, on a ring that is driven one way and on the same ring driven the other, of which one has the search's tour turned round; a route stored by road without a way when the service gives none; a route on great circles asking for none; the lease kept while the way is waited for, and the wait ended by a cancel; the compose file starting the server for a way one position longer than its longest table; a route read through the API with its way.
