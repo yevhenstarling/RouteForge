@@ -197,14 +197,31 @@ impl Tokens {
 
     /// A session for `user`, from now, for as long as a login is good for.
     pub(crate) fn issue(&self, user: User) -> Result<Session, ApiError> {
-        self.issue_for(user, self.ttl)
+        let role = user.role;
+        self.issue_for(user, role, self.ttl)
     }
 
-    /// A session for `user`, from now, that is good for `ttl`. The bot's are much
-    /// shorter than a login's: it asks for one each time it needs one (D60).
-    pub(crate) fn issue_for(&self, user: User, ttl: Duration) -> Result<Session, ApiError> {
+    /// A session the bot is given for the Telegram user it talks to (D60). It is good
+    /// for `ttl`, which is much shorter than a login: the bot asks for one each time it
+    /// needs one.
+    ///
+    /// Its token gives an operator's rights at the most, whatever the account's role.
+    /// The bot asks nothing of the API that is an admin's, so its key mints no admin's
+    /// token, whichever account it names. The session's account is the account as it
+    /// is, its role included.
+    pub(crate) fn issue_to_the_bot(&self, user: User, ttl: Duration) -> Result<Session, ApiError> {
+        let role = match user.role {
+            Role::Admin => Role::Operator,
+            role @ (Role::Client | Role::Operator) => role,
+        };
+        self.issue_for(user, role, ttl)
+    }
+
+    /// A session for `user`, from now, that is good for `ttl`, with a token that gives
+    /// the rights of `role`.
+    fn issue_for(&self, user: User, role: Role, ttl: Duration) -> Result<Session, ApiError> {
         let now = jsonwebtoken::get_current_timestamp();
-        let token = self.sign(user.id, user.role, now, ttl)?;
+        let token = self.sign(user.id, role, now, ttl)?;
         Ok(Session {
             token,
             expires_in: ttl.as_secs(),
@@ -447,14 +464,14 @@ mod tests {
     }
 
     /// The bot's tokens are of the same key as a login's and read by the same check.
-    /// They differ in how long they are good for, and in nothing else.
+    /// They differ in how long they are good for, and in the most they give.
     #[test]
     fn a_token_can_be_issued_for_less_than_a_login_lasts() {
         let tokens = Tokens::new(SECRET, HOUR);
         let user = user(Role::Operator);
         let minute = Duration::from_secs(60);
 
-        let session = tokens.issue_for(user.clone(), minute).unwrap();
+        let session = tokens.issue_to_the_bot(user.clone(), minute).unwrap();
         assert_eq!(session.expires_in, 60);
         assert_eq!(session.user, user);
         let read = tokens.read(&session.token).unwrap();
@@ -470,6 +487,28 @@ mod tests {
         let over = tokens.sign(user.id, user.role, now - 120, minute).unwrap();
         assert_eq!(tokens.read(&over), None);
         assert!(tokens.read(&tokens.issued_at(&user, now - 120)).is_some());
+    }
+
+    /// The bot is given an operator's token at the most, so its key opens no more than
+    /// an operator may (D60). The account it is told of is the account as it is.
+    #[test]
+    fn the_bot_is_given_an_operators_token_at_the_most() {
+        let tokens = Tokens::new(SECRET, HOUR);
+        let minute = Duration::from_secs(60);
+        for (role, given) in [
+            (Role::Client, Role::Client),
+            (Role::Operator, Role::Operator),
+            (Role::Admin, Role::Operator),
+        ] {
+            let user = user(role);
+            let session = tokens.issue_to_the_bot(user.clone(), minute).unwrap();
+            assert_eq!(session.user, user);
+            assert_eq!(tokens.read(&session.token).unwrap().role, given, "{role}");
+        }
+        // A login is given what the account is.
+        let admin = user(Role::Admin);
+        let session = tokens.issue(admin).unwrap();
+        assert_eq!(tokens.read(&session.token).unwrap().role, Role::Admin);
     }
 
     #[test]

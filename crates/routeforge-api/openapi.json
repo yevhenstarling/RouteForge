@@ -1217,7 +1217,7 @@
     },
     "/api/auth/telegram": {
       "post": {
-        "description": "The Telegram bot is the one caller of this. It shows its key, as\n`Authorization: Bearer <key>`, says which Telegram user it is talking to, and is\ngiven a token for that user's account. With that token it asks what the user asks\nof it, so the bot can do no more than the user may (D9).\n\nA Telegram user the API has not heard of gets an account here and now: a client's,\nwith no address and no password. An admin can make it an operator's.\n\nThe token is good for `expires_in` seconds, which is far less than a login's: the\nbot asks for one whenever it needs one.",
+        "description": "The Telegram bot is the one caller of this. It shows its key, as\n`Authorization: Bearer <key>`, says which Telegram user it is talking to, and is\ngiven a token for that user's account. With that token it asks what the user asks\nof it, so the bot can do no more than the user may (D9). Nor more than an operator\nmay: the token of an admin's account gives an operator's rights, which are all the\nbot uses, so the key opens nothing that is an admin's.\n\nA Telegram user the API has not heard of gets an account here and now: a client's,\nwith no address and no password. An admin can make it an operator's.\n\nThe token is good for `expires_in` seconds, which is far less than a login's: the\nbot asks for one whenever it needs one.",
         "operationId": "telegram_login",
         "requestBody": {
           "content": {
