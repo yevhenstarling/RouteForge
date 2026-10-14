@@ -1270,8 +1270,14 @@ function renderPlan() {
     if (plan.error) $('plan-error').textContent = `It failed: ${plan.error}`;
   }
   const busy = state.plans.some(isActive);
-  $('plan').disabled = busy || !state.depot;
-  $('plan').title = busy ? 'The day has a plan in progress.' : (state.depot ? '' : 'No depot has been set.');
+  // A day whose plan is done is planned again once that plan is discarded (D83).
+  const standing = state.plans.some((known) => known.status === 'done');
+  $('plan').disabled = busy || standing || !state.depot;
+  $('plan').title = busy
+    ? 'The day has a plan in progress.'
+    : standing
+      ? 'The day has a plan that is done: discard it, and the day can be planned afresh.'
+      : (state.depot ? '' : 'No depot has been set.');
   $('cancel').disabled = !isActive(plan);
   $('discard').disabled = !plan || plan.status !== 'done';
 }
