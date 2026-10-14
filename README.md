@@ -1,7 +1,11 @@
 # RouteForge
-backend for managing parcel pickup and delivery across a city
 
-It turns a day's parcel orders into optimized courier routes, and spreads the route optimization over workers that scale horizontally.
+A backend for managing parcel pickup and delivery across a city, made as the capstone of a Rust bootcamp. It turns a day's parcel orders into optimized courier routes, and spreads the route optimization over workers that scale horizontally:
+
+- **an API** in actix-web, for orders, accounts and plans, with OpenAPI and Swagger UI;
+- **solvers**, as many as are started. They take their jobs from a queue in PostgreSQL, and one that dies leaves its job to the others;
+- **a page** with a Leaflet map, on which a plan is drawn while the solvers search for it;
+- **a Telegram bot**, which places orders through the API.
 
 ## Running it
 
