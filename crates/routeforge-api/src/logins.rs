@@ -293,6 +293,11 @@ mod tests {
             assert_eq!(logins.begin("ada@example.com", start), Ok(()));
         }
         assert!(logins.begin("ada@example.com", start).is_err());
+        // And one who has a try left: the count that makes room is one with the fewest
+        // tries, and not the oldest of those below the limit.
+        for _ in 0..4 {
+            assert_eq!(logins.begin("bob@example.com", start), Ok(()));
+        }
 
         // More made-up addresses than are counted, all within the window. Each is
         // counted, and each makes room for the next.
@@ -303,6 +308,11 @@ mod tests {
         assert_eq!(logins.lock().len(), MOST_ADDRESSES);
         assert_eq!(
             logins.begin("ada@example.com", start + seconds(2)),
+            Err(seconds(58))
+        );
+        assert_eq!(logins.begin("bob@example.com", start + seconds(2)), Ok(()));
+        assert_eq!(
+            logins.begin("bob@example.com", start + seconds(2)),
             Err(seconds(58))
         );
     }
