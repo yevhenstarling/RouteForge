@@ -497,3 +497,24 @@ Run on the development machine (Windows 11, Rust 1.99.0), against the compose `d
 - **`routeforge-bot`:** `main.rs`, `telegram.rs` (the run loop and handlers), `chat.rs` (its outline, the drafts and their dispatch), `api.rs` (the requests).
 - **The page:** `web/index.html`, for its injection sinks, storage, the input of the CSP hashes, and how it shows plans.
 - **Build and run:** `Cargo.toml`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml`, `.gitignore`, `.dockerignore`, `.cargo/audit.toml`, `clippy.toml`.
+
+## What became of it
+
+Phase 12 acted on this review on the same day; `docs/plan.md` has it in full. The review above is left as it was written.
+
+| ID | What was done | Decision |
+|---|---|---|
+| R1 | A job is polled through `catch_unwind`, and a panic is a failed attempt. A lost worker ends its solver with an error. | D82 |
+| S1 | The count that makes room is one with the fewest tries, and never one at its limit. | D68 |
+| Q1 | `scripts/page-check.mjs` tries the page in a browser. | D86 |
+| P1, R2 | The stats count the jobs that ended within the last day, by an index. A starting solver forgets workers not seen for a day. | D84 |
+| A1 | A day whose plan is done is refused another plan until that plan is discarded. | D83 |
+| S2 | The bot's token gives an operator's rights at the most. | D60 |
+| S3 | One person holds 16 event streams at the most, `API_STREAMS_PER_USER`. | D85 |
+| T1 | The probe's tests give an answer two seconds. | none |
+| P2, P3, P4 | A query of its own and an index for a client's orders of a day, a route counted once, demo orders in one statement. | D77, D78, D46 |
+| Q2, Q5 | `routeforge_domain::service`: logging that names an unreadable `RUST_LOG`, the stop signal, `Backoff`. | D81 |
+| Q3 | The bot's dialogue in five files. | D61 |
+| A2 | The ceiling is recorded. | D49 |
+| Docs | The decision log has an index. | none |
+| C1, C2, Q4 | Not mended in code: Phase 11, a Telegram token, and a release of teloxide. | D58, D64, D10 |

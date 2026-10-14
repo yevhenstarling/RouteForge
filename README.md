@@ -24,7 +24,7 @@ What there is to see on the page:
 - **A plan as it is made.** A route is a dashed line while a solver searches for it, and a solid one when it is stored. A small chart in its row shows its length falling as the search goes on. With 300 orders a route is at its final length a quarter of a second in, and the chart is one step. With 1200 it goes on falling for seconds.
 - **Vans that drive the routes** of a plan that is done. They are simulated. Each page moves its own along the stored routes, at a speed at which the longest route takes a minute. Nothing tracks a courier, and the project is not to.
 - **A route sheet** for each stored route: its stops in the order the courier calls, with what is on board after each. A click on a route's line opens its sheet, and a row of the sheet shows its stop on the map.
-- **The queue and the workers,** as they are.
+- **The queue and the workers,** as they are, and the jobs that ended in the last day.
 - **A plan that was asked for elsewhere,** by chat, by a script or in another window: a page that shows its day shows the plan as it is made.
 
 And what a client has, in a second window:
@@ -69,6 +69,14 @@ This is what it showed on the development machine, which has 16 logical processo
 In the failure run a solver was killed two seconds into its route. Another solver took the route over 27.9 seconds after the kill, when the lease of the dead one had run out. The plan was done 40.5 seconds after it was asked for, with each of its 300 orders on exactly one route.
 
 `scripts/demo.ps1 scaling -Solvers 1,2,4,8` prints the table for your machine.
+
+### Trying the page
+
+```sh
+node scripts/page-check.mjs    # needs Node 22 or later, and Edge or Chrome
+```
+
+It drives a browser without a window through what the page is for, against the stack: the admin sets up the demo city if there is none, gives a day its orders, places one by a click, plans the day, opens a route sheet and discards the plan. Then somebody opens an account, places an order by a click and withdraws it. The browser has to hold nothing against the page all the while: no error, no refused script, no request to another host. It plans a day a month ahead, `--day` for another, and `--url` points it at another API. The admin is the one `ADMIN_EMAIL` and `ADMIN_PASSWORD` name, or the demonstration's.
 
 ## How a route is found
 
@@ -188,6 +196,7 @@ The days the bot offers are those of its clock, which is on UTC in a container u
 What the system does not do, or does only up to a point:
 
 - **One order is one stop.** A parcel goes from the depot to a client, or from a client to the depot. A courier makes one round a day, and there are no time windows.
+- **A day is planned once.** A day whose plan is done is planned again when that plan has been discarded, and then with every order of it. An order that comes in after the day was planned waits for that.
 - **A route that is still searched for is drawn as straight lines,** by road as well. It follows its streets once it is stored. One that was stored while the OSRM server was away stays straight until its day is planned again.
 - **The vans are a simulation.** No courier reports where they are. Each page reckons its own vans, so a page that opens a plan later starts them from the depot, and Refresh sends them out again.
 - **The chart of a search is the page's.** Nothing stores the lengths a search announces, so a page that is opened after a search has no chart of it.
@@ -201,10 +210,10 @@ What the system does not do, or does only up to a point:
 - **A client is told where their order is in the round, and not when.** A route has no times. And a client sees no route, no van and no sheet.
 - **On the page an operator can place an order, and cannot withdraw one.** The API lets them. A place cannot be typed there either: it is clicked.
 - **The depot and the couriers are read when the page is.** One that an admin has moved or added shows on a page that was open after Refresh.
-- **Nothing limits how many event streams one person holds open,** and since a client has a stream too, that is anybody with an account.
+- **One person holds sixteen event streams open at the most,** unless `API_STREAMS_PER_USER` says otherwise. A page holds two or three. Nothing limits how many accounts hold them.
 - **One address search a second,** for all the chats of the bot together, which is what the public service allows.
 - **A route of more than 2000 stops** is more than the OSRM server is started for, and is searched for on great circles.
-- **The page is tried by hand.** The tests check that it is served and what it loads, and not what it does.
+- **The page is tried by a script that is run by hand,** `scripts/page-check.mjs`. The tests of the API check that it is served and what it loads, and not what it does.
 
 ## More
 

@@ -43,6 +43,11 @@ Confirmed with the project owner:
   - an operator's page hears of a plan that was asked for elsewhere (D79);
   - a client is told which courier has their order and which stop of the route it is (D78). That one changes what a client may read (D41).
 - **The key that makes an order safe to repeat is a header, and the bot does not ask again by itself.** Both were settled in the phase's plan. The header is `Idempotency-Key`. When no answer comes, the bot keeps the order open and says that pressing again cannot place it twice (D76).
+- **Phase 12 is what the review of 2026-10-14 found, mended.** The project owner asked for the fixes it proposed, and chose, each time the option recommended to them:
+  - a day whose plan is done is refused another plan until that plan is discarded, over offering a later plan only the couriers with no route and over calling it a second wave (D83);
+  - the stats count the jobs of the last day and old workers are forgotten, over deleting old jobs and over leaving it as it was (D84);
+  - all four extras that were offered: a script that tries the page, the bot's dialogue split by what it does, an index of the decisions, and the plumbing of the three services in one place, of which the last was not recommended (D81, D86);
+  - the work as Phase 12 on a branch of its own, merged into `dev`.
 
 Derived from the description:
 
@@ -95,10 +100,13 @@ RouteForge/
 | 9 | More to see on the map | Routes along the streets, vans driving them, a route getting shorter while it is searched for | M | done |
 | 10 | The client's page | A client placing an order on the page and seeing it planned, beside an operator's page | L | done |
 | 11 | Free text for the bot | An order placed by a sentence | M | not decided on; needs an Anthropic API key |
+| 12 | Fixes from the review | What the review of 2026-10-14 found, mended, and the page tried by a script | L | done |
 
 **Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58). In the end one thing was dropped there: the LLM part, for which there was no key.
 
 Phases 9 to 11 were added when all of that was done, and nothing depends on any of them. Each stands by itself, so they can be taken in any order, or left. Phases 9 and 10 make a demonstration show more, and both are built. Phase 11 is the one part of the approved description that is not built.
+
+Phase 12 was added on 2026-10-14, after a review of the code (`docs/review.md`), and holds what the review found that code can mend.
 
 ## Phase 0: skeleton and tooling
 
@@ -687,6 +695,85 @@ What is known so far:
 - **To be shown in a chat it needs a token from Telegram as well,** and the project owner said on 2026-10-12 that there will be none. Without one, the half that faces Telegram is tried against the stand-in, as all of the bot is (D64), and the half that faces the model against the Claude API.
 - **The README says today that the bot understands no sentences, and why.** When this is built, that paragraph goes.
 
+## Phase 12: fixes from the review
+
+Built. Added on 2026-10-14, after a review of the code at the end of Phase 10 (`docs/review.md`). The project owner asked for the fixes it proposed, and chose four things it left open: a day whose plan is done is refused another plan until that plan is discarded; the stats count the jobs of the last day; all four of the extras it offered; and the work as a phase of its own, into `dev`.
+
+What it was to hold, as the review ranked it:
+
+- **R1:** a job that panics outside its search took its worker down for good.
+- **S1:** the login limit could be reset by a flood of logins for made-up addresses.
+- **Q1:** the page had no test that could be run again.
+- **P1, R2:** the live view counted every job there ever was, every two seconds a page, and nothing was ever deleted.
+- **A1:** a second plan of a day gave every courier a second round.
+- **S2, S3, T1, P2 to P4, Q5:** the bot's key minted an admin's token, one person could hold any number of streams, a test waited 200 ms for an answer, three reads did more than they had to, and a mistyped `RUST_LOG` said nothing.
+- **Extras:** a decision index, the services' plumbing in one place, and the bot's dialogue in files by what each does.
+
+Done when: every finding with a fix in code has it, with a test that fails without it; the page is tried by a script; and the checks of `CLAUDE.md` pass.
+
+Not mended here, because no code mends them: the bot is not LLM-powered (C1, Phase 11), it has not met Telegram (C2), and the compiler stays where teloxide's `proc-macro-error2` lets it (Q4, D10).
+
+Delivered:
+
+- **A job that panics is a failed attempt (D82).** `worker::guarded` polls a job through `catch_unwind`, and the panic's words go to `queue::fail`. A worker that is lost all the same ends its solver with the reason and an error status, after the others have given their jobs back.
+- **One plan that stands for a day (D83).** `plans::create` locks the plans of the day and refuses one while a plan of it is done: `DbError::DayIsPlanned`, a `409`. The page keeps Plan off for such a day and says why.
+- **The jobs of the last day (D84).** `queue::depth` takes a span, and the API asks for a day. A solver that starts forgets the workers not seen for a day. Migration `0009_indexes.sql`: an index on when a job ended, and one on an order's client and day in the place of the one on its client.
+- **Streams by the person (D85).** `stream::Streams` and its `Slot`, `API_STREAMS_PER_USER` (16), and a `429` with `Retry-After` on the three streams.
+- **The login limit (D68).** The count that makes room is one with the fewest tries, the newest first, and never one at its limit.
+- **The bot's token (D60).** `Tokens::issue_to_the_bot` gives an operator's rights at the most.
+- **The reads.** `orders::of_client_on` for the stream of one's own orders, `routes::stops_of_day` counting a route once, and `orders::create_many` for a day of demo orders.
+- **The services' plumbing (D81).** `routeforge_domain::service`, behind the feature `service`: `init_logging`, which says so of a `RUST_LOG` it cannot read, `told_to_stop` and `Backoff`.
+- **The bot's dialogue** in five files (D61), and its two `causes` one.
+- **The probe's tests** give a stand-in that answers the two seconds the probe has in the image.
+- **`scripts/page-check.mjs` (D86):** the page in Edge or Chrome without a window, through what it is for, with nothing held against it.
+- **The decision log** has an index of its decisions, D1 to D86, and the older decisions say what Phase 12 changed for them.
+
+The API has no new endpoint and one new setting, `API_STREAMS_PER_USER`, which compose hands on and `.env.example` explains. In `openapi.json`: the `429` of the three streams, the `409` of `POST /api/plans` in its words, what the counts of the stats count, and the words of `POST /api/auth/telegram`. The solver depends on `futures-util`, which was in the build already. The bot no longer depends on `tracing-subscriber`, and the API and the solver have it for their tests alone.
+
+Tests: 20 more, 577 in all. 8 are in the domain crate, which has 154 now, 8 in the API (151 and the 2 of its binary), and 4 in the solver (85). They hold:
+
+- what `RUST_LOG` gives when it is set, empty, missing and mistyped, and a pause that doubles to its limit and starts again;
+- a day whose plan is done refused another, by `create` and by `submit`, with nothing left behind, and planned once the plan is discarded; a day whose plan was cancelled planned again; and a plan asked for while the last route of the day's plan is stored waiting for that plan, and refused;
+- the depth of the queue counting the jobs that ended within the span and those queued however long ago, and through the API, a job that ended counted and a day later not;
+- a worker unseen for a day forgotten, by the registry and by a solver that starts;
+- one client's orders of a day, and many orders stored together, each day told once, and none stored when one of them cannot be;
+- a route job whose distances panic failing its attempts with the panic's words while its worker goes on, and a worker that panics or stops by itself ending the others and the process with the reason;
+- an address at its limit, and one a try short of it, keeping their counts through a flood of made-up addresses, and a new address waiting when every count is at its limit;
+- the bot given a client's, an operator's and, for an admin, an operator's token, and through the API not let into what is an admin's;
+- a person's streams counted, refused one over the limit with the reason and when to come back, and given back when a stream ends or is refused;
+- the `409` of a planned day through the API, with its words.
+
+The tests were tried against 48 faults put into the code on purpose: 17 in the domain crate, 11 in the solver, 18 in the API, the compose file among them, and 2 in the bot. One did not compile, and was put in again in another form. 44 made a test fail. Three were missed:
+
+- **The line in the solver's `main`** that ends the process with the error a lost worker gives. No test runs the solver's binary, and a worker cannot be made to be lost from outside. It is one `?` (D82).
+- **Starting the pause again after a success,** in the solver's listener of the jobs channel and in the bot's way to Telegram. Without it a second outage waits longer before the next try, and polling, or the next try, covers it meanwhile. `Backoff::reset` itself is tested. Neither of the two places was tested before this phase either.
+
+Two faults were plain from reading before the pass, and each got its test first: the count that makes room among the logins taken as the oldest of those below the limit, which no test would have seen, and the stats counted of any span, since no test of the stats had a job that ended. Both were caught in the pass.
+
+A fault in the page, Plan left pressable for a day whose plan is done, made `scripts/page-check.mjs` fail where it should, with a picture of the page.
+
+Tried, with the development database left alone:
+
+- **The checks of `CLAUDE.md`,** offline and `--locked`: format, clippy with warnings as errors, the bot without `db`, and the 577 tests, in 108 seconds with the compiling. `cargo audit` found what it found before: one allowed warning, `proc-macro-error2`, unmaintained. `.sqlx/` was prepared against a database with migration 0009, and `cargo sqlx prepare --check` agrees with it.
+- **The page, on the host:** an API and a solver of four workers from the debug build, on a database of their own. `scripts/page-check.mjs` passed in 6.4 seconds on a new database and in 6.0 on the same day again. With Plan left pressable for a planned day it failed there, with a picture of the page.
+- **The stack, as a clone has it:** a clone of the phase branch with no `.env`, under the project `routeforge-try12` and on other ports. Built in 114 seconds with the layers of the dependencies there already, and up on a new volume in 10 seconds, with four solvers, the API healthy and the bot idling. The images are 140, 133 and 134 MB, as they were. `scripts/page-check.mjs` passed against it in 4.6 seconds. Its logs held the warning about the demonstration's values and the depot a new database does not have, and nothing else. Taken down with its volume and its images.
+
+Not tried, because nothing of it was changed: the demonstration's scripts, the stack with the roads, and the bot against Telegram.
+
+What is left, for whoever goes on:
+
+- Phase 11, and the try with Telegram, as before.
+- The decision in the solver's `main`, to end with the error a lost worker gives, is a line no test runs (D82).
+- A day planned and then given a late order is planned again by discarding the plan: every order of the day is searched for again (D83).
+- `scripts/page-check.mjs` is run by hand.
+
+What later phases need from it:
+
+- The next migration is number 0010.
+- A new way to make a plan goes through `plans::create`, which holds the rule of D83.
+- A new event stream goes through `stream::open`, which takes its place among the user's (D85).
+- After a change to the page, `node scripts/page-check.mjs` against a stack that was built with it.
+
 ## Known traps
 
 - **sqlx compile-time queries** are checked against the metadata in `.sqlx/`, not against a database: `.cargo/config.toml` sets `SQLX_OFFLINE`. After changing a query or a migration, run `scripts/sqlx-prepare` and commit the result, or the build fails with "no cached data for this query". The script needs `sqlx-cli`, and the command that installs it is at the top of the script. To have the compiler ask the live database while writing queries, set `SQLX_OFFLINE=false` in the shell.
@@ -752,6 +839,12 @@ What is known so far:
 - **OSRM's length of a way is not the length of its line from point to point.** Measured along great circles between its points, a way came out 0.2 % shorter than OSRM says it is. Whatever compares the two has to allow for that.
 - **PowerShell rounds a fraction away in `[math]::Min(1, 0.5)`.** With a whole number among its arguments it takes the function for whole numbers, and the answer is `0`. Write `1.0`. It made every great-circle length nought in a script that checked the lengths of Phase 8, and none of the repository's scripts has it: `scripts/demo.ps1` takes the least of whole numbers.
 - **`/api/orders/{id}` takes any one word.** A path is given to the first route it fits. `/api/orders/stops`, registered after the route that takes an id, is answered `400`: `stops` is no UUID. A path of one word under a path that takes an id has to be registered before it (D77, D78).
+- **A plain `SELECT` in a CTE runs only when something reads it.** A CTE that changes rows runs whether it is read or not, but one that only selects, a `pg_notify` among its columns, is left out when the statement does not refer to it, and nobody is told. Notify in what the statement returns, as `orders::create_many` does.
+- **A `SELECT ... FOR UPDATE` that waits for a row gives the row as it is after the wait.** In READ COMMITTED it looks at the row again once the other transaction has committed. That is what lets `plans::create` see a plan that was done meanwhile (D83). Without the lock the statement sees the row as it was when it began.
+- **`EnvFilter` writes its directives in an order of its own.** `debug,sqlx=warn` comes back as `sqlx=warn,debug`. Compare it with a filter made of the same text.
+- **`cargo sqlx prepare` is run from the root of the workspace.** Anywhere else it ends with `Failed to read Cargo.toml`.
+- **A method of `Chats` in a file of its own under `chat/` is private to that file** unless it is `pub(super)`. `use super::*` there brings in the parent's types and imports, private ones too, and the fields of a struct of the parent are open to it.
+- **A headless browser says where it listens in its profile.** Started with `--remote-debugging-port=0`, Edge and Chrome write the port they took into `DevToolsActivePort` in the `--user-data-dir`. `scripts/page-check.mjs` reads it from there, and so needs no free port of its own.
 - **`ON CONFLICT DO UPDATE` is how one statement answers with the row that was there** (D59, D76). On an index that covers only some rows the statement has to say which: `ON CONFLICT (client_id, idempotency_key) WHERE idempotency_key IS NOT NULL`. Whether the row that comes back is new is read off its id, which the application made.
 - **A function that returns nothing can stand in a `CASE`.** `CASE WHEN … THEN pg_notify(…) END` notifies for some rows and not for others, in the statement that changes them. sqlx reads the column as an optional unit.
 - **utoipa says of an optional header that it may be null.** Of an optional query parameter it does not. `nullable = false` among the attributes of the parameter puts that right, and `min_length`, `max_length` and `pattern` are taken there too.
@@ -778,6 +871,7 @@ What is known so far:
   With `GEOCODER_URL` set as well, step 4 has a second way in: write an address where the location was shared, and press the button of the place.
 - For Phase 9: nothing new. The lines along the streets show where an OSRM server is asked, which takes the roads that `scripts/osrm-prepare` fetches. An OSRM server that was started before Phase 9 takes a way through 500 positions and no more: `docker compose up` makes it anew from the compose file as it is now.
 - For Phase 10: nothing. An account for the client's page is opened on the page, and the admin is the one the stack starts with.
+- For Phase 12: Node 22 or later and Edge or Chrome on a machine where `scripts/page-check.mjs` is run. Nothing else.
 - For Phase 11, the free text of the bot: the decision whether to build it, and an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58). The phase is not begun without the key.
 - The owner said on 2026-10-12 that the bootcamp holds the project to nothing formal: no rubric, and no word on whether the bot may come without its LLM part. If that changes, the README's paragraph on the bot is where the difference from the approved description is said.
 
@@ -796,3 +890,4 @@ What is known so far:
 11. Numbers: `cargo run -p routeforge-tsp --release --example quality` and `cargo bench -p routeforge-tsp` print what the README's tables were made from.
 12. The map: while a plan is searched for, each route has a chart in its row that falls, for seconds if the day has 1200 orders. When the plan is done, a van sets out along each route and is back within a minute, and the page says that the vans are simulated. The button in a route's row, or a click on its line, opens its sheet, and a row of the sheet shows its stop. With the roads of step 9 the stored routes follow the streets, and so do the vans (D73 to D75).
 13. The client's page, in two windows on one day. In the first, press "Open an account" with an address and a password of your own, click the map, and place the order: it is in your list as pending. In the second, as the admin, the order is on the map with nobody pressing Refresh. Press Plan there: the first window shows the order as planned, and then which van has it and which stop it is. Discard the plan, and it is pending again; withdraw it, and the admin's window says so. And by hand: `POST /api/orders` twice with the same `Idempotency-Key` is answered `201` and then `200`, with one order (D76 to D80).
+14. The page by a script: `node scripts/page-check.mjs` against the stack, with `ADMIN_PASSWORD` if `.env` sets one. It plans a day a month ahead and says what it tried (D86).

@@ -11,6 +11,8 @@ cargo check -p routeforge-bot --locked    # the bot must build without the `db` 
 cargo test --workspace --locked
 ```
 
+After a change to `web/index.html`, build the stack with it and run `node scripts/page-check.mjs` against it (D86). It needs Node 22 or later and Edge or Chrome, and says what it tried.
+
 From Phase 2 on, tests need Postgres: `docker compose up -d db`, with `.env` copied from `.env.example`.
 
 CI runs `cargo audit` as well, in a job of its own. `.cargo/audit.toml` lists what it ignores, and why (D12). After a change to the dependencies, run it here first: `cargo install cargo-audit --version 0.22.1 --locked` once.
@@ -61,6 +63,11 @@ An API that is to take a bot needs `BOT_SERVICE_KEY` as well, of at least 32 byt
 - Exactly five crates. Helpers go into an existing crate, never a new one.
 - `routeforge-tsp` has no I/O, no async and no workspace dependencies, and takes every random number from a seeded generator.
 - `routeforge-api` never depends on `routeforge-tsp`. `routeforge-bot` never enables the `db` or the `openapi` feature of `routeforge-domain`.
+- How the three binaries log, hear that they are to stop, and pause before a retry is `routeforge_domain::service`, behind the feature `service`, which all three enable (D81). It goes there and not into a binary.
+- A job's future is polled through `worker::guarded`, so that a panic in it is a failed attempt (D82). A worker that ends without being told to ends its solver with an error: it is not started again in its place.
+- A date has one plan that stands: one in progress, or one that is done (D83). `plans::create` holds the rule, under a lock of the date's plans, and a new way to make a plan goes through it.
+- An event stream is opened through `stream::open`, which takes a place among the user's streams (D85). The place is a field of the stream's value, so it is given back however the stream ends.
+- The bot is given its token by `Tokens::issue_to_the_bot`, which gives an operator's rights at the most (D60).
 - No `unsafe`. No `unwrap()` outside tests.
 - Route costs are integer metres.
 - A courier is never overloaded along its route (D65). A route is searched with `optimize_route_within`, on the `Loads` of its orders and its courier, and the solver checks the calling order with `Loads::fits` once more before it stores it. Whatever changes the order of a route's stops after the search, as turning it round for the roads does, has to check that too.
@@ -90,7 +97,7 @@ An API that is to take a bot needs `BOT_SERVICE_KEY` as well, of at least 32 byt
 - What a person writes to the bot goes to the geocoding service, if there is one, and nowhere else: not into a log, and not into an error. A reqwest error names the address it asked, query and all, so it goes through `without_url()` first (D72).
 - Every request to the geocoding service waits for its turn in `Nominatim::turn`: one a second for all the chats together, which is what the public service allows an application. The bot asks it when a person has written an address, and at no other time (D72).
 - A file added under `web/` needs a row in `FILES` in `crates/routeforge-api/src/page.rs`. Files under `web/vendor/` are kept as they were released: do not edit them (D52).
-- The page asks no other host for anything but map tiles, and puts text from the API into the document as text, never as HTML (D52). After changing `web/index.html`, try it in a browser: the tests check that the page is served and what it loads, not what it does.
+- The page asks no other host for anything but map tiles, and puts text from the API into the document as text, never as HTML (D52). After changing `web/index.html`, run `scripts/page-check.mjs` and look at it in a browser: the tests check that the page is served and what it loads, not what it does.
 - The page is served with a policy that names its one `<script>` and its one `<style>` by their hash, and allows no other inline code (D69). So the page has one of each, without attributes, and no `style` attribute and no handler in an attribute anywhere. What the browser refuses shows in its console and nowhere else.
 - The page makes its SVG with Leaflet's `L.SVG.create`, and names no namespace: to the test that reads the page for other hosts, a namespace is an address (D75).
 - What moves on the page is a simulation, and the page says so beside it. Nothing reports where a courier is, and nothing is to: tracking is among what the approved description rules out. The vans are reckoned on the page, from the routes as they are stored (D74).

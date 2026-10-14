@@ -22,7 +22,7 @@ How a plan is made:
 3. Solvers claim the `route` jobs. Each one optimizes the stop order for a single courier, so that the courier is never overloaded on the way, and writes the route in the transaction that completes its job. The distances it works on are great circles, or roads where the solver was given an OSRM server to ask (D66). A route by road is stored with the way it takes along the streets, which the solver asks the same server for (D73).
 4. When the last `route` job completes, the plan is marked done.
 
-A plan that is cancelled, or that loses a job for good, undoes itself: its routes are deleted and its orders are pending again (D20). A plan that is done can be discarded, which undoes it the same way, so that its date can be planned again (D30).
+A plan that is cancelled, or that loses a job for good, undoes itself: its routes are deleted and its orders are pending again (D20). A plan that is done can be discarded, which undoes it the same way, so that its date can be planned again (D30). A date is planned again only so: while a plan of it is done, another is refused (D83).
 
 How a plan is watched:
 
@@ -59,12 +59,103 @@ The workspace has exactly five crates, as the [approved description](description
 | Crate | Role | Workspace crates it may use |
 |---|---|---|
 | `routeforge-tsp` | Clustering and route optimization. Pure computation. | none |
-| `routeforge-domain` | Domain types, DTOs and geo helpers. With the `db` feature: persistence and the job queue. With the `openapi` feature: the schemas of the DTOs. | none |
-| `routeforge-api` | HTTP API, auth, OpenAPI, the map page. | `domain` with `db` and `openapi` |
-| `routeforge-solver` | Queue worker. Asks an OSRM server for distances by road and for the way a route takes, if it is given one. | `domain` with `db`, `tsp` |
-| `routeforge-bot` | Telegram bot. Asks a geocoding service where an address is, if it is given one. | `domain` without `db` |
+| `routeforge-domain` | Domain types, DTOs and geo helpers. With the `db` feature: persistence and the job queue. With the `openapi` feature: the schemas of the DTOs. With the `service` feature: the logging, the stop signal and the pause before a retry that the three services share (D81). | none |
+| `routeforge-api` | HTTP API, auth, OpenAPI, the map page. | `domain` with `db`, `openapi` and `service` |
+| `routeforge-solver` | Queue worker. Asks an OSRM server for distances by road and for the way a route takes, if it is given one. | `domain` with `db` and `service`, `tsp` |
+| `routeforge-bot` | Telegram bot. Asks a geocoding service where an address is, if it is given one. | `domain` with `service`, without `db` |
 
 ## Decisions
+
+Every decision with its number, what it holds, and whether it holds now. A decision that was replaced says by which.
+
+| | Decision | Status |
+|---|---|---|
+| [D1](#d1-one-order-is-one-stop-relative-to-a-depot-in-place) | One order is one stop, relative to a depot | in place |
+| [D2](#d2-a-plan-is-one-plan-job-that-fans-out-into-route-jobs-in-place) | A plan is one `plan` job that fans out into `route` jobs | in place |
+| [D3](#d3-persistence-lives-in-routeforge-domain-behind-the-db-feature-in-place) | Persistence lives in `routeforge-domain`, behind the `db` feature | in place |
+| [D4](#d4-costs-are-integer-metres-in-place) | Costs are integer metres | in place |
+| [D5](#d5-the-search-is-deterministic-a-deadline-only-cuts-it-short-in-place) | The search is deterministic; a deadline only cuts it short | in place |
+| [D6](#d6-jobs-are-delivered-at-least-once-completion-is-fenced-in-place) | Jobs are delivered at least once; completion is fenced | in place |
+| [D7](#d7-capacity-first-version-all-demands-on-a-route-share-the-limit-replaced-by-d65) | Capacity, first version: all demands on a route share the limit | replaced by D65 |
+| [D8](#d8-the-demo-works-without-the-internet-in-place) | The demo works without the internet | in place |
+| [D9](#d9-the-bot-has-no-authority-of-its-own-in-place) | The bot has no authority of its own | in place |
+| [D10](#d10-rust-1990-pinned-in-place) | Rust 1.99.0, pinned | in place |
+| [D11](#d11-postgresql-17-in-place) | PostgreSQL 17 | in place |
+| [D12](#d12-one-tls-stack-no-native-crypto-libraries-in-place) | One TLS stack, no native crypto libraries | in place |
+| [D13](#d13-lint-baseline-in-place) | Lint baseline | in place |
+| [D14](#d14-node-0-is-the-depot-and-the-distance-matrix-is-symmetric-in-place) | Node 0 is the depot, and the distance matrix is symmetric | in place |
+| [D15](#d15-one-control-for-all-stages-one-iteration-is-one-candidate-move-in-place) | One control for all stages; one iteration is one candidate move | in place |
+| [D16](#d16-sweep-largest-courier-first-then-repair-in-place) | Sweep: largest courier first, then repair | in place |
+| [D17](#d17-the-annealing-schedule-in-place) | The annealing schedule | in place |
+| [D18](#d18-annealing-runs-until-it-is-stopped-in-place) | Annealing runs until it is stopped | in place |
+| [D19](#d19-schema-conventions-in-place) | Schema conventions | in place |
+| [D20](#d20-an-order-is-on-one-route-at-most-and-a-plan-that-ends-early-undoes-itself-in-place) | An order is on one route at most, and a plan that ends early undoes itself | in place |
+| [D21](#d21-the-depot-has-versions-in-place) | The depot has versions | in place |
+| [D22](#d22-the-job-row-and-the-claim-in-place) | The job row and the claim | in place |
+| [D23](#d23-retries-final-failure-and-cancelling-in-place) | Retries, final failure and cancelling | in place |
+| [D24](#d24-lock-order-the-plan-row-first-in-place) | Lock order: the plan row first | in place |
+| [D25](#d25-completing-a-job-is-a-handle-not-a-closure-in-place) | Completing a job is a handle, not a closure | in place |
+| [D26](#d26-a-notification-is-a-hint-in-place) | A notification is a hint | in place |
+| [D27](#d27-the-worker-registry-is-not-part-of-the-queue-in-place) | The worker registry is not part of the queue | in place |
+| [D28](#d28-query-metadata-is-committed-and-a-build-needs-no-database-in-place) | Query metadata is committed, and a build needs no database | in place |
+| [D29](#d29-distances-and-the-flat-map-in-place) | Distances and the flat map | in place |
+| [D30](#d30-a-plan-that-is-done-can-be-discarded-and-its-date-planned-again-in-place) | A plan that is done can be discarded, and its date planned again | in place |
+| [D31](#d31-how-long-a-route-is-searched-for-is-part-of-the-plan-in-place) | How long a route is searched for is part of the plan | in place |
+| [D32](#d32-the-api-owns-the-schema-and-a-solver-waits-for-it-in-place) | The API owns the schema, and a solver waits for it | in place |
+| [D33](#d33-the-worker-loop-in-place) | The worker loop | in place |
+| [D34](#d34-a-lease-lives-exactly-as-long-as-the-jobs-future-in-place) | A lease lives exactly as long as the job's future | in place |
+| [D35](#d35-a-worker-that-is-told-to-stop-drops-its-job-and-gives-it-back-in-place) | A worker that is told to stop drops its job and gives it back | in place |
+| [D36](#d36-the-plan-job-is-one-transaction-in-place) | The `plan` job is one transaction | in place |
+| [D37](#d37-what-counts-as-a-failed-attempt-in-place) | What counts as a failed attempt | in place |
+| [D38](#d38-one-dockerfile-a-target-for-each-service-in-place) | One Dockerfile, a target for each service | in place |
+| [D39](#d39-the-http-api-one-prefix-plain-json-one-shape-of-error-in-place) | The HTTP API: one prefix, plain JSON, one shape of error | in place |
+| [D40](#d40-passwords-and-tokens-in-place) | Passwords and tokens | in place |
+| [D41](#d41-who-may-call-what-is-a-table-and-the-tests-hold-the-api-to-it-in-place) | Who may call what is a table, and the tests hold the API to it | in place |
+| [D42](#d42-one-id-follows-a-request-into-the-logs-of-the-solvers-in-place) | One id follows a request into the logs of the solvers | in place |
+| [D43](#d43-the-openapi-document-comes-from-the-types-and-the-handlers-in-place) | The OpenAPI document comes from the types and the handlers | in place |
+| [D44](#d44-a-list-is-read-in-pages-by-the-id-of-the-last-item-in-place) | A list is read in pages, by the id of the last item | in place |
+| [D45](#d45-the-api-gives-a-plan-its-budget-and-its-seed-when-it-names-none-in-place) | The API gives a plan its budget and its seed when it names none | in place |
+| [D46](#d46-demo-orders-come-from-the-api-from-a-seed-in-place) | Demo orders come from the API, from a seed | in place |
+| [D47](#d47-the-api-ends-at-once-when-it-cannot-start-in-place) | The API ends at once when it cannot start | in place |
+| [D48](#d48-a-change-to-a-plan-is-announced-where-it-is-made-in-place) | A change to a plan is announced where it is made | in place |
+| [D49](#d49-a-search-hands-out-its-best-route-and-its-worker-announces-it-in-place) | A search hands out its best route, and its worker announces it | in place |
+| [D50](#d50-one-connection-listens-and-the-event-streams-read-in-place) | One connection listens, and the event streams read | in place |
+| [D51](#d51-the-api-stops-at-once-with-streams-open-in-place) | The API stops at once with streams open | in place |
+| [D52](#d52-the-page-is-one-file-inside-the-binary-in-place) | The page is one file, inside the binary | in place |
+| [D53](#d53-the-plans-of-a-day-are-listed-whole-in-place) | The plans of a day are listed whole | in place |
+| [D54](#d54-the-stack-is-one-command-and-needs-no-settings-in-place) | The stack is one command, and needs no settings | in place |
+| [D55](#d55-the-api-answers-for-its-own-health-in-place) | The API answers for its own health | in place |
+| [D56](#d56-the-bot-holds-its-place-in-the-stack-before-it-is-built-in-place) | The bot holds its place in the stack before it is built | in place |
+| [D57](#d57-the-demonstration-is-a-script-in-place) | The demonstration is a script | in place |
+| [D58](#d58-the-bot-takes-buttons-and-commands-and-free-text-waits-for-a-key-in-place) | The bot takes buttons and commands, and free text waits for a key | in place |
+| [D59](#d59-a-telegram-user-gets-an-account-of-their-own-the-first-time-the-bot-hears-of-them-in-place) | A Telegram user gets an account of their own, the first time the bot hears of them | in place |
+| [D60](#d60-the-bot-shows-a-key-and-is-given-a-token-of-the-person-in-place) | The bot shows a key, and is given a token of the person | in place |
+| [D61](#d61-the-bot-is-a-dialogue-that-knows-nothing-of-telegram-behind-a-part-that-decides-nothing-in-place) | The bot is a dialogue that knows nothing of Telegram, behind a part that decides nothing | in place |
+| [D62](#d62-how-the-bot-starts-waits-and-stops-in-place) | How the bot starts, waits and stops | in place |
+| [D63](#d63-an-order-announces-itself-in-place) | An order announces itself | in place |
+| [D64](#d64-the-bot-is-tried-against-stand-ins-and-its-requests-are-held-to-the-apis-document-in-place) | The bot is tried against stand-ins, and its requests are held to the API's document | in place |
+| [D65](#d65-what-a-courier-has-on-board-is-followed-along-the-route-in-place) | What a courier has on board is followed along the route | in place |
+| [D66](#d66-distances-by-road-come-from-an-osrm-server-and-a-route-says-what-it-was-measured-along-in-place) | Distances by road come from an OSRM server, and a route says what it was measured along | in place |
+| [D67](#d67-osrm-is-a-service-of-the-stack-behind-a-profile-on-roads-that-are-fetched-once-in-place) | OSRM is a service of the stack behind a profile, on roads that are fetched once | in place |
+| [D68](#d68-a-login-is-counted-and-passwords-are-hashed-a-few-at-a-time-in-place) | A login is counted, and passwords are hashed a few at a time | in place |
+| [D69](#d69-the-page-is-served-with-a-content-security-policy-in-place) | The page is served with a content security policy | in place |
+| [D70](#d70-the-api-says-when-it-runs-on-the-demonstrations-values-in-place) | The API says when it runs on the demonstration's values | in place |
+| [D71](#d71-a-depot-can-be-read-by-its-id-and-a-plan-is-drawn-from-its-own-in-place) | A depot can be read by its id, and a plan is drawn from its own | in place |
+| [D72](#d72-the-bot-looks-an-address-up-at-a-service-it-is-given-in-place) | The bot looks an address up, at a service it is given | in place |
+| [D73](#d73-a-route-by-road-keeps-the-way-it-takes-and-the-map-draws-it-in-place) | A route by road keeps the way it takes, and the map draws it | in place |
+| [D74](#d74-the-vans-on-the-map-are-a-simulation-and-each-page-reckons-its-own-in-place) | The vans on the map are a simulation, and each page reckons its own | in place |
+| [D75](#d75-the-chart-of-a-search-and-the-route-sheet-are-the-pages-in-place) | The chart of a search and the route sheet are the page's | in place |
+| [D76](#d76-a-key-makes-placing-an-order-safe-to-repeat-in-place) | A key makes placing an order safe to repeat | in place |
+| [D77](#d77-a-stream-says-when-something-has-become-of-ones-own-orders-in-place) | A stream says when something has become of one's own orders | in place |
+| [D78](#d78-whoever-placed-an-order-is-told-where-it-is-on-its-route-in-place) | Whoever placed an order is told where it is on its route | in place |
+| [D79](#d79-an-operators-page-hears-of-a-plan-that-was-asked-for-elsewhere-in-place) | An operator's page hears of a plan that was asked for elsewhere | in place |
+| [D80](#d80-the-page-takes-an-account-and-an-order-and-lists-a-clients-own-in-place) | The page takes an account and an order, and lists a client's own | in place |
+| [D81](#d81-the-services-share-their-plumbing-through-a-feature-of-the-domain-crate-in-place) | The services share their plumbing through a feature of the domain crate | in place |
+| [D82](#d82-a-job-that-panics-fails-its-attempt-and-a-solver-that-loses-a-worker-ends-in-place) | A job that panics fails its attempt, and a solver that loses a worker ends | in place |
+| [D83](#d83-a-date-has-one-plan-that-stands-in-place) | A date has one plan that stands | in place |
+| [D84](#d84-the-live-view-counts-the-jobs-of-the-last-day-and-forgets-the-workers-of-long-ago-in-place) | The live view counts the jobs of the last day, and forgets the workers of long ago | in place |
+| [D85](#d85-one-person-holds-only-so-many-event-streams-open-in-place) | One person holds only so many event streams open | in place |
+| [D86](#d86-a-script-tries-the-page-in-a-browser-in-place) | A script tries the page in a browser | in place |
 
 ### D1. One order is one stop, relative to a depot (in place)
 
@@ -87,6 +178,8 @@ How the solver runs the two kinds of job is in D34 and D36.
 ### D3. Persistence lives in `routeforge-domain`, behind the `db` feature (in place)
 
 Why: both `api` and `solver` need the repositories and the queue, and the workspace is fixed at five crates, so there is no room for a separate storage crate. The feature keeps sqlx out of the bot, which reaches the system only over HTTP. CI builds the bot on its own to prove that.
+
+Since Phase 12 a third feature, `service`, holds what the three services share beside their types. The bot takes that one, and neither of the others (D81).
 
 ### D4. Costs are integer metres (in place)
 
@@ -144,7 +237,7 @@ How it is built: the token is D60, and the confirmation is D61. The bot looks at
 
 Why: sqlx 0.9 needs Rust 1.94 or newer, and one compiler everywhere removes differences between machines.
 
-Check before raising the pin: teloxide 0.17 depends, through `aquamarine`, on `proc-macro-error2` 2.0.1. Rust 1.99 compiles it with a future-incompatibility warning (rust-lang/rust#127909), and a later compiler will reject it. The crate is also marked unmaintained (RUSTSEC-2026-0173).
+Check before raising the pin: teloxide 0.17 depends, through `aquamarine`, on `proc-macro-error2` 2.0.1. Rust 1.99 compiles it with a future-incompatibility warning (rust-lang/rust#127909), and a later compiler will reject it. The crate is also marked unmaintained (RUSTSEC-2026-0173). Clippy prints the warning on every run, and `cargo audit` the advisory, as an allowed warning. So the compiler stays where it is until teloxide no longer needs that crate: watch its releases.
 
 ### D11. PostgreSQL 17 (in place)
 
@@ -252,7 +345,7 @@ Why:
 - A plan takes its orders under a row lock (`orders::lock_pending`). Without it a client could cancel an order between the moment it was counted into a cluster and the moment it was marked. With it one of the two is first and the other sees that.
 - After a plan that undid itself the date looks as it did before, and can simply be planned again. Half a plan would need rules of its own: which of its routes count, and which orders are free.
 
-A plan that is done keeps its orders. A later plan for the same date takes the orders that are still pending and adds its routes to those that are there. Getting the orders of a done plan back is D30.
+A plan that is done keeps its orders. Until Phase 12 a later plan for the same date took the orders that were still pending and added its routes to those that were there. Since then there is no later plan while a plan that is done stands: it is discarded first, and the date planned afresh (D83). Getting the orders of a done plan back is D30.
 
 ### D21. The depot has versions (in place)
 
@@ -362,7 +455,7 @@ Decided by the project owner on 2026-10-11.
 
 Discarding undoes a plan that is done, the way a plan that fails or is cancelled undoes itself (D20): its routes are deleted and its orders are pending again. The plan row stays, with the status `discarded`. The operator then plans the date again, and the new plan takes every pending order of the date. Only a plan that is done can be discarded. One that is still in progress is cancelled instead.
 
-A date whose plan is not discarded is planned as before: a later plan takes the orders that are still pending.
+Until Phase 12 a date whose plan was not discarded was planned as before: a later plan took the orders that were still pending. Since then such a date is refused another plan until its plan is discarded (D83).
 
 Why:
 
@@ -485,7 +578,7 @@ Each route job carries the request id of the plan job. That is how one request c
 ### D37. What counts as a failed attempt (in place)
 
 - An error while a job runs is reported with `queue::fail`, with the chain of its causes as the text. The queue retries the job or, after the last attempt, fails it together with its plan (D23). The reason is then on the plan for the operator to read.
-- A panic in the search is such an error.
+- A panic in the search is such an error. Since Phase 12 so is a panic anywhere in a job, and a worker that is lost all the same ends its solver (D82).
 - A job this build cannot read is logged and the next one claimed. The queue has counted that attempt already (D22).
 - Trouble with the database outside a job is not held against any job. A claim that fails is tried again after the poll interval, a heartbeat at the next heartbeat, and a connection at startup after a pause that doubles up to 30 seconds.
 - A failure that cannot be reported is left alone. The lease runs out, and the queue treats the job as it treats that of a worker that died.
@@ -659,7 +752,7 @@ Why:
 
 ### D46. Demo orders come from the API, from a seed (in place)
 
-`POST /api/demo/orders`, for admins, stores up to 2000 pending orders for a date, spread evenly over a disc round the depot. Its radius is 5 km by default and 30 km at most. About one in five is a pickup, and each has a demand of 1 to 3. They belong to the admin who asked. They are stored in one transaction.
+`POST /api/demo/orders`, for admins, stores up to 2000 pending orders for a date, spread evenly over a disc round the depot. Its radius is 5 km by default and 30 km at most. About one in five is a pickup, and each has a demand of 1 to 3. They belong to the admin who asked. They are stored in one statement, `orders::create_many`, since Phase 12, and in one transaction of an insert each before that.
 
 Every random choice comes from a ChaCha8 generator seeded with the request's seed, as in `routeforge-tsp` (D5). The same seed gives the same orders round the same depot.
 
@@ -728,6 +821,8 @@ A worker can now make three calls at one moment: its heartbeat, an announcement,
 
 What the callback costs: nothing that can be measured. The benchmarks of the old code and the new were run back to back, twice. 2-opt at 50 stops took 11.97 and 12.25 µs before and 12.15 and 12.18 after. Annealing 100 000 moves at 200 stops took 1.98 and 2.00 ms before and 2.01 and 1.99 after.
 
+A ceiling, noted in the review of Phase 12: PostgreSQL commits the transactions that notified one at a time, under a lock of the whole database, so that the notifications arrive in the order of the commits. Every order, claim and completion notifies, and so does every search, four times a second. At the scale of the demonstration that is nothing. Under a heavy load of writes it is the first thing to give, and the progress of the searches is then the first thing to send less often, or another way.
+
 What there is to see, measured with four solvers in containers on the development machine:
 
 - Routes of about a hundred stops, as 300 demo orders give, are at the length they end with by the second announcement, a quarter of a second in. From the first tour to a local optimum takes the search a few milliseconds, and annealing then finds little or nothing. The line appears, jumps once, and stands.
@@ -754,7 +849,7 @@ A stream opens with everything it shows. After that:
 - Progress is passed on as it comes, with no read. So is the word that an order was placed or withdrawn, by the stats stream. That a plan has changed is passed on by the stats stream as well, and is a reason for it to read (D79). The stream of one's own orders passes nothing on: it reads, and speaks if what it read has changed (D77).
 - A comment line every 15 seconds keeps a quiet stream from being taken for a dead one.
 
-A stream ends when its reader has gone, when the token it was opened with expires, when the API is told to stop (D51), and when a read fails.
+A stream ends when its reader has gone, when the token it was opened with expires, when the API is told to stop (D51), and when a read fails. Since Phase 12 one person holds only so many streams open at once (D85).
 
 Why:
 
@@ -832,7 +927,7 @@ So a client no longer only looks. What a client is shown is still what the API l
 
 What the page learns only from Refresh. Until Phase 7 that was an order that somebody else had placed. An operator's page hears of one since then (D63), and a client's of their own since Phase 10 (D77). A plan that was asked for elsewhere shows on an operator's page since Phase 10 as well (D79). What is left is the depot and the couriers: a page that was open when an admin moved the one or added the other shows it after Refresh.
 
-The page has no tests of its own. The API's tests check that it is served and what it loads. What it does was tried in a browser: `docs/plan.md` says how.
+The page has no tests of its own. The API's tests check that it is served and what it loads. What it does was tried in a browser: `docs/plan.md` says how. Since Phase 12 a script does that, run by hand: `scripts/page-check.mjs` (D86).
 
 ### D53. The plans of a day are listed whole (in place)
 
@@ -1044,7 +1139,7 @@ Why:
 - As a bearer and not in a header of its own: the answer to a missing key is then the `401` with `WWW-Authenticate: Bearer` that the API has anyway, and credentials are read in one place. In the OpenAPI document it is a second scheme, `service_key`, so Swagger UI asks for it by name.
 - `401` and not `403` for a user's token: a `403` says that the caller is known and may not. A token is not known here at all.
 
-What the key is worth: a token of any account that Telegram reaches. That is whatever account is asked for by its Telegram id, an operator's or an admin's included. Outside a demonstration it is a secret of the rank of the signing key. Neither the API nor the bot can log it: both hold it in a type without `Debug`.
+What the key is worth: a token of any account that Telegram reaches. That is whatever account is asked for by its Telegram id, an operator's included. Until Phase 12 an admin's was included as well. Since then the token gives an operator's rights at the most, which are all the bot uses: orders, plans and the depot. The session still names the account as it is, so the bot tells an admin that they are one. Outside a demonstration the key is a secret of the rank of the signing key all the same. Neither the API nor the bot can log it: both hold it in a type without `Debug`.
 
 The request is logged like any other (D42). Its `user_id` is the account the bot asked a token for.
 
@@ -1057,7 +1152,7 @@ Tests: the key gets a token that places an order as a new client, and opens noth
 | Module | |
 |---|---|
 | `api` | What the bot asks of the API: a trait, `Api`, and `HttpApi`, which asks over HTTP. |
-| `chat` | What the bot says and does. What came from a chat goes in, an `Event`. A `Reply` comes out: a text, and the buttons under it. |
+| `chat` | What the bot says and does. What came from a chat goes in, an `Event`. A `Reply` comes out: a text, and the buttons under it. Since Phase 12 in five files: `chat.rs` with the types, how an event is handed on and who is asking, and `chat/draft.rs`, `search.rs`, `orders.rs` and `operator.rs`. |
 | `telegram` | Updates of Telegram's become events, and replies become messages. Nothing is decided there. |
 
 How an order is placed:
@@ -1200,7 +1295,7 @@ What it does not do:
 
 - The search never passes through a tour that overloads the courier. Where the loads are tight, a shorter tour that small moves reach only through such a tour may not be found.
 - A parcel that is picked up goes to the depot. It cannot be delivered on the same route (D1).
-- A courier drives one round a day. Coming back to unload and going out again is not planned.
+- A courier drives one round a day. Coming back to unload and going out again is not planned. Since Phase 12 a second plan of a day cannot send it out again either (D83).
 
 Tests: the sweep's properties under the two kinds of room, and deliveries and pickups not taking each other's; a tour within the loads at every stage, for random routes and loads; never longer than the best such tour that an exhaustive search finds, for up to nine stops; the same seed giving the same tour; with loads that cannot overload, the very tour of the search without loads; a square on which the shortest tour overloads the courier, 40 against 48. In the solver: a courier that leaves full delivers before it picks up; a day of mixed orders with no route over its courier's capacity; a route that overloads its courier not stored.
 
@@ -1277,7 +1372,7 @@ Decided with the project owner on 2026-10-12, as the first of four items of hard
 - **Only so many logins are taken for one address within a minute:** five, unless `API_LOGIN_ATTEMPTS` says otherwise. The next is answered `429` with a `Retry-After`, before anything is looked up or hashed.
 - **It counts by the address that was sent,** in lower case, whether it has an account or not, and right password or wrong. A login that succeeds clears the count. A login the API could not check, for a fault of its own, is not counted.
 - **Passwords are hashed four at a time,** unless `API_HASHES_AT_ONCE` says otherwise. A login that gets no turn within five seconds is answered `503`, and is not counted either.
-- **The counts are in memory,** for at most ten thousand addresses, the oldest going first.
+- **The counts are in memory,** for at most ten thousand addresses. When there is no room, the counts whose window is over go first, and then one of those with the fewest tries, the newest first. A count that has reached its limit never goes: until Phase 12 the oldest went, and a flood of logins for made-up addresses gave an address that had had its tries a fresh five. When every count is at its limit, a new address waits.
 
 Why:
 
@@ -1546,7 +1641,7 @@ Why:
 - The same event as the stats stream, and not the orders themselves: one handler on the page serves both, and the read that follows is the one the page makes anyway, in pages (D44).
 - A stream of its own, and not the stats stream opened to clients: that one shows the queue and the workers, which are an operator's (D41).
 
-What it costs: every stream of this kind reads when any plan changes, at most five times a second each (D50). A read is two queries by the index on `orders.client_id`.
+What it costs: every stream of this kind reads when any plan changes, at most five times a second each (D50). A read is two queries. Since Phase 12 the one of the orders is a statement of its own, `orders::of_client_on`, served by the index on client and day of migration 0009.
 
 Good to know: a page that picks another day opens the stream of that day, and leaves the one it had. The API finds a stream without a reader when it next writes to it, and a quiet stream writes a comment every fifteen seconds (D50). Until then the stream that was left reads as the others do. Three that one page had left were still open when the API was stopped a little later, and ended with it.
 
@@ -1564,7 +1659,7 @@ Decided with the project owner on 2026-10-13, as one of four things beyond the l
 
 - **An order is on a route from the moment the route is stored.** While the route is still searched for, the order is planned and has no stop.
 - **The calls are counted over the whole route,** and not over the rows that are one client's.
-- **One query serves the endpoint and the stream of D77.**
+- **One query serves the endpoint and the stream of D77.** Since Phase 12 it counts the calls of each route once, for the routes the orders are on, and not once for each order.
 
 This changes what a client may read (D41). Until now a client was told nothing of a route. Now they are told the name of the courier that has their order, its place in the round, and the length of the round in calls. Of the route itself they are told nothing: not its other calls, its line or its length.
 
@@ -1633,4 +1728,134 @@ What it does not do:
 
 Found while it was tried: a click on the line of a route left a black box round the whole route. Leaflet listens for the focus of whatever has a tooltip. To the browser a line that is listened to like that is one a click gives the focus to, and it draws the outline of the focus as a box. That was so since Phase 9, which made the lines something to click. The page takes that outline off. Nothing on the map is reached by keyboard.
 
-The page has no tests of its own (D52). How it was tried is in `docs/plan.md`.
+The page has no tests of its own (D52). How it was tried is in `docs/plan.md`. Since Phase 12 a script tries it in a browser (D86).
+
+### D81. The services share their plumbing through a feature of the domain crate (in place)
+
+Decided by the project owner on 2026-10-14, from the review of that day (`docs/review.md`, finding Q2).
+
+`routeforge_domain::service`, behind a feature of its own, `service`, has what the API, the solver and the bot do alike and have nothing to do with their work:
+
+- `init_logging`: lines for people, or JSON with `LOG_FORMAT=json`, filtered by `RUST_LOG`. A `RUST_LOG` that cannot be read is said to be so, once there is a log to say it in, and `info` is logged in its place (finding Q5).
+- `told_to_stop`: Ctrl-C, and SIGTERM where there is one (D35, D51, D62).
+- `Backoff`: the pause before the next try, a second at first and twice as long each time up to half a minute, started again by a success. The solver waits so for its database and its listener (D37), the API's listener for its connection (D50), and the bot for Telegram (D62).
+
+All three enable the feature. The bot enables it without `db` and without `openapi`.
+
+Why:
+
+- Each binary had a copy of the first two, word for word, and four loops doubled a pause in four ways of their own. A change to one had to be made to the others by hand, and the comments said as much.
+- In the domain crate, because the workspace has five crates and a helper goes into one of them. Behind a feature, because the domain crate is otherwise plain data, and tokio's signals and a log subscriber are no business of a type.
+- Not into a crate of the bot's or of the API's: the three share it, and none of them may depend on another.
+
+`tracing-subscriber` is a dev-dependency of the API and the solver, for their tests that read the log, and the bot no longer has it.
+
+The bot's two ways of writing an error with its causes are one as well, `api::causes`. The geocoder takes the address out of the error before it hands it on, as before (D72).
+
+Tests: what `RUST_LOG` gives when it is set, empty, missing and mistyped; a pause that doubles to its limit and starts again; the pauses the services wait.
+
+### D82. A job that panics fails its attempt, and a solver that loses a worker ends (in place)
+
+From the review of 2026-10-14 (finding R1).
+
+- **A job's future is polled through `catch_unwind`** (`worker::guarded`). A panic anywhere in a job, and not only on the blocking thread of a search, is an error of the attempt, with what the panic said. It goes to `queue::fail` like any other error (D37).
+- **The job is dropped where it stood,** its heartbeat and its search with it, as when the worker is told to stop (D34). It is not polled again after it panicked.
+- **A worker that ends without being told to has been lost** to a fault outside its jobs. `worker::run` tells the other workers of the process to stop, they give their jobs back (D35), and the solver ends with the reason and a status that says something went wrong.
+
+Why:
+
+- Until Phase 12 a panic in a job's own code ended the worker's task. The job waited out its lease for the next worker to panic over, nothing took the worker's place, and a solver whose last worker had gone ended with status 0. A job that panicked on some input took a solver down with each of its attempts.
+- A failed attempt is how the queue already bounds a job that cannot be done (D23). With the panic as its reason, the plan says why it failed.
+- A process that has lost a worker is not what it was started as. Ending it says so, where going on would say nothing (D47). Starting another worker in its place could start one fault after another.
+
+What it does not do: start the solver again. The stack still has no restart policy (D54). A solver that ends is ended, and `docker compose ps` shows it with its status.
+
+Tests: a route job whose distances panic fails each attempt with the panic's words, and the one worker there is takes all three attempts and stops when it is told to; a worker that panics, or that stops by itself, ends the others and the process with the reason; workers that are told to stop end it well.
+
+The decision in `main`, to end with the error `run` gives, is a line that no test runs: the solver's binary is not run by a test, and a worker cannot be made to be lost from outside.
+
+### D83. A date has one plan that stands (in place)
+
+Decided by the project owner on 2026-10-14, from the review of that day (finding A1). Changes D20 and D30.
+
+A plan stands while it is in progress and once it is done. A date has one at a time: a plan for a date that has a plan that is done is refused, with a `409` that says to discard it first. Once discarded, the date is planned afresh, with every order of it (D30). A plan that failed or was cancelled has undone itself and stands no more (D20).
+
+- **In the database** `plans::create` locks the plans of the date, in the order of their ids, and inserts the new one only if none of them is done. In one statement. The plan in progress is refused, as before, by the unique index of D20.
+- **The lock** is what makes the rule hold when the last route of a plan is stored in the very moment another plan is asked for. Without it the request would see the plan as the plan in progress it was a moment before, wait for its row to be written, and then go in as a second plan beside a plan that is done.
+- **On the page** Plan cannot be pressed for a day whose plan is done, and says why. The bot shows the API's words.
+
+Why:
+
+- A plan that is done gives its couriers their round of the day. A second plan of the same day was offered every active courier at its whole capacity, knowing nothing of the first, and so gave each of them a second round. The model says that a courier makes one round a day (D1, D65), and the page shows one plan of a day at a time, so an operator did not see it.
+- Refusing is the smallest of the three ways that were offered. The others were to offer a later plan only the couriers that have no route that day, and to call a later plan a second wave.
+- In the database and not in the handler, so that no way to a plan goes round it.
+
+What it costs: an order that comes in after the day was planned is planned by discarding the plan and planning the day again, every order of it. The demonstration's scripts did that already (D57).
+
+Tests: a done plan's date refused, by `create` and by `submit`, with nothing left behind; a cancelled plan's date planned again; a date planned once its plan is discarded; a plan asked for while the last route of the date's plan is stored waits for that plan and is refused; through the API, the `409` with its words, and the date planned after a discard.
+
+### D84. The live view counts the jobs of the last day, and forgets the workers of long ago (in place)
+
+Decided by the project owner on 2026-10-14, from the review of that day (findings P1 and R2).
+
+- **The stats** count the jobs that are queued and running, and those that ended within the last day. `queue::depth` takes the span, and the API asks for a day. Until Phase 12 the three counts of jobs that ended were of every job there ever was.
+- **An index on when a job ended**, migration `0009_indexes.sql`, serves the count, whatever the history.
+- **A solver that starts takes the workers that were not seen for a day out of the registry** (`workers::forget`). The queue never reads that table (D27), so a row can go at any time.
+- **Nothing else is deleted.** The jobs stay, for the plans they belong to.
+- **The page** writes "In the last day" before the three counts.
+
+Why:
+
+- The stats are read by every open page of an operator every two seconds, and whenever a plan changes (D50). Counted whole, their cost grew with the history and not with the load.
+- What an operator looks at is the day's work, and a count that only grows says little about it.
+- Not by deleting old jobs: the page builds the rows of a plan from its jobs (D75), so an old plan would have opened with no route in its list.
+- Each start of a solver registers its workers under new ids, so the registry gained rows that nothing would ever take away.
+
+Tests: the depth counting the jobs that ended within the span, and the queued ones however long ago; through the API, a job that ended counted, and a day later not; a worker unseen for a day forgotten, by the registry and by a solver that starts.
+
+### D85. One person holds only so many event streams open (in place)
+
+From the review of 2026-10-14 (finding S3).
+
+An event stream takes a place among those of its user when it opens, and gives it back when it is dropped, however it ends (D50). `API_STREAMS_PER_USER`, sixteen unless it is set, says how many places a user has. One more stream is answered `429`, with `Retry-After` as long as it takes a stream whose reader has gone to be noticed: the next comment finds it gone.
+
+- The place is taken before anything is read, and a stream that is refused for a reason of its own holds none.
+- It counts the streams of every kind together.
+- The page needs no change. It opens a stream again after a pause that grows, whatever it was answered.
+
+Why:
+
+- Every stream reads the database when it opens, every few seconds, and whenever a plan changes, through the ten connections that every request shares (D47). Anybody who reaches the port can open an account (D80), and nothing bounded what an account held open. A few thousand streams would have had every other request wait for a connection, and fail after five seconds.
+- Sixteen: a page holds two or three, and one it has left is let go only when the next comment finds its reader gone (D77), within fifteen seconds. So there is room for a few pages and for a page whose day is changed a few times.
+- The place is a value the stream owns, given back in its `Drop`. So no way a stream ends can keep it, which is the rule of D34 and D50.
+
+What it does not do: bound how many accounts are opened, or how many streams all of them hold together. Both are among the README's known limits.
+
+Tests: the setting, its default and its bounds; a user's places taken, given back with a stream that is dropped, and kept apart from another user's; through the API, a stream over the limit refused with the reason and when to come back, streams of every kind counted together, and a stream refused for a plan that is not there holding no place.
+
+### D86. A script tries the page in a browser (in place)
+
+Decided by the project owner on 2026-10-14, from the review of that day (finding Q1). Changes D52.
+
+`scripts/page-check.mjs` drives Edge or Chrome without a window, over the DevTools protocol, against an API that is running:
+
+1. The admin logs in, sets up the demo city if there is none, gives a day its demo orders, and places an order by a click on the map.
+2. The day is planned with a second a route. Each route has its row and its line, the streams are live, the jobs are counted of the last day (D84), and Plan cannot be pressed (D83). A route sheet opens and closes.
+3. The plan is discarded, and Plan can be pressed again.
+4. Somebody opens an account, places an order by a click, sees it wait for its day, and withdraws it.
+
+All the while the browser has to hold nothing against the page: no error in its console, nothing refused by the policy (D69), no request that failed but the depot that a new database does not have, and no request to another host. The tiles are switched off for it, so that it asks the API alone.
+
+- **The day** is a month from today unless it is named, out of the way of what is done on the page. The script clears it first, through the API, and leaves its plan discarded.
+- **What it needs:** Node 22 or later, and no package, since Node has `fetch` and `WebSocket` of its own. And Edge or Chrome, found where they are installed or named in `BROWSER`.
+- **Run by hand,** after a change to the page, against a stack that was built with it.
+
+Why:
+
+- The page had grown real logic, phase by phase: an order with its key, two streams, lists that keep their rows, the vans, the sheets. It was tried by hand in a headless browser, by scripts that were not kept, so the next change to the page could not repeat what was tried.
+- A script of Node, and not one of PowerShell and one of sh as the other scripts are: neither has a way to speak the protocol without something added, and Node has. It runs on Windows and anywhere else alike.
+- Through the page and not around it: what it checks is what a person sees. It uses the API only to clear the day it plans.
+
+What it does not do: run by itself, or look at the pictures. It takes one when it fails, and says where it is.
+
+Tried against an API and a solver of four workers on the host, on a new database: it passed in 6.4 seconds. With the rule of D83 taken out of the page, it failed where Plan could be pressed. Against the stack of a clone with no `.env`, it passed in 4.6 seconds.
