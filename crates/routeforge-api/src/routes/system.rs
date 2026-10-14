@@ -9,7 +9,7 @@ use routeforge_domain::db::{queue, workers};
 use routeforge_domain::{OrdersChanged, PlanChanged, SystemStats};
 use utoipa_actix_web::service_config::ServiceConfig;
 
-use crate::app::{AppState, NotAllowed, NotLoggedIn};
+use crate::app::{AppState, NotAllowed, NotLoggedIn, TooManyStreams};
 use crate::auth::Staff;
 use crate::error::ApiError;
 use crate::events::Signal;
@@ -68,6 +68,7 @@ async fn get_system_stats(
             body = String, content_type = "text/event-stream"),
         NotLoggedIn,
         NotAllowed,
+        TooManyStreams,
     )
 )]
 #[get("/api/system/stats/events")]

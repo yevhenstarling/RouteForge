@@ -26,6 +26,7 @@
 //! | `API_WORKER_ALIVE_SECS` | 15 | A worker seen within this long counts as alive. |
 //! | `API_LOGIN_ATTEMPTS` | 5 | How many logins are taken for one address within a minute. |
 //! | `API_HASHES_AT_ONCE` | 4 | How many passwords are hashed at the same time. Each takes 19 MiB. |
+//! | `API_STREAMS_PER_USER` | 16 | How many event streams one user may hold open at the same time. |
 //! | `LOG_FORMAT` | `text` | `json` for one JSON object per line. |
 //! | `RUST_LOG` | `info` | What to log, in the syntax of `tracing`'s `EnvFilter`. |
 //!
@@ -61,7 +62,7 @@ use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::{Config, Secrets};
 use crate::events::Events;
 use crate::logins::Logins;
-use crate::stream::Pace;
+use crate::stream::{Pace, Streams};
 
 /// How long the requests in hand are given to finish once the API is told to stop.
 /// `docker stop` waits ten seconds before it kills, and this has to be inside that.
@@ -119,6 +120,7 @@ async fn serve() -> anyhow::Result<()> {
         worker_alive: config.worker_alive,
         events: Events::new(),
         pace: Pace::default(),
+        streams: Streams::new(config.streams_per_user),
     });
     let listening = state.events.listen(pool.clone());
 

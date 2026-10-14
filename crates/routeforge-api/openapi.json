@@ -2000,6 +2000,16 @@
               }
             },
             "description": "No token was sent, or the one sent is not valid or has expired"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller holds as many event streams open as one person may. `Retry-After` says when one that has lost its reader is noticed, and makes room"
           }
         },
         "security": [
@@ -2606,6 +2616,16 @@
               }
             },
             "description": "There is no such thing, or none the caller may know of"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller holds as many event streams open as one person may. `Retry-After` says when one that has lost its reader is noticed, and makes room"
           }
         },
         "security": [
@@ -2771,6 +2791,16 @@
               }
             },
             "description": "The caller's role does not allow this"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller holds as many event streams open as one person may. `Retry-After` says when one that has lost its reader is noticed, and makes room"
           }
         },
         "security": [

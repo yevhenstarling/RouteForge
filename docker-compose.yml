@@ -64,6 +64,7 @@ services:
       API_WORKER_ALIVE_SECS:
       API_LOGIN_ATTEMPTS:
       API_HASHES_AT_ONCE:
+      API_STREAMS_PER_USER:
       LOG_FORMAT:
       RUST_LOG:
     ports:

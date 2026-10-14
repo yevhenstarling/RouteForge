@@ -29,7 +29,7 @@ use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::Limits;
 use crate::events::{Events, Signal};
 use crate::logins::{self, Logins};
-use crate::stream::{EVENT_STREAM, Pace};
+use crate::stream::{EVENT_STREAM, Pace, Streams};
 
 /// The limits the application has in a test. Small, so that a test can step over them.
 pub(crate) const LIMITS: Limits = Limits {
@@ -52,6 +52,10 @@ pub(crate) const LOGIN_ATTEMPTS: u32 = 5;
 
 /// How long a token is good for in a test that the bot was given.
 pub(crate) const BOT_TOKEN_TTL: Duration = Duration::from_secs(60);
+
+/// How many event streams the application of a test lets one user hold open: what the
+/// API lets them when nothing is set.
+pub(crate) const STREAMS_PER_USER: u32 = 16;
 
 /// A lease no test outlives.
 pub(crate) const LONG: Duration = Duration::from_secs(600);
@@ -120,6 +124,18 @@ pub(crate) fn api_with_logins(pool: &PgPool, logins: Logins, passwords: Password
     }
 }
 
+/// The application that lets one user hold so many event streams open at once.
+pub(crate) fn api_with_streams(pool: &PgPool, most: u32) -> Api {
+    let state = AppState {
+        streams: Streams::new(most),
+        ..state_for(pool, PACE, Some(BOT_KEY))
+    };
+    Api {
+        pool: pool.clone(),
+        state: web::Data::new(state),
+    }
+}
+
 fn api_with(pool: &PgPool, pace: Pace, bot_key: Option<&str>) -> Api {
     Api {
         pool: pool.clone(),
@@ -142,6 +158,7 @@ fn state_for(pool: &PgPool, pace: Pace, bot_key: Option<&str>) -> AppState {
         worker_alive: Duration::from_secs(15),
         events: Events::new(),
         pace,
+        streams: Streams::new(STREAMS_PER_USER),
     }
 }
 

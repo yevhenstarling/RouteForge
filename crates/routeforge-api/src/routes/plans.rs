@@ -16,7 +16,9 @@ use routeforge_domain::{
 use utoipa_actix_web::service_config::ServiceConfig;
 use uuid::Uuid;
 
-use crate::app::{AppState, NotAcceptable, NotAllowed, NotLoggedIn, NotNow, NotThere};
+use crate::app::{
+    AppState, NotAcceptable, NotAllowed, NotLoggedIn, NotNow, NotThere, TooManyStreams,
+};
 use crate::auth::Staff;
 use crate::error::ApiError;
 use crate::events::Signal;
@@ -203,6 +205,7 @@ async fn list_plan_routes(
         NotLoggedIn,
         NotAllowed,
         NotThere,
+        TooManyStreams,
     )
 )]
 #[get("/api/plans/{id}/events")]

@@ -64,6 +64,14 @@ pub(crate) enum ApiError {
         whole_seconds(*.retry_after)
     )]
     TooManyLogins { retry_after: Duration },
+    /// The caller holds as many event streams open as one person may (D85). A stream
+    /// whose reader has gone is noticed within `retry_after`, and makes room then.
+    #[error(
+        "you have {most} event streams open, which is as many as one person may: close one, \
+         or try again in {} seconds",
+        whole_seconds(*.retry_after)
+    )]
+    TooManyStreams { most: u32, retry_after: Duration },
     /// The cause is for the log. The client is told only that it was not its fault.
     #[error("something went wrong on the server")]
     Internal(#[source] anyhow::Error),
@@ -130,7 +138,9 @@ impl ResponseError for ApiError {
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotJson => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Invalid { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::TooManyLogins { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::TooManyLogins { .. } | Self::TooManyStreams { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Unavailable(_) | Self::Busy => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -143,7 +153,9 @@ impl ResponseError for ApiError {
         }
         // Whoever is told to come back is told when.
         let retry_after = match self {
-            Self::TooManyLogins { retry_after } => Some(*retry_after),
+            Self::TooManyLogins { retry_after } | Self::TooManyStreams { retry_after, .. } => {
+                Some(*retry_after)
+            }
             Self::Busy => Some(BUSY_RETRY_AFTER),
             _ => None,
         };
@@ -279,6 +291,14 @@ mod tests {
                 429,
                 "Too Many Requests",
             ),
+            (
+                ApiError::TooManyStreams {
+                    most: 16,
+                    retry_after: Duration::from_secs(15),
+                },
+                429,
+                "Too Many Requests",
+            ),
             (ApiError::Busy, 503, "Service Unavailable"),
         ];
         for (error, status, title) in errors {
@@ -346,6 +366,15 @@ mod tests {
             assert_eq!(retry_after(error).as_deref(), Some(seconds));
         }
         assert_eq!(retry_after(ApiError::Busy).as_deref(), Some("1"));
+        let streams = ApiError::TooManyStreams {
+            most: 16,
+            retry_after: Duration::from_secs(15),
+        };
+        assert!(
+            streams.to_string().contains("16 event streams"),
+            "{streams}"
+        );
+        assert_eq!(retry_after(streams).as_deref(), Some("15"));
         // An API that is not ready does not know when it will be.
         assert_eq!(retry_after(ApiError::Unavailable("no schema")), None);
         assert_eq!(retry_after(ApiError::Forbidden), None);
