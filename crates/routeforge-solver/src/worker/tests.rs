@@ -6,6 +6,7 @@
 //! than the test takes, and holds [`one_at_a_time`]. Every other test budgets by
 //! moves, so its searches take the same course on any machine.
 
+use std::convert::Infallible;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -13,8 +14,8 @@ use std::time::{Duration, Instant};
 use routeforge_domain::db::queue::{MAX_ATTEMPTS, PLANS_CHANNEL, PROGRESS_CHANNEL};
 use routeforge_domain::db::{orders, plans, routes};
 use routeforge_domain::{
-    CourierId, Job, JobKind, JobStatus, Order, OrderId, OrderKind, OrderStatus, Plan, PlanCounts,
-    PlanId, PlanStatus, RouteProgress,
+    CourierId, DistanceTable, Distances, Job, JobKind, JobStatus, LatLon, Order, OrderId,
+    OrderKind, OrderStatus, Plan, PlanCounts, PlanId, PlanStatus, Polyline, RouteProgress,
 };
 use sqlx::postgres::PgListener;
 
@@ -431,6 +432,121 @@ async fn a_job_that_keeps_failing_fails_its_plan_with_the_reason(pool: PgPool) {
     let job = queue::get(&pool, job_id).await.unwrap().unwrap();
     assert_eq!((job.status, job.attempt), (JobStatus::Failed, MAX_ATTEMPTS));
     assert_eq!(job.error.as_deref(), Some(reason.as_str()));
+}
+
+/// Distances that are never given: asking for them panics. That is a panic in a route
+/// job's own code, on no blocking thread.
+struct Panicking;
+
+/// What the panic says, so that a test can find it in a plan's error.
+const PANIC: &str = "a distance provider that panics on purpose";
+
+impl DistanceProvider for Panicking {
+    type Error = Infallible;
+
+    fn measures(&self) -> Distances {
+        Distances::GreatCircle
+    }
+
+    async fn table(&self, _positions: &[LatLon]) -> Result<DistanceTable, Infallible> {
+        panic!("{PANIC}")
+    }
+
+    async fn path(&self, _positions: &[LatLon]) -> Result<Option<Polyline>, Infallible> {
+        Ok(None)
+    }
+}
+
+/// A job that panics outside the search is a failed attempt like any other (D82). The
+/// worker reports it and goes on: here it is the one worker there is, and it takes
+/// every attempt of the job, so it outlived the first two.
+#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+async fn a_job_that_panics_fails_its_attempt_and_the_worker_goes_on(pool: PgPool) {
+    let city = testing::city(&pool, &[6]).await;
+    city.orders(&pool, date(12), 3, 1).await;
+    let mut fleet = Fleet::with_distances(&pool, testing::config(), Panicking);
+    let worker = fleet.start_worker();
+
+    let plan = plans::submit(&pool, &city.new_plan(date(12), moves(1_000)), None)
+        .await
+        .unwrap();
+    let failed = eventually("the plan to fail", async || {
+        // A failed attempt is due again after two seconds, then four. The test does
+        // not sit them out.
+        sqlx::query("UPDATE jobs SET run_at = now() WHERE status = 'queued'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let plan = plans::get(&pool, plan.id).await.unwrap().unwrap();
+        (plan.status == PlanStatus::Failed).then_some(plan)
+    })
+    .await;
+
+    let reason = failed.error.unwrap();
+    assert!(reason.contains("the job panicked"), "{reason}");
+    assert!(reason.contains(PANIC), "{reason}");
+    let jobs = queue::list_for_plan(&pool, plan.id).await.unwrap();
+    let route = jobs
+        .iter()
+        .find(|job| job.payload.kind() == JobKind::Route)
+        .unwrap();
+    assert_eq!(
+        (route.status, route.attempt, route.claimed_by),
+        (JobStatus::Failed, MAX_ATTEMPTS, Some(worker))
+    );
+
+    // Still there, and it stops when it is told to, as a worker does.
+    fleet.stop().await;
+}
+
+/// One that waits until it is told to stop, as a worker does.
+fn waiting(halted: &watch::Receiver<bool>) -> impl Future<Output = ()> + use<> {
+    let mut halted = halted.clone();
+    async move { stopped(&mut halted).await }
+}
+
+/// A worker that ends without being told to has been lost to a fault outside its jobs
+/// (D82). The others are told to stop, and the process ends saying why.
+#[tokio::test]
+async fn a_lost_worker_stops_the_others_and_the_process_says_why() {
+    let (halt, halted) = watch::channel(false);
+    let (_signal, mut shutdown) = watch::channel(false);
+    let mut workers = JoinSet::new();
+    workers.spawn(waiting(&halted));
+    workers.spawn(waiting(&halted));
+    workers.spawn(async { panic!("a worker lost on purpose") });
+
+    let lost = testing::soon(supervise(workers, &halt, &mut shutdown))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(lost.contains("a worker lost on purpose"), "{lost}");
+    assert!(*halted.borrow());
+
+    // One that just stops, which no worker does unless it is told to, is lost as well.
+    let (halt, _halted) = watch::channel(false);
+    let mut workers = JoinSet::new();
+    workers.spawn(async {});
+    let lost = testing::soon(supervise(workers, &halt, &mut shutdown))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(lost.contains("stopped by itself"), "{lost}");
+}
+
+#[tokio::test]
+async fn workers_that_are_told_to_stop_end_the_process_well() {
+    let (halt, halted) = watch::channel(false);
+    let (signal, mut shutdown) = watch::channel(false);
+    let mut workers = JoinSet::new();
+    workers.spawn(waiting(&halted));
+    workers.spawn(waiting(&halted));
+
+    signal.send_replace(true);
+    testing::soon(supervise(workers, &halt, &mut shutdown))
+        .await
+        .unwrap();
+    assert!(*halted.borrow());
 }
 
 /// What the workers log, as the JSON lines a solver writes with `LOG_FORMAT=json`.

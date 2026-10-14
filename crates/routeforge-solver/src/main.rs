@@ -66,10 +66,15 @@ async fn main() -> anyhow::Result<()> {
     let Some(pool) = startup::connect(&database_url, &config, &mut shutdown).await? else {
         return Ok(());
     };
-    if startup::wait_for_schema(&pool, startup::SCHEMA_CHECK, &mut shutdown).await {
-        worker::run(pool.clone(), config, distances, shutdown).await;
-    }
+    let ran = if startup::wait_for_schema(&pool, startup::SCHEMA_CHECK, &mut shutdown).await {
+        worker::run(pool.clone(), config, distances, shutdown).await
+    } else {
+        Ok(())
+    };
     pool.close().await;
+    // A worker that was lost ends the process with its reason, and with a status that
+    // says something went wrong (D82).
+    ran?;
     info!("the solver has stopped");
     Ok(())
 }

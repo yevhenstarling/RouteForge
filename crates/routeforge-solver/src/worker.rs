@@ -6,8 +6,12 @@
 //! A process runs [`Config::concurrency`] of them, one unless it is told otherwise,
 //! so capacity grows with the number of solver instances.
 
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use anyhow::anyhow;
+use futures_util::FutureExt as _;
 use routeforge_domain::db::queue::{self, ClaimedJob};
 use routeforge_domain::db::{DbError, workers};
 use routeforge_domain::{DistanceProvider, JobPayload, WorkerId};
@@ -51,7 +55,18 @@ pub(crate) enum Outcome {
 /// Runs the workers of this process until `shutdown` says stop.
 ///
 /// They share the pool and one connection that listens for notifications.
-pub(crate) async fn run<P>(pool: PgPool, config: Config, distances: P, shutdown: Shutdown)
+///
+/// # Errors
+///
+/// When a worker has ended without being told to (D82). The others are told to stop
+/// then, and give their jobs back. A process that goes on with a worker less says
+/// nothing about it, and one that ends says why.
+pub(crate) async fn run<P>(
+    pool: PgPool,
+    config: Config,
+    distances: P,
+    mut shutdown: Shutdown,
+) -> anyhow::Result<()>
 where
     P: DistanceProvider + Send + Sync + 'static,
 {
@@ -63,22 +78,62 @@ where
         distances,
     });
 
+    // The workers stop when the process is told to, and when one of them is lost.
+    let (halt, halted) = watch::channel(false);
     let mut workers = JoinSet::new();
     for _ in 0..context.config.concurrency {
         let worker = Worker::new(
             Arc::clone(&context),
             Arc::clone(&hostname),
             wake.clone(),
-            shutdown.clone(),
+            halted.clone(),
         );
         workers.spawn(worker.run());
     }
-    while let Some(ended) = workers.join_next().await {
-        if let Err(error) = ended {
-            error!(%error, "a worker ended without being told to");
+    let ended = supervise(workers, &halt, &mut shutdown).await;
+    listener.abort();
+    ended
+}
+
+/// Waits until every worker has ended, and tells them to stop when the process is.
+///
+/// A worker ends when it is told to stop, and at no other time: a job that panics is
+/// a failed attempt and no more (D82). So a worker that ends otherwise has been lost
+/// to a fault outside its jobs. `halt` then tells the others to stop as well, and the
+/// answer says what became of it.
+async fn supervise(
+    mut workers: JoinSet<()>,
+    halt: &watch::Sender<bool>,
+    shutdown: &mut Shutdown,
+) -> anyhow::Result<()> {
+    let mut lost = None;
+    loop {
+        tokio::select! {
+            ended = workers.join_next() => {
+                let Some(ended) = ended else { break };
+                let fault = match ended {
+                    Err(error) if error.is_panic() => {
+                        Some(format!("it panicked: {}", said(&*error.into_panic())))
+                    }
+                    Err(error) => Some(error.to_string()),
+                    Ok(()) if !*halt.borrow() => Some("it stopped by itself".to_owned()),
+                    Ok(()) => None,
+                };
+                if let Some(reason) = fault {
+                    error!(%reason, "a worker was lost; the others are told to stop");
+                    halt.send_replace(true);
+                    lost.get_or_insert(reason);
+                }
+            }
+            () = stopped(shutdown), if !*halt.borrow() => {
+                halt.send_replace(true);
+            }
         }
     }
-    listener.abort();
+    match lost {
+        Some(reason) => Err(anyhow!("a worker was lost: {reason}")),
+        None => Ok(()),
+    }
 }
 
 /// The name this machine goes by in the registry. Under Docker it is the id of the
@@ -203,7 +258,7 @@ where
             let ended = tokio::select! {
                 biased;
                 () = stopped(&mut shutdown) => None,
-                ended = execute(context, &job) => Some(ended),
+                ended = guarded(execute(context, &job)) => Some(ended),
             };
             match ended {
                 Some(Ok(Outcome::Done)) => info!("the job is done"),
@@ -256,6 +311,32 @@ where
             route_job::run(context, &job.lease, &route).await
         }
     }
+}
+
+/// What a job gives, with a panic anywhere in it as an error of the attempt (D82).
+///
+/// A panic on the blocking thread of a search or a clustering comes back as an error
+/// already (D37). One in the job's own code would unwind through the worker and end
+/// it, and the job would wait out its lease for the next worker to panic over. Caught
+/// here, it is a failed attempt like any other, with what the panic said as its reason.
+///
+/// The job is not polled again after it has panicked. It is dropped with whatever it
+/// held, the heartbeat and the search's flag among them, as a job that is told to stop
+/// is (D34).
+async fn guarded<T>(job: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    match AssertUnwindSafe(job).catch_unwind().await {
+        Ok(ended) => ended,
+        Err(panic) => Err(anyhow!("the job panicked: {}", said(&*panic))),
+    }
+}
+
+/// What a panic said, where it said it in words.
+fn said(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("it said nothing in words")
 }
 
 /// Puts a worker into the registry and marks it as seen every heartbeat interval,

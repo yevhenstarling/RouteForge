@@ -10,9 +10,9 @@ use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 use routeforge_domain::db::{couriers, depots, orders, plans, routes, users};
 use routeforge_domain::{
-    Courier, Depot, DistanceTable, Haversine, LatLon, NewCourier, NewDepot, NewOrder, NewPlan,
-    NewUser, Order, OrderId, OrderKind, OrderStatus, PlanId, PlanStatus, Role, RouteBudget,
-    RouteStop, User, UserId, WorkerId,
+    Courier, Depot, DistanceProvider, DistanceTable, Haversine, LatLon, NewCourier, NewDepot,
+    NewOrder, NewPlan, NewUser, Order, OrderId, OrderKind, OrderStatus, PlanId, PlanStatus, Role,
+    RouteBudget, RouteStop, User, UserId, WorkerId,
 };
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -220,9 +220,10 @@ impl City {
 }
 
 /// Workers running inside a test, on the test's pool, with one listener between them
-/// as in a solver process.
-pub(crate) struct Fleet {
-    context: Arc<Context<Haversine>>,
+/// as in a solver process. Their distances are great circles unless a test gives
+/// them others.
+pub(crate) struct Fleet<P = Haversine> {
+    context: Arc<Context<P>>,
     wake: Wake,
     listener: JoinHandle<()>,
     stop: watch::Sender<bool>,
@@ -232,15 +233,7 @@ pub(crate) struct Fleet {
 impl Fleet {
     /// The listener, and no worker yet.
     pub(crate) fn new(pool: &PgPool, config: Config) -> Self {
-        let (wake, listener) = wake::listen(pool.clone());
-        let (stop, _) = watch::channel(false);
-        Self {
-            context: Arc::new(context(pool, config)),
-            wake,
-            listener,
-            stop,
-            workers: Vec::new(),
-        }
+        Self::with_distances(pool, config, Haversine)
     }
 
     pub(crate) fn with_workers(pool: &PgPool, config: Config, workers: usize) -> Self {
@@ -249,6 +242,29 @@ impl Fleet {
             fleet.start_worker();
         }
         fleet
+    }
+}
+
+impl<P> Fleet<P>
+where
+    P: DistanceProvider + Send + Sync + 'static,
+{
+    /// The listener, and no worker yet, with the distances that `distances` gives.
+    pub(crate) fn with_distances(pool: &PgPool, config: Config, distances: P) -> Self {
+        let (wake, listener) = wake::listen(pool.clone());
+        let (stop, _) = watch::channel(false);
+        let context = Context {
+            pool: pool.clone(),
+            config,
+            distances,
+        };
+        Self {
+            context: Arc::new(context),
+            wake,
+            listener,
+            stop,
+            workers: Vec::new(),
+        }
     }
 
     /// Starts one more worker and says which.

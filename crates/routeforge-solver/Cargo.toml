@@ -12,6 +12,8 @@ routeforge-domain = { workspace = true, features = ["db", "service"] }
 routeforge-tsp.workspace = true
 
 anyhow.workspace = true
+# For `catch_unwind` on a job's future: a job that panics is a failed attempt (D82).
+futures-util.workspace = true
 # For the jitter of the polling interval, from a generator seeded with the worker's id.
 rand.workspace = true
 # For asking an OSRM server for road distances (D66). It is on the compose network or
