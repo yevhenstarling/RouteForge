@@ -5,6 +5,8 @@ target
 
 # Local settings and secrets, copied from .env.example
 .env
+# Settings of this machine alone, which can hold a command approved with a token in it
+.claude/settings.local.json
 
 # The roads the OSRM server of the `osrm` profile reads: an extract of OpenStreetMap,
 # and what scripts/osrm-prepare makes of it
