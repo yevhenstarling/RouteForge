@@ -639,7 +639,7 @@
         "type": "object"
       },
       "QueueDepth": {
-        "description": "How many jobs stand in each status.\n\n`queued` and `running` are the work still to be done. The other three only grow.",
+        "description": "How many jobs stand in each status.\n\n`queued` and `running` are the work still to be done. The other three are the jobs\nthat ended within a span: the last day, in what the API gives (D84).",
         "properties": {
           "cancelled": {
             "format": "int64",
@@ -2262,7 +2262,7 @@
         ]
       },
       "post": {
-        "description": "Stores the plan and hands it to the solvers. They take the orders of the day that\nare pending, give each active courier the ones that fit it, and search for the\norder to call in. Read the plan again to see it go from `queued` to `routing` to\n`done`.\n\nA day has one plan in progress at a time. The `X-Request-Id` of this request is\nkept on the plan's jobs, so the solvers' logs can be searched for it.",
+        "description": "Stores the plan and hands it to the solvers. They take the orders of the day that\nare pending, give each active courier the ones that fit it, and search for the\norder to call in. Read the plan again to see it go from `queued` to `routing` to\n`done`.\n\nA day has one plan at a time that stands: one in progress, or one that is done.\nA day whose plan is done is planned again once that plan is discarded, and then\nafresh, with every order of it (D83). The `X-Request-Id` of this request is kept on\nthe plan's jobs, so the solvers' logs can be searched for it.",
         "operationId": "create_plan",
         "requestBody": {
           "content": {
@@ -2313,7 +2313,7 @@
                 }
               }
             },
-            "description": "The day already has a plan in progress, or no depot has been set"
+            "description": "The day already has a plan in progress, or one that is done and is to be discarded first, or no depot has been set"
           },
           "422": {
             "content": {

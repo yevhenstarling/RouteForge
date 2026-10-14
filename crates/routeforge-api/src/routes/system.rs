@@ -19,6 +19,10 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
     config.service(get_system_stats).service(watch_system_stats);
 }
 
+/// The jobs that ended are counted of the last day: the work of a day is what an
+/// operator looks at, and every job there ever was is a count that only grows (D84).
+pub(crate) const ENDED_WITHIN: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Read the state of the queue and its workers
 ///
 /// How many jobs stand in each status, and the workers that were seen lately, each
@@ -81,7 +85,7 @@ async fn watch_system_stats(
 
 /// The queue and the workers, as they are now.
 async fn stats(state: &AppState) -> Result<SystemStats, ApiError> {
-    let queue = queue::depth(&state.pool).await?;
+    let queue = queue::depth(&state.pool, ENDED_WITHIN).await?;
     let workers = workers::list(&state.pool, state.worker_alive).await?;
     let busy = workers
         .iter()

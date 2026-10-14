@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO plans (id, service_date, depot_id, seed, created_by, budget_time_ms,\n                            budget_iterations)\n         VALUES ($1, $2, $3, $4, $5, $6, $7)\n         RETURNING id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,\n                   created_by, orders_total, orders_unassigned, routes_total, routes_done, error,\n                   created_at, finished_at",
+  "query": "WITH day AS (\n               SELECT status FROM plans WHERE service_date = $2 ORDER BY id FOR UPDATE\n           )\n           INSERT INTO plans (id, service_date, depot_id, seed, created_by, budget_time_ms,\n                              budget_iterations)\n           SELECT $1, $2, $3, $4, $5, $6, $7\n           WHERE NOT EXISTS (SELECT 1 FROM day WHERE status = 'done')\n           RETURNING id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,\n                     created_by, orders_total, orders_unassigned, routes_total, routes_done,\n                     error, created_at, finished_at",
   "describe": {
     "columns": [
       {
@@ -198,5 +198,5 @@
       true
     ]
   },
-  "hash": "eb04228b62a251fd853d6716ce7f85e05bb67ccf446607a66b27412387323d19"
+  "hash": "e542a2106a6760c015e5224b0f4a491a3d3644dd41cb1f2bad22c000dccd6955"
 }

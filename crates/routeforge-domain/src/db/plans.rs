@@ -75,11 +75,22 @@ fn budget(time_ms: Option<i64>, iterations: Option<i64>) -> Result<RouteBudget, 
 
 /// Stores a new plan as queued, without a job. [`submit`] is the whole step.
 ///
+/// A service date has one plan at a time that stands: one that is in progress, or one
+/// that is done (D83). A plan that is done gives its couriers their round of the day,
+/// and a second plan would give them another, with all they carry. So the date is
+/// planned again once that plan is discarded, and then afresh, with every order of it
+/// (D30).
+///
+/// The plans of the date are locked first, in the order of their ids, as every
+/// operation on a plan locks its row first (D24). So a plan whose last route is stored
+/// at this very moment is seen as done, and not as the plan in progress it was.
+///
 /// # Errors
 ///
 /// [`DbError::ActivePlanExists`] if the service date has a plan that is queued or
-/// routing. [`DbError::OutOfRange`] if the budget allows more moves than fit a signed
-/// 64-bit number.
+/// routing, and [`DbError::DayIsPlanned`] if it has one that is done.
+/// [`DbError::OutOfRange`] if the budget allows more moves than fit a signed 64-bit
+/// number.
 pub async fn create(executor: impl PgExecutor<'_>, new: &NewPlan) -> Result<Plan, DbError> {
     let budget_iterations = new
         .budget
@@ -87,14 +98,18 @@ pub async fn create(executor: impl PgExecutor<'_>, new: &NewPlan) -> Result<Plan
         .map(i64::try_from)
         .transpose()
         .map_err(|_| DbError::OutOfRange("the plan's iteration budget"))?;
-    sqlx::query_as!(
+    let created = sqlx::query_as!(
         PlanRow,
-        "INSERT INTO plans (id, service_date, depot_id, seed, created_by, budget_time_ms,
-                            budget_iterations)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,
-                   created_by, orders_total, orders_unassigned, routes_total, routes_done, error,
-                   created_at, finished_at",
+        r#"WITH day AS (
+               SELECT status FROM plans WHERE service_date = $2 ORDER BY id FOR UPDATE
+           )
+           INSERT INTO plans (id, service_date, depot_id, seed, created_by, budget_time_ms,
+                              budget_iterations)
+           SELECT $1, $2, $3, $4, $5, $6, $7
+           WHERE NOT EXISTS (SELECT 1 FROM day WHERE status = 'done')
+           RETURNING id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,
+                     created_by, orders_total, orders_unassigned, routes_total, routes_done,
+                     error, created_at, finished_at"#,
         PlanId::generate().0,
         new.service_date,
         new.depot_id.0,
@@ -103,7 +118,7 @@ pub async fn create(executor: impl PgExecutor<'_>, new: &NewPlan) -> Result<Plan
         new.budget.time_ms().map(i64::from),
         budget_iterations,
     )
-    .fetch_one(executor)
+    .fetch_optional(executor)
     .await
     .map_err(|error| {
         on_violation(
@@ -111,8 +126,8 @@ pub async fn create(executor: impl PgExecutor<'_>, new: &NewPlan) -> Result<Plan
             "plans_one_active_per_date",
             DbError::ActivePlanExists,
         )
-    })?
-    .try_into()
+    })?;
+    created.ok_or(DbError::DayIsPlanned)?.try_into()
 }
 
 /// Starts a plan: stores it and puts its `plan` job on the queue, in one transaction.
@@ -123,8 +138,8 @@ pub async fn create(executor: impl PgExecutor<'_>, new: &NewPlan) -> Result<Plan
 ///
 /// # Errors
 ///
-/// [`DbError::ActivePlanExists`] if the service date has a plan that is queued or
-/// routing.
+/// As [`create`]: [`DbError::ActivePlanExists`] if the service date has a plan that is
+/// queued or routing, and [`DbError::DayIsPlanned`] if it has one that is done.
 pub async fn submit(
     pool: &PgPool,
     new: &NewPlan,
@@ -379,7 +394,8 @@ mod tests {
             .unwrap();
         assert_eq!(all_jobs, 1);
 
-        // Another date is free, and so is this one once its plan is done.
+        // Another date is free. This one is not when its plan is done, which gives the
+        // couriers their round of the day: it is free once that plan is discarded (D83).
         let other_day = NewPlan {
             service_date: date(13),
             ..new
@@ -389,6 +405,9 @@ mod tests {
             route_finished(&pool, first.id).await.unwrap(),
             Some(PlanStatus::Done)
         );
+        let error = submit(&pool, &new, None).await.unwrap_err();
+        assert!(matches!(error, DbError::DayIsPlanned), "{error:?}");
+        assert!(queue::discard_plan(&pool, first.id).await.unwrap());
         submit(&pool, &new, None).await.unwrap();
     }
 

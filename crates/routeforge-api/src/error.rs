@@ -172,7 +172,9 @@ impl ResponseError for ApiError {
 impl From<DbError> for ApiError {
     fn from(error: DbError) -> Self {
         match error {
-            DbError::EmailTaken | DbError::ActivePlanExists => Self::Conflict(error.to_string()),
+            DbError::EmailTaken | DbError::ActivePlanExists | DbError::DayIsPlanned => {
+                Self::Conflict(error.to_string())
+            }
             // What the handlers pass on has been checked, so the rest is not the
             // caller's doing: a database that is away, or one this build cannot read.
             DbError::OutOfRange(_) | DbError::Unreadable(_) | DbError::Sqlx(_) => {

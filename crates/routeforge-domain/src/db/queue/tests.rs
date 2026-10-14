@@ -1360,6 +1360,99 @@ async fn a_discarded_date_is_planned_afresh_with_every_order(pool: PgPool) {
     );
 }
 
+/// How many plans a date has, and how many jobs the queue has.
+async fn plans_and_jobs(pool: &PgPool, day: u32) -> (i64, i64) {
+    let plans = sqlx::query_scalar("SELECT count(*) FROM plans WHERE service_date = $1")
+        .bind(date(day))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let jobs = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (plans, jobs)
+}
+
+/// A date with a plan that is done is planned again once that plan is discarded, and
+/// not before: the couriers of that plan have had their round of the day (D83).
+#[sqlx::test]
+async fn a_date_with_a_done_plan_is_planned_again_only_once_it_is_discarded(pool: PgPool) {
+    let first = done_plan(&pool, 12, 2, 3).await;
+    let new = testing::new_plan(&pool, date(12)).await;
+    let before = plans_and_jobs(&pool, 12).await;
+
+    for refused in [
+        plans::create(&pool, &new).await,
+        plans::submit(&pool, &new, None).await,
+    ] {
+        let refused = refused.unwrap_err();
+        assert!(matches!(refused, DbError::DayIsPlanned), "{refused:?}");
+    }
+    // Nothing was left behind: no plan, and no job for one.
+    assert_eq!(plans_and_jobs(&pool, 12).await, before);
+
+    // Another date is planned as ever, and so is one whose plan was cancelled.
+    let cancelled = testing::plan(&pool, date(13)).await;
+    assert!(cancel_plan(&pool, cancelled.id).await.unwrap());
+    plans::create(&pool, &testing::new_plan(&pool, date(13)).await)
+        .await
+        .unwrap();
+
+    assert!(discard_plan(&pool, first.plan.id).await.unwrap());
+    plans::submit(&pool, &new, None).await.unwrap();
+}
+
+/// A plan is asked for in the very moment the last route of the date's plan is stored.
+/// The new one waits for that plan's row, finds the plan done, and is refused: it does
+/// not slip in as a second plan while the first is still taken for one in progress.
+#[sqlx::test]
+async fn a_plan_asked_for_as_the_last_route_is_stored_finds_the_date_planned(pool: PgPool) {
+    testing::routing(&pool, date(12), 1, 2).await;
+    let job = claim(&pool, WorkerId::generate(), LONG)
+        .await
+        .unwrap()
+        .unwrap();
+    let JobPayload::Route {
+        plan_id,
+        courier_id,
+        order_ids,
+        ..
+    } = &job.payload
+    else {
+        panic!("{:?} is not a route job", job.payload);
+    };
+    // The last route is stored, and its transaction is held open.
+    let mut completion = begin_complete(&pool, &job.lease).await.unwrap().unwrap();
+    let route = NewRoute {
+        plan_id: *plan_id,
+        courier_id: *courier_id,
+        distance_m: 1_000,
+        distances: Distances::GreatCircle,
+        path: None,
+        stops: order_ids.clone(),
+    };
+    routes::insert(completion.conn(), &route).await.unwrap();
+    let status = plans::route_finished(completion.conn(), *plan_id).await;
+    assert_eq!(status.unwrap(), Some(PlanStatus::Done));
+
+    let new = testing::new_plan(&pool, date(12)).await;
+    let asking = tokio::spawn({
+        let pool = pool.clone();
+        async move { plans::create(&pool, &new).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !asking.is_finished(),
+        "the request did not wait for the plan"
+    );
+
+    completion.commit().await.unwrap();
+    let refused = soon(asking).await.unwrap().unwrap_err();
+    assert!(matches!(refused, DbError::DayIsPlanned), "{refused:?}");
+    assert_eq!(plans_and_jobs(&pool, 12).await.0, 1);
+}
+
 /// Two operators press the button at the same moment.
 #[sqlx::test]
 async fn discards_at_the_same_moment_succeed_once(pool: PgPool) {
@@ -1377,9 +1470,12 @@ async fn discards_at_the_same_moment_succeed_once(pool: PgPool) {
     assert!(orders_are_free(&pool, &routing).await);
 }
 
+/// The span the jobs that ended are counted of, as the API asks for them (D84).
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[sqlx::test]
 async fn the_depth_of_the_queue_counts_the_jobs_of_each_status(pool: PgPool) {
-    assert_eq!(depth(&pool).await.unwrap(), QueueDepth::default());
+    assert_eq!(depth(&pool, DAY).await.unwrap(), QueueDepth::default());
 
     let routing = testing::routing(&pool, date(12), 4, 1).await;
     let finished = claim(&pool, WorkerId::generate(), LONG)
@@ -1392,7 +1488,7 @@ async fn the_depth_of_the_queue_counts_the_jobs_of_each_status(pool: PgPool) {
         .unwrap()
         .unwrap();
     assert_eq!(
-        depth(&pool).await.unwrap(),
+        depth(&pool, DAY).await.unwrap(),
         QueueDepth {
             queued: 2,
             running: 1,
@@ -1415,13 +1511,37 @@ async fn the_depth_of_the_queue_counts_the_jobs_of_each_status(pool: PgPool) {
         .unwrap();
     assert!(fail(&pool, &job.lease, "broken").await.unwrap());
     assert_eq!(
-        depth(&pool).await.unwrap(),
+        depth(&pool, DAY).await.unwrap(),
         QueueDepth {
             queued: 0,
             running: 0,
             done: 1,
             failed: 1,
             cancelled: 3,
+        }
+    );
+
+    // A job that ended before the span is no longer counted. One that is queued is,
+    // however long ago it was made.
+    sqlx::query(
+        "UPDATE jobs SET finished_at = now() - interval '2 days' WHERE status = 'cancelled'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    testing::routing(&pool, date(14), 1, 1).await;
+    sqlx::query("UPDATE jobs SET created_at = now() - interval '2 days', run_at = now() - interval '2 days' WHERE status = 'queued'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        depth(&pool, DAY).await.unwrap(),
+        QueueDepth {
+            queued: 1,
+            running: 0,
+            done: 1,
+            failed: 1,
+            cancelled: 0,
         }
     );
 }

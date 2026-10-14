@@ -252,12 +252,7 @@ impl Watch for OrdersWatch {
     }
 
     async fn read(&mut self, state: &AppState) -> Result<Vec<Bytes>, ApiError> {
-        let own = OrderFilter {
-            client_id: Some(self.client_id),
-            service_date: Some(self.service_date),
-            ..OrderFilter::default()
-        };
-        let orders = orders::list(&state.pool, &own)
+        let orders = orders::of_client_on(&state.pool, self.client_id, self.service_date)
             .await?
             .into_iter()
             .map(|order| (order.id, order.status))

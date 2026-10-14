@@ -56,11 +56,8 @@ async fn create_demo_orders(
         ApiError::Conflict("the depot is too near a pole to scatter orders round it".to_owned())
     })?;
 
-    let mut tx = state.pool.begin().await?;
-    for order in &scattered {
-        orders::create(&mut *tx, order).await?;
-    }
-    tx.commit().await?;
+    // One statement, so the orders are stored together or not at all.
+    orders::create_many(&state.pool, &scattered).await?;
     Ok(HttpResponse::Created().json(DemoCreated {
         created: request.count,
     }))

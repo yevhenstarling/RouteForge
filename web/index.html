@@ -1526,8 +1526,9 @@ function renderSystem() {
   const stats = state.stats;
   if (!stats) return;
   const queue = stats.queue;
-  $('queue').textContent = `Jobs: ${queue.queued} queued, ${queue.running} running, ${queue.done} done, `
-    + `${queue.failed} failed, ${queue.cancelled} stopped.`;
+  // What ended is counted of the last day (D84).
+  $('queue').textContent = `Jobs: ${queue.queued} queued, ${queue.running} running. In the last day `
+    + `${queue.done} done, ${queue.failed} failed, ${queue.cancelled} stopped.`;
   $('workers-line').textContent = stats.workers_alive === 0
     ? 'No worker has been seen lately. Is a solver running?'
     : `${stats.workers_alive} ${stats.workers_alive === 1 ? 'worker' : 'workers'}, ${stats.workers_busy} busy.`;

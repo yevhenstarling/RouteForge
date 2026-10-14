@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH placed AS (\n             INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)\n             SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::date[],\n                                  $5::float8[], $6::float8[], $7::text[], $8::int8[])\n             RETURNING service_date\n         )\n         SELECT pg_notify($9, to_char(service_date, 'YYYY-MM-DD')) AS watchers FROM placed",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "watchers",
+        "type_info": "Void",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "UuidArray",
+        "TextArray",
+        "DateArray",
+        "Float8Array",
+        "Float8Array",
+        "TextArray",
+        "Int8Array",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "ef0d362c50c936d29c77710df4bc0bf4fd1ce51932fbc064d94e5e04b55f2998"
+}

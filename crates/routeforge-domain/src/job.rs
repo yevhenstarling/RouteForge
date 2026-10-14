@@ -172,7 +172,8 @@ impl RouteJob {
 
 /// How many jobs stand in each status.
 ///
-/// `queued` and `running` are the work still to be done. The other three only grow.
+/// `queued` and `running` are the work still to be done. The other three are the jobs
+/// that ended within a span: the last day, in what the API gives (D84).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct QueueDepth {

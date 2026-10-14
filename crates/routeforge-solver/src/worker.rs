@@ -9,6 +9,7 @@
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use futures_util::FutureExt as _;
@@ -27,6 +28,10 @@ use crate::{plan_job, route_job};
 
 /// Becomes `true` once, when the process is told to stop.
 pub(crate) type Shutdown = watch::Receiver<bool>;
+
+/// A worker that was not seen for this long is taken out of the registry when a solver
+/// starts. The load view shows those seen within seconds (D27).
+const FORGOTTEN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Waits until the process is told to stop. If nobody is left to say so, that counts
 /// as being told.
@@ -77,6 +82,17 @@ where
         config,
         distances,
     });
+
+    // The workers of solvers that are gone would stay in the registry for good: every
+    // solver that starts registers workers under new ids (D84).
+    match workers::forget(&context.pool, FORGOTTEN_AFTER).await {
+        Ok(0) => {}
+        Ok(forgotten) => info!(
+            forgotten,
+            "took workers not seen for a day out of the registry"
+        ),
+        Err(error) => warn!(%error, "could not tidy the registry of workers"),
+    }
 
     // The workers stop when the process is told to, and when one of them is lost.
     let (halt, halted) = watch::channel(false);

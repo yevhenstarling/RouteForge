@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use routeforge_domain::db::queue::{MAX_ATTEMPTS, PLANS_CHANNEL, PROGRESS_CHANNEL};
 use routeforge_domain::db::{orders, plans, routes};
 use routeforge_domain::{
-    CourierId, DistanceTable, Distances, Job, JobKind, JobStatus, LatLon, Order, OrderId,
-    OrderKind, OrderStatus, Plan, PlanCounts, PlanId, PlanStatus, Polyline, RouteProgress,
+    CourierId, DistanceTable, Distances, Haversine, Job, JobKind, JobStatus, LatLon, Order,
+    OrderId, OrderKind, OrderStatus, Plan, PlanCounts, PlanId, PlanStatus, Polyline, RouteProgress,
 };
 use sqlx::postgres::PgListener;
 
@@ -497,6 +497,36 @@ async fn a_job_that_panics_fails_its_attempt_and_the_worker_goes_on(pool: PgPool
 
     // Still there, and it stops when it is told to, as a worker does.
     fleet.stop().await;
+}
+
+/// A solver that starts takes the workers that were not seen for a day out of the
+/// registry, and leaves the others (D84).
+#[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+async fn a_solver_that_starts_forgets_the_workers_of_long_ago(pool: PgPool) {
+    let (gone, recent) = (WorkerId::generate(), WorkerId::generate());
+    for (worker, unseen) in [(gone, "25 hours"), (recent, "23 hours")] {
+        workers::register(&pool, worker, "solver-1").await.unwrap();
+        sqlx::query("UPDATE workers SET last_seen_at = now() - $2::interval WHERE id = $1")
+            .bind(worker.0)
+            .bind(unseen)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Told to stop before it starts: it tidies the registry, starts its worker, and
+    // stops it again.
+    let (_signal, stopping) = watch::channel(true);
+    testing::soon(run(pool.clone(), testing::config(), Haversine, stopping))
+        .await
+        .unwrap();
+
+    let left: Vec<sqlx::types::Uuid> = sqlx::query_scalar("SELECT id FROM workers")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(left.contains(&recent.0), "{left:?}");
+    assert!(!left.contains(&gone.0), "{left:?}");
 }
 
 /// One that waits until it is told to stop, as a worker does.

@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::{DbError, parsed, unsigned};
 use crate::geo::LatLon;
-use crate::ids::{IdempotencyKey, OrderId, PlanId};
+use crate::ids::{IdempotencyKey, OrderId, PlanId, UserId};
 use crate::model::{NewOrder, Order, OrderFilter, OrderStatus};
 
 /// The channel that says the orders of a day have changed: one was placed, or one was
@@ -213,6 +213,69 @@ pub async fn list(
     orders(rows)
 }
 
+/// The orders a client placed for a day, oldest first.
+///
+/// What the stream of somebody's own orders reads, whenever any plan changes (D77).
+/// It is [`list`] with a client and a day, in a statement of its own, which the index
+/// of the two serves however PostgreSQL comes to plan it.
+pub async fn of_client_on(
+    executor: impl PgExecutor<'_>,
+    client_id: UserId,
+    service_date: NaiveDate,
+) -> Result<Vec<Order>, DbError> {
+    let rows = sqlx::query_as!(
+        OrderRow,
+        "SELECT id, client_id, kind, status, service_date, lat, lon, address, demand,
+                plan_id, created_at
+         FROM orders
+         WHERE client_id = $1 AND service_date = $2
+         ORDER BY id",
+        client_id.0,
+        service_date,
+    )
+    .fetch_all(executor)
+    .await?;
+    orders(rows)
+}
+
+/// Stores many new orders as pending, in one statement, and says how many.
+///
+/// This is [`create`] for a batch, as the demonstration makes them (D46): a day of two
+/// thousand orders is one round trip and not two thousand. The watchers of each day
+/// are told as by `create`, and the words for one day are one when the transaction
+/// commits (D63). None of the orders has a key.
+pub async fn create_many(executor: impl PgExecutor<'_>, new: &[NewOrder]) -> Result<u64, DbError> {
+    let ids: Vec<Uuid> = new.iter().map(|_| OrderId::generate().0).collect();
+    let clients: Vec<Uuid> = new.iter().map(|order| order.client_id.0).collect();
+    let kinds: Vec<&str> = new.iter().map(|order| order.kind.as_str()).collect();
+    let days: Vec<NaiveDate> = new.iter().map(|order| order.service_date).collect();
+    let lats: Vec<f64> = new.iter().map(|order| order.location.lat()).collect();
+    let lons: Vec<f64> = new.iter().map(|order| order.location.lon()).collect();
+    let addresses: Vec<Option<String>> = new.iter().map(|order| order.address.clone()).collect();
+    let demands: Vec<i64> = new.iter().map(|order| i64::from(order.demand)).collect();
+    let placed = sqlx::query!(
+        "WITH placed AS (
+             INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand)
+             SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::date[],
+                                  $5::float8[], $6::float8[], $7::text[], $8::int8[])
+             RETURNING service_date
+         )
+         SELECT pg_notify($9, to_char(service_date, 'YYYY-MM-DD')) AS watchers FROM placed",
+        &ids,
+        &clients,
+        &kinds[..] as &[&str],
+        &days,
+        &lats,
+        &lons,
+        &addresses[..] as &[Option<String>],
+        &demands,
+        ORDERS_CHANNEL,
+    )
+    .execute(executor)
+    .await?;
+    Ok(placed.rows_affected())
+}
+
 /// The orders with these ids, oldest first. An id that names no order is left out.
 ///
 /// This is how a route job reads its stops.
@@ -309,7 +372,7 @@ mod tests {
 
     use super::*;
     use crate::db::queue::{JOBS_CHANNEL, PLANS_CHANNEL};
-    use crate::db::testing::{self, date};
+    use crate::db::testing::{self, date, soon};
     use crate::ids::UserId;
     use crate::model::{OrderKind, Role};
 
@@ -336,6 +399,84 @@ mod tests {
         assert_eq!(created.plan_id, None);
         assert_eq!(get(&pool, created.id).await.unwrap(), Some(created));
         assert_eq!(get(&pool, OrderId::generate()).await.unwrap(), None);
+    }
+
+    /// What the stream of somebody's own orders reads (D77): theirs, of that day, as the
+    /// list with the same two filters gives them.
+    #[sqlx::test]
+    async fn the_orders_of_a_client_on_a_day_are_theirs_of_that_day(pool: PgPool) {
+        let ada = testing::user(&pool, Role::Client).await;
+        let bob = testing::user(&pool, Role::Client).await;
+        let first = testing::order(&pool, ada.id, date(12)).await;
+        testing::order(&pool, ada.id, date(13)).await;
+        testing::order(&pool, bob.id, date(12)).await;
+        let withdrawn = testing::order(&pool, ada.id, date(12)).await;
+        assert!(cancel(&pool, withdrawn.id).await.unwrap());
+
+        let own = of_client_on(&pool, ada.id, date(12)).await.unwrap();
+        let ids: Vec<OrderId> = own.iter().map(|order| order.id).collect();
+        assert_eq!(ids, [first.id, withdrawn.id]);
+        let filter = OrderFilter {
+            client_id: Some(ada.id),
+            service_date: Some(date(12)),
+            ..OrderFilter::default()
+        };
+        assert_eq!(own, list(&pool, &filter).await.unwrap());
+        let nobodys = of_client_on(&pool, UserId::generate(), date(12)).await;
+        assert!(nobodys.unwrap().is_empty());
+    }
+
+    /// The orders of a demonstration go in as one statement (D46).
+    #[sqlx::test]
+    async fn many_orders_are_stored_together_and_each_day_is_told_once(pool: PgPool) {
+        let client = testing::user(&pool, Role::Client).await;
+        let mut listener = PgListener::connect_with(&pool).await.unwrap();
+        listener.listen(ORDERS_CHANNEL).await.unwrap();
+
+        let mut new: Vec<NewOrder> = (0..5)
+            .map(|_| testing::new_order(client.id, date(12)))
+            .collect();
+        new.push(NewOrder {
+            kind: OrderKind::Pickup,
+            address: Some("Khreshchatyk St, 22".to_owned()),
+            demand: 3,
+            ..testing::new_order(client.id, date(13))
+        });
+        assert_eq!(create_many(&pool, &new).await.unwrap(), 6);
+
+        let theirs = OrderFilter {
+            client_id: Some(client.id),
+            ..OrderFilter::default()
+        };
+        let stored = list(&pool, &theirs).await.unwrap();
+        assert_eq!(stored.len(), 6);
+        assert!(
+            stored
+                .iter()
+                .all(|order| order.status == OrderStatus::Pending)
+        );
+        for asked in &new {
+            assert!(
+                stored.iter().any(|order| asked.asks_for(order)),
+                "{asked:?}"
+            );
+        }
+        // One word for each day, as `create` would have said it in one transaction.
+        let mut heard = Vec::new();
+        for _ in 0..2 {
+            let told = soon(listener.recv()).await.unwrap();
+            heard.push(told.payload().to_owned());
+        }
+        heard.sort_unstable();
+        assert_eq!(heard, ["2026-10-12", "2026-10-13"]);
+        let more = tokio::time::timeout(Duration::from_millis(200), listener.recv()).await;
+        assert!(more.is_err(), "{more:?}");
+
+        // One statement: an order that cannot be stored keeps the others out as well.
+        let mut broken = new.clone();
+        broken[2].demand = 0;
+        assert!(create_many(&pool, &broken).await.is_err());
+        assert_eq!(list(&pool, &theirs).await.unwrap().len(), 6);
     }
 
     #[sqlx::test]
