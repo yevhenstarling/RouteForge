@@ -25,7 +25,7 @@ use crate::error::{self, PROBLEM_JSON};
 use crate::events::Events;
 use crate::logins::Logins;
 use crate::request_id::{self, RequestSpan};
-use crate::stream::Pace;
+use crate::stream::{Pace, Streams};
 use crate::{page, routes};
 
 /// Where the OpenAPI document is served.
@@ -54,6 +54,8 @@ pub(crate) struct AppState {
     pub(crate) events: Events,
     /// How the event streams pace themselves.
     pub(crate) pace: Pace,
+    /// The event streams each user holds open: only so many are taken (D85).
+    pub(crate) streams: Streams,
 }
 
 /// The application.
@@ -191,6 +193,8 @@ refusals! {
     NotAcceptable => "422", "Something in the request cannot be accepted. `errors` names the fields, where it is known which";
     /// `429`, on the login.
     TooManyLogins => "429", "Too many logins were tried for this address. `Retry-After` says in how many seconds the next may be";
+    /// `429`, on an event stream.
+    TooManyStreams => "429", "The caller holds as many event streams open as one person may. `Retry-After` says when one that has lost its reader is noticed, and makes room";
     /// `503`, where a password is hashed.
     Busy => "503", "The server has too many passwords to check at this moment. `Retry-After` says when to try again";
 }

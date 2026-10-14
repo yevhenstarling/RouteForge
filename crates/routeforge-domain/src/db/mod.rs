@@ -82,6 +82,12 @@ pub enum DbError {
     /// [`plans::create`]: a service date has at most one plan in progress.
     #[error("the service date already has a plan in progress")]
     ActivePlanExists,
+    /// [`plans::create`]: a service date that has a plan that is done is planned again
+    /// only once that plan is discarded (D83).
+    #[error(
+        "the service date has a plan that is done: discard it, and the date can be planned afresh"
+    )]
+    DayIsPlanned,
     /// A value is larger than its column can hold.
     #[error("{0} is too large to be stored")]
     OutOfRange(&'static str),

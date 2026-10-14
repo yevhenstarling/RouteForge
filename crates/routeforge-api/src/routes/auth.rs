@@ -118,7 +118,9 @@ async fn check(state: &AppState, sent: &Login) -> Result<Option<User>, ApiError>
 /// The Telegram bot is the one caller of this. It shows its key, as
 /// `Authorization: Bearer <key>`, says which Telegram user it is talking to, and is
 /// given a token for that user's account. With that token it asks what the user asks
-/// of it, so the bot can do no more than the user may (D9).
+/// of it, so the bot can do no more than the user may (D9). Nor more than an operator
+/// may: the token of an admin's account gives an operator's rights, which are all the
+/// bot uses, so the key opens nothing that is an admin's.
 ///
 /// A Telegram user the API has not heard of gets an account here and now: a client's,
 /// with no address and no password. An admin can make it an operator's.
@@ -147,7 +149,7 @@ async fn telegram_login(
     // So that what the request logs says for whom the bot asked.
     span.record("user_id", tracing::field::display(user.id));
     Ok(web::Json(
-        state.tokens.issue_for(user, state.bot_token_ttl)?,
+        state.tokens.issue_to_the_bot(user, state.bot_token_ttl)?,
     ))
 }
 
@@ -450,6 +452,35 @@ mod tests {
         assert_eq!(couriers(&token_of(&after)).await, StatusCode::OK);
         // The token from before says what the account was, for the minute it lasts.
         assert_eq!(couriers(&token_of(&before)).await, StatusCode::FORBIDDEN);
+    }
+
+    /// The bot's key is no admin's key, whichever account it names (D60). An admin who
+    /// talks to the bot is told they are one, and does through it what an operator may.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn the_bot_is_given_no_more_than_an_operators_token(pool: PgPool) {
+        let api = testing::api(&pool);
+        let admin = api.actor(Role::Admin).await;
+        let login = || api.telegram_login(Some(BOT_KEY), json!({ "telegram_id": 4_242 }));
+        let made = login().await;
+        let role = format!(
+            "/api/users/{}/role",
+            made.body["user"]["id"].as_str().unwrap()
+        );
+        let promoted = api
+            .put(Some(&admin), &role, json!({ "role": "admin" }))
+            .await;
+        assert_eq!(promoted.status, StatusCode::OK, "{}", promoted.text);
+
+        let session = login().await;
+        assert_eq!(session.body["user"]["role"], "admin");
+        let token = token_of(&session);
+        let asked = async |path: &str| {
+            with_token(&api, "GET", path, &token, Value::Null)
+                .await
+                .status
+        };
+        assert_eq!(asked("/api/couriers").await, StatusCode::OK);
+        assert_eq!(asked("/api/users").await, StatusCode::FORBIDDEN);
     }
 
     #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]

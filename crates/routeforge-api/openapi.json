@@ -639,7 +639,7 @@
         "type": "object"
       },
       "QueueDepth": {
-        "description": "How many jobs stand in each status.\n\n`queued` and `running` are the work still to be done. The other three only grow.",
+        "description": "How many jobs stand in each status.\n\n`queued` and `running` are the work still to be done. The other three are the jobs\nthat ended within a span: the last day, in what the API gives (D84).",
         "properties": {
           "cancelled": {
             "format": "int64",
@@ -1217,7 +1217,7 @@
     },
     "/api/auth/telegram": {
       "post": {
-        "description": "The Telegram bot is the one caller of this. It shows its key, as\n`Authorization: Bearer <key>`, says which Telegram user it is talking to, and is\ngiven a token for that user's account. With that token it asks what the user asks\nof it, so the bot can do no more than the user may (D9).\n\nA Telegram user the API has not heard of gets an account here and now: a client's,\nwith no address and no password. An admin can make it an operator's.\n\nThe token is good for `expires_in` seconds, which is far less than a login's: the\nbot asks for one whenever it needs one.",
+        "description": "The Telegram bot is the one caller of this. It shows its key, as\n`Authorization: Bearer <key>`, says which Telegram user it is talking to, and is\ngiven a token for that user's account. With that token it asks what the user asks\nof it, so the bot can do no more than the user may (D9). Nor more than an operator\nmay: the token of an admin's account gives an operator's rights, which are all the\nbot uses, so the key opens nothing that is an admin's.\n\nA Telegram user the API has not heard of gets an account here and now: a client's,\nwith no address and no password. An admin can make it an operator's.\n\nThe token is good for `expires_in` seconds, which is far less than a login's: the\nbot asks for one whenever it needs one.",
         "operationId": "telegram_login",
         "requestBody": {
           "content": {
@@ -2000,6 +2000,16 @@
               }
             },
             "description": "No token was sent, or the one sent is not valid or has expired"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller holds as many event streams open as one person may. `Retry-After` says when one that has lost its reader is noticed, and makes room"
           }
         },
         "security": [
@@ -2252,7 +2262,7 @@
         ]
       },
       "post": {
-        "description": "Stores the plan and hands it to the solvers. They take the orders of the day that\nare pending, give each active courier the ones that fit it, and search for the\norder to call in. Read the plan again to see it go from `queued` to `routing` to\n`done`.\n\nA day has one plan in progress at a time. The `X-Request-Id` of this request is\nkept on the plan's jobs, so the solvers' logs can be searched for it.",
+        "description": "Stores the plan and hands it to the solvers. They take the orders of the day that\nare pending, give each active courier the ones that fit it, and search for the\norder to call in. Read the plan again to see it go from `queued` to `routing` to\n`done`.\n\nA day has one plan at a time that stands: one in progress, or one that is done.\nA day whose plan is done is planned again once that plan is discarded, and then\nafresh, with every order of it (D83). The `X-Request-Id` of this request is kept on\nthe plan's jobs, so the solvers' logs can be searched for it.",
         "operationId": "create_plan",
         "requestBody": {
           "content": {
@@ -2303,7 +2313,7 @@
                 }
               }
             },
-            "description": "The day already has a plan in progress, or no depot has been set"
+            "description": "The day already has a plan in progress, or one that is done and is to be discarded first, or no depot has been set"
           },
           "422": {
             "content": {
@@ -2606,6 +2616,16 @@
               }
             },
             "description": "There is no such thing, or none the caller may know of"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller holds as many event streams open as one person may. `Retry-After` says when one that has lost its reader is noticed, and makes room"
           }
         },
         "security": [
@@ -2771,6 +2791,16 @@
               }
             },
             "description": "The caller's role does not allow this"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The caller holds as many event streams open as one person may. `Retry-After` says when one that has lost its reader is noticed, and makes room"
           }
         },
         "security": [

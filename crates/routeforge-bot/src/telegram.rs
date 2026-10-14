@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use chrono::Local;
 use reqwest::Url;
+use routeforge_domain::service::Backoff;
 use teloxide::dispatching::UpdateHandler;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -43,11 +44,9 @@ pub(crate) struct Pace {
     /// How long Telegram may keep a request for updates open when it has none. It has
     /// to be well inside the seventeen seconds the client gives any request.
     pub(crate) poll: Duration,
-    /// How long to wait before Telegram is tried again when it cannot be reached:
-    /// this long at first, then twice as long each time, up to `retry_up_to`. As the
-    /// solver waits for its database.
-    pub(crate) retry_from: Duration,
-    pub(crate) retry_up_to: Duration,
+    /// How long to wait before Telegram is tried again when it cannot be reached. As
+    /// the solver waits for its database.
+    pub(crate) retry: Backoff,
     /// How long the bot has to finish what it has in hand once it is told to stop.
     /// `docker stop` waits ten seconds before it kills, and this has to be inside
     /// that.
@@ -58,8 +57,7 @@ impl Default for Pace {
     fn default() -> Self {
         Self {
             poll: Duration::from_secs(10),
-            retry_from: Duration::from_secs(1),
-            retry_up_to: Duration::from_secs(30),
+            retry: Backoff::STANDARD,
             stop_within: Duration::from_secs(8),
         }
     }
@@ -109,17 +107,17 @@ pub(crate) async fn run(
     // container. The bot is told to stop from outside, and passes it on (D62).
     let stop = dispatcher.shutdown_token();
 
-    let mut retry_in = pace.retry_from;
+    let mut retry = pace.retry;
     loop {
         let reached = tokio::select! {
             reached = bot.get_me().send() => reached,
             () = told(&mut stopping) => return Ok(()),
         };
-        match reached {
+        let unreached = match reached {
             Ok(me) => {
                 let username = me.user.username.as_deref().unwrap_or_default();
                 info!(username, "Telegram knows the bot; listening for its chats");
-                retry_in = pace.retry_from;
+                retry.reset();
                 if let Err(error) = bot.set_my_commands(menu()).await {
                     warn!(%error, "could not tell Telegram the bot's commands");
                 }
@@ -152,16 +150,20 @@ pub(crate) async fn run(
                         return Ok(());
                     }
                 }
+                None
             }
             Err(error) if is_refusal(&error) => bail!(refusal()),
-            Err(error) => warn!(%error, ?retry_in, "cannot reach Telegram; trying again"),
-        }
+            Err(error) => Some(error),
+        };
 
+        let retry_in = retry.pause();
+        if let Some(error) = unreached {
+            warn!(%error, ?retry_in, "cannot reach Telegram; trying again");
+        }
         tokio::select! {
             () = tokio::time::sleep(retry_in) => {}
             () = told(&mut stopping) => return Ok(()),
         }
-        retry_in = (retry_in * 2).min(pace.retry_up_to);
     }
 }
 

@@ -127,18 +127,30 @@ pub async fn stops_of_day(
     client_id: Option<UserId>,
 ) -> Result<Vec<OrderStop>, DbError> {
     // How many calls the route has is counted over the whole route, and not over the
-    // rows that are left when one client's orders are picked out.
+    // rows that are left when one client's orders are picked out. It is counted once
+    // for each route that has one of the orders, and not once for each order: for all
+    // the orders of a day that is a few routes and not a few thousand counts.
     let rows = sqlx::query!(
-        r#"SELECT stops.order_id, couriers.name AS courier, stops.position,
-                  (SELECT count(*) FROM route_stops AS calls
-                   WHERE calls.route_id = stops.route_id) AS "calls!"
-           FROM orders
-           JOIN route_stops AS stops ON stops.order_id = orders.id
+        r#"WITH stops AS (
+               SELECT route_stops.order_id, route_stops.route_id, route_stops.position
+               FROM orders
+               JOIN route_stops ON route_stops.order_id = orders.id
+               WHERE orders.service_date = $1
+                 AND ($2::uuid IS NULL OR orders.client_id = $2)
+           ),
+           calls AS (
+               SELECT route_stops.route_id, count(*) AS calls
+               FROM route_stops
+               WHERE route_stops.route_id IN (SELECT route_id FROM stops)
+               GROUP BY route_stops.route_id
+           )
+           SELECT stops.order_id, couriers.name AS courier, stops.position,
+                  calls.calls AS "calls!"
+           FROM stops
+           JOIN calls ON calls.route_id = stops.route_id
            JOIN routes ON routes.id = stops.route_id
            JOIN couriers ON couriers.id = routes.courier_id
-           WHERE orders.service_date = $1
-             AND ($2::uuid IS NULL OR orders.client_id = $2)
-           ORDER BY orders.id"#,
+           ORDER BY stops.order_id"#,
         service_date,
         client_id.map(|id| id.0),
     )

@@ -8,10 +8,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-routeforge-domain = { workspace = true, features = ["db"] }
+routeforge-domain = { workspace = true, features = ["db", "service"] }
 routeforge-tsp.workspace = true
 
 anyhow.workspace = true
+# For `catch_unwind` on a job's future: a job that panics is a failed attempt (D82).
+futures-util.workspace = true
 # For the jitter of the polling interval, from a generator seeded with the worker's id.
 rand.workspace = true
 # For asking an OSRM server for road distances (D66). It is on the compose network or
@@ -22,11 +24,13 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
 serde_json.workspace = true
+# For the tests that read what a worker logs. The solver itself logs through
+# `routeforge_domain::service` (D81).
+tracing-subscriber.workspace = true
 # A server inside a test, in the place of OSRM.
 wiremock.workspace = true
 

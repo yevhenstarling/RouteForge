@@ -16,7 +16,9 @@ use routeforge_domain::{
 use utoipa_actix_web::service_config::ServiceConfig;
 use uuid::Uuid;
 
-use crate::app::{AppState, NotAcceptable, NotAllowed, NotLoggedIn, NotNow, NotThere};
+use crate::app::{
+    AppState, NotAcceptable, NotAllowed, NotLoggedIn, NotNow, NotThere, TooManyStreams,
+};
 use crate::auth::Staff;
 use crate::error::ApiError;
 use crate::events::Signal;
@@ -42,8 +44,10 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
 /// order to call in. Read the plan again to see it go from `queued` to `routing` to
 /// `done`.
 ///
-/// A day has one plan in progress at a time. The `X-Request-Id` of this request is
-/// kept on the plan's jobs, so the solvers' logs can be searched for it.
+/// A day has one plan at a time that stands: one in progress, or one that is done.
+/// A day whose plan is done is planned again once that plan is discarded, and then
+/// afresh, with every order of it (D83). The `X-Request-Id` of this request is kept on
+/// the plan's jobs, so the solvers' logs can be searched for it.
 #[utoipa::path(
     tag = "plans",
     security(("bearer" = [])),
@@ -51,7 +55,7 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
         (status = 201, description = "The plan, queued", body = Plan),
         NotLoggedIn,
         NotAllowed,
-        (status = 409, description = "The day already has a plan in progress, or no depot has been set",
+        (status = 409, description = "The day already has a plan in progress, or one that is done and is to be discarded first, or no depot has been set",
             body = routeforge_domain::Problem, content_type = "application/problem+json"),
         NotAcceptable,
     )
@@ -203,6 +207,7 @@ async fn list_plan_routes(
         NotLoggedIn,
         NotAllowed,
         NotThere,
+        TooManyStreams,
     )
 )]
 #[get("/api/plans/{id}/events")]
@@ -472,6 +477,41 @@ mod tests {
         // Another day is free.
         let other = api.post(Some(&operator), "/api/plans", plan_for(13)).await;
         assert_eq!(other.status, StatusCode::CREATED);
+    }
+
+    /// A day whose plan is done has given its couriers their round. It is planned again
+    /// once that plan is discarded, and the refusal says so (D83).
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_day_whose_plan_is_done_is_planned_again_once_it_is_discarded(pool: PgPool) {
+        let api = testing::api(&pool);
+        let operator = api.actor(Role::Operator).await;
+        api.depot().await;
+        let first = api.post(Some(&operator), "/api/plans", plan_for(12)).await;
+        assert_eq!(first.status, StatusCode::CREATED);
+        let first_id: Uuid = first.body["id"].as_str().unwrap().parse().unwrap();
+        // Done, as the solvers leave a plan that had no orders to route.
+        for done in [
+            "UPDATE jobs SET status = 'done', finished_at = now() WHERE plan_id = $1",
+            "UPDATE plans SET status = 'done', finished_at = now() WHERE id = $1",
+        ] {
+            sqlx::query(done)
+                .bind(first_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let second = api.post(Some(&operator), "/api/plans", plan_for(12)).await;
+        assert_eq!(second.status, StatusCode::CONFLICT);
+        let detail = second.body["detail"].as_str().unwrap();
+        assert!(detail.contains("discard it"), "{detail}");
+        assert_eq!(plans_and_jobs(&pool).await, (1, 1));
+
+        let discard = format!("/api/plans/{first_id}/discard");
+        let discarded = api.post(Some(&operator), &discard, Value::Null).await;
+        assert_eq!(discarded.status, StatusCode::OK);
+        let third = api.post(Some(&operator), "/api/plans", plan_for(12)).await;
+        assert_eq!(third.status, StatusCode::CREATED, "{}", third.text);
     }
 
     /// The plan and its job are one transaction: a plan whose job cannot be stored is

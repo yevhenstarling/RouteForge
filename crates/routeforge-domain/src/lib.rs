@@ -10,6 +10,9 @@
 //!   and the job queue (D3). The API and the solver enable it.
 //! - With the `openapi` feature, the types the HTTP API sends and receives describe
 //!   themselves for its OpenAPI document. The API enables it.
+//! - With the `service` feature, the `service` module has what the three services
+//!   share beside their types: how they log, how they hear that they are to stop, and
+//!   how long they wait before trying again (D81). All three enable it.
 //!
 //! The decisions cited as D1, D2, … are in `docs/architecture.md`.
 
@@ -20,6 +23,8 @@ mod geo;
 mod ids;
 mod job;
 mod model;
+#[cfg(feature = "service")]
+pub mod service;
 mod text;
 
 pub use dto::{

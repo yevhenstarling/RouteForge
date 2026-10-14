@@ -31,6 +31,22 @@ pub async fn register(
     Ok(())
 }
 
+/// Takes the workers that were not seen for `unseen_for` out of the registry, and says
+/// how many (D84).
+///
+/// Every solver that starts registers workers under ids of their own, and the rows of
+/// those that are gone would stay for good. The queue never reads them (D27), so a row
+/// can go at any time.
+pub async fn forget(executor: impl PgExecutor<'_>, unseen_for: Duration) -> Result<u64, DbError> {
+    let forgotten = sqlx::query!(
+        "DELETE FROM workers WHERE last_seen_at < now() - $1::bigint * interval '1 millisecond'",
+        millis(unseen_for),
+    )
+    .execute(executor)
+    .await?;
+    Ok(forgotten.rows_affected())
+}
+
 struct WorkerRow {
     id: Uuid,
     hostname: String,
@@ -88,6 +104,27 @@ mod tests {
     use crate::db::testing::{self, LONG, date};
 
     const RECENTLY: Duration = Duration::from_secs(30);
+
+    #[sqlx::test]
+    async fn a_worker_not_seen_for_long_is_forgotten(pool: PgPool) {
+        let (gone, here) = (WorkerId::generate(), WorkerId::generate());
+        register(&pool, gone, "solver-1").await.unwrap();
+        register(&pool, here, "solver-2").await.unwrap();
+        sqlx::query("UPDATE workers SET last_seen_at = now() - interval '2 days' WHERE id = $1")
+            .bind(gone.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert_eq!(forget(&pool, day).await.unwrap(), 1);
+        let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workers")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, [here.0]);
+        assert_eq!(forget(&pool, day).await.unwrap(), 0);
+    }
 
     #[sqlx::test]
     async fn a_worker_registers_once_and_is_seen_again(pool: PgPool) {

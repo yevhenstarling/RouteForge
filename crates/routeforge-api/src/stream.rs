@@ -21,14 +21,16 @@
 //! nothing to stop and nothing that could be left running when the response is
 //! dropped: the rule of D34, kept here as well.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use actix_web::http::header;
 use actix_web::web::{self, Bytes};
 use actix_web::{HttpResponse, HttpResponseBuilder};
 use futures_util::stream;
+use routeforge_domain::UserId;
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch};
@@ -102,6 +104,71 @@ pub(crate) trait Watch: 'static {
     fn unprompted(&self, pace: &Pace) -> Duration;
 }
 
+/// How many event streams each user holds open, so that nobody holds more than so many
+/// (D85).
+///
+/// Each stream reads the database when it opens, every few seconds and whenever a plan
+/// changes, through the pool every request shares. Without a bound, whoever has an
+/// account could open thousands of them and have every request wait for a connection.
+pub(crate) struct Streams {
+    most: u32,
+    open: Arc<Mutex<HashMap<UserId, u32>>>,
+}
+
+/// One stream's place among those of its user. It is given back when it is dropped,
+/// which is when the stream is, however the stream ends.
+pub(crate) struct Slot {
+    open: Arc<Mutex<HashMap<UserId, u32>>>,
+    user: UserId,
+}
+
+impl Streams {
+    /// At most `most` streams open for each user.
+    pub(crate) fn new(most: u32) -> Self {
+        Self {
+            most,
+            open: Arc::default(),
+        }
+    }
+
+    /// A place for one more stream of `user`. `None` if they hold as many as one may.
+    pub(crate) fn take(&self, user: UserId) -> Option<Slot> {
+        let mut open = lock(&self.open);
+        let held = open.entry(user).or_default();
+        if *held >= self.most {
+            return None;
+        }
+        *held += 1;
+        Some(Slot {
+            open: Arc::clone(&self.open),
+            user,
+        })
+    }
+
+    /// How many streams `user` holds open.
+    #[cfg(test)]
+    pub(crate) fn held(&self, user: UserId) -> u32 {
+        lock(&self.open).get(&user).copied().unwrap_or_default()
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut open = lock(&self.open);
+        if let Some(held) = open.get_mut(&self.user) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                open.remove(&self.user);
+            }
+        }
+    }
+}
+
+fn lock(open: &Mutex<HashMap<UserId, u32>>) -> MutexGuard<'_, HashMap<UserId, u32>> {
+    // Nothing is ever done under the lock that could leave the map half changed.
+    open.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// One event: its name, and its data as JSON on a line of its own.
 pub(crate) fn frame(event: &str, data: &impl Serialize) -> Result<Bytes, ApiError> {
     // serde_json breaks no line by itself, and writes a line break inside a text as
@@ -114,13 +181,24 @@ pub(crate) fn frame(event: &str, data: &impl Serialize) -> Result<Bytes, ApiErro
 ///
 /// # Errors
 ///
-/// What the first read fails with. Nothing has been sent by then, so the caller is
-/// refused as by any other endpoint: a plan that does not exist is a `404`.
+/// [`ApiError::TooManyStreams`] when the caller holds as many streams open as one may
+/// (D85). Otherwise what the first read fails with. Nothing has been sent by then, so
+/// the caller is refused as by any other endpoint: a plan that does not exist is a
+/// `404`.
 pub(crate) async fn open<W: Watch>(
     state: web::Data<AppState>,
     user: AuthUser,
     mut watch: W,
 ) -> Result<HttpResponse, ApiError> {
+    // Before anything is read. A stream whose reader has gone is found when the next
+    // comment is written to it, and gives its place back then.
+    let slot = state
+        .streams
+        .take(user.id)
+        .ok_or(ApiError::TooManyStreams {
+            most: state.streams.most,
+            retry_after: state.pace.keep_alive,
+        })?;
     // Subscribed before the first read. What changes after that read is then waiting
     // in the receiver when the stream comes to look.
     let subscription = state.events.subscribe();
@@ -150,6 +228,7 @@ pub(crate) async fn open<W: Watch>(
         ready: first.into(),
         keep_alive,
         ending: Ending::begin(),
+        _slot: slot,
     };
 
     let events = stream::unfold(feed, |mut feed| async move {
@@ -184,6 +263,8 @@ struct Feed<W> {
     /// When the token the stream was opened with stops being accepted.
     expires: Option<Instant>,
     ending: Ending,
+    /// The stream's place among those of its user, given back with the stream.
+    _slot: Slot,
 }
 
 impl<W: Watch> Feed<W> {
@@ -305,6 +386,30 @@ mod tests {
         assert_eq!(text.matches('\n').count(), 3, "{text:?}");
         assert!(text.ends_with("\n\n") && !text.contains('\r'));
         assert!(text.contains(r"first line\nsecond line\r\n"), "{text:?}");
+    }
+
+    #[test]
+    fn a_user_holds_so_many_streams_and_a_dropped_one_makes_room() {
+        let streams = Streams::new(2);
+        let (ada, bob) = (UserId::generate(), UserId::generate());
+
+        let first = streams.take(ada).unwrap();
+        let second = streams.take(ada).unwrap();
+        assert!(streams.take(ada).is_none());
+        assert_eq!(streams.held(ada), 2);
+        // Somebody else counts apart.
+        let bobs = streams.take(bob).unwrap();
+        assert_eq!(streams.held(bob), 1);
+
+        drop(first);
+        assert_eq!(streams.held(ada), 1);
+        let third = streams.take(ada).unwrap();
+        assert!(streams.take(ada).is_none());
+
+        // When the last one goes, nothing is kept of the user.
+        drop((second, third, bobs));
+        assert_eq!((streams.held(ada), streams.held(bob)), (0, 0));
+        assert!(lock(&streams.open).is_empty());
     }
 
     #[test]

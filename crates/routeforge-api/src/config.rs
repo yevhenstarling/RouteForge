@@ -29,6 +29,8 @@ pub(crate) struct Config {
     pub(crate) login_attempts: u32,
     /// How many passwords are hashed at the same time. Each takes 19 MiB (D68).
     pub(crate) hashes_at_once: usize,
+    /// How many event streams one user may hold open at the same time (D85).
+    pub(crate) streams_per_user: u32,
 }
 
 /// More tries than this within a minute are no limit worth the name.
@@ -36,6 +38,9 @@ const MOST_LOGIN_ATTEMPTS: u64 = 1_000;
 
 /// More hashes at once than this are more than a gigabyte of them.
 const MOST_HASHES_AT_ONCE: u64 = 64;
+
+/// More streams than this for one person are no limit worth the name.
+const MOST_STREAMS_PER_USER: u64 = 1_000;
 
 /// What a plan's budget for each of its routes may be (D31).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +128,13 @@ impl Config {
             (1..=MOST_HASHES_AT_ONCE).contains(&hashes_at_once),
             "API_HASHES_AT_ONCE must be between 1 and {MOST_HASHES_AT_ONCE}, got {hashes_at_once}"
         );
+        // A page holds two or three, and one it has left is not noticed until the next
+        // comment finds its reader gone (D50). Sixteen leave room for a few pages.
+        let streams_per_user = number("API_STREAMS_PER_USER", 16)?;
+        ensure!(
+            (1..=MOST_STREAMS_PER_USER).contains(&streams_per_user),
+            "API_STREAMS_PER_USER must be between 1 and {MOST_STREAMS_PER_USER}, got {streams_per_user}"
+        );
 
         Ok(Self {
             bind,
@@ -130,9 +142,10 @@ impl Config {
             bot_token_ttl: seconds("BOT_JWT_TTL_SECS", 60)?,
             limits,
             worker_alive: seconds("API_WORKER_ALIVE_SECS", 15)?,
-            // Both were held to a range that fits.
+            // All three were held to a range that fits.
             login_attempts: login_attempts as u32,
             hashes_at_once: hashes_at_once as usize,
+            streams_per_user: streams_per_user as u32,
         })
     }
 }
@@ -287,6 +300,7 @@ mod tests {
                 worker_alive: Duration::from_secs(15),
                 login_attempts: 5,
                 hashes_at_once: 4,
+                streams_per_user: 16,
             }
         );
     }
@@ -303,6 +317,7 @@ mod tests {
             ("API_WORKER_ALIVE_SECS", "3"),
             ("API_LOGIN_ATTEMPTS", "20"),
             ("API_HASHES_AT_ONCE", "1"),
+            ("API_STREAMS_PER_USER", "3"),
         ])
         .unwrap();
         assert_eq!(
@@ -319,6 +334,7 @@ mod tests {
                 worker_alive: Duration::from_secs(3),
                 login_attempts: 20,
                 hashes_at_once: 1,
+                streams_per_user: 3,
             }
         );
     }
@@ -352,6 +368,9 @@ mod tests {
             ("API_LOGIN_ATTEMPTS", "a few"),
             ("API_HASHES_AT_ONCE", "0"),
             ("API_HASHES_AT_ONCE", "65"),
+            ("API_STREAMS_PER_USER", "0"),
+            ("API_STREAMS_PER_USER", "1001"),
+            ("API_STREAMS_PER_USER", "many"),
         ] {
             let error = config(&[(name, value)]).unwrap_err();
             assert!(error.to_string().contains(name), "{name}={value}: {error}");

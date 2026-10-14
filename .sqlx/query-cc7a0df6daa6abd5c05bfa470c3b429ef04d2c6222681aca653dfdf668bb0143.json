@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM workers WHERE last_seen_at < now() - $1::bigint * interval '1 millisecond'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cc7a0df6daa6abd5c05bfa470c3b429ef04d2c6222681aca653dfdf668bb0143"
+}

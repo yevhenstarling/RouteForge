@@ -623,11 +623,25 @@ pub async fn list_for_plan(
 }
 
 /// How many jobs stand in each status: the depth of the queue, and what became of the
-/// jobs that have left it.
-pub async fn depth(executor: impl PgExecutor<'_>) -> Result<QueueDepth, DbError> {
-    let rows = sqlx::query!(r#"SELECT status, count(*) AS "jobs!" FROM jobs GROUP BY status"#)
-        .fetch_all(executor)
-        .await?;
+/// jobs that left it within the last `ended_within` (D84).
+///
+/// The jobs that have ended pile up, and the live view asks for this every couple of
+/// seconds. So the count of them is of a span, which an index of when they ended
+/// serves, and not of all there ever were.
+pub async fn depth(
+    executor: impl PgExecutor<'_>,
+    ended_within: Duration,
+) -> Result<QueueDepth, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT status, count(*) AS "jobs!"
+           FROM jobs
+           WHERE status IN ('queued', 'running')
+              OR finished_at > now() - $1::bigint * interval '1 millisecond'
+           GROUP BY status"#,
+        millis(ended_within),
+    )
+    .fetch_all(executor)
+    .await?;
 
     let mut depth = QueueDepth::default();
     for row in rows {

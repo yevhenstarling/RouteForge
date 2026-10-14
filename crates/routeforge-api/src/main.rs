@@ -26,6 +26,7 @@
 //! | `API_WORKER_ALIVE_SECS` | 15 | A worker seen within this long counts as alive. |
 //! | `API_LOGIN_ATTEMPTS` | 5 | How many logins are taken for one address within a minute. |
 //! | `API_HASHES_AT_ONCE` | 4 | How many passwords are hashed at the same time. Each takes 19 MiB. |
+//! | `API_STREAMS_PER_USER` | 16 | How many event streams one user may hold open at the same time. |
 //! | `LOG_FORMAT` | `text` | `json` for one JSON object per line. |
 //! | `RUST_LOG` | `info` | What to log, in the syntax of `tracing`'s `EnvFilter`. |
 //!
@@ -51,19 +52,17 @@ mod stream;
 mod testing;
 mod validate;
 
-use std::io::IsTerminal;
-
 use actix_web::{HttpServer, web};
 use anyhow::{Context, bail};
+use routeforge_domain::service::{init_logging, told_to_stop};
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
 
 use crate::app::{AppState, app};
 use crate::auth::{Passwords, ServiceKey, Tokens};
 use crate::config::{Config, Secrets};
 use crate::events::Events;
 use crate::logins::Logins;
-use crate::stream::Pace;
+use crate::stream::{Pace, Streams};
 
 /// How long the requests in hand are given to finish once the API is told to stop.
 /// `docker stop` waits ten seconds before it kills, and this has to be inside that.
@@ -121,6 +120,7 @@ async fn serve() -> anyhow::Result<()> {
         worker_alive: config.worker_alive,
         events: Events::new(),
         pace: Pace::default(),
+        streams: Streams::new(config.streams_per_user),
     });
     let listening = state.events.listen(pool.clone());
 
@@ -146,59 +146,4 @@ async fn serve() -> anyhow::Result<()> {
     pool.close().await;
     info!("the API has stopped");
     Ok(())
-}
-
-/// Returns when the process is asked to stop: Ctrl-C anywhere, and SIGTERM where
-/// there is one, which is what `docker stop` sends. The solver listens the same way.
-async fn told_to_stop() {
-    let interrupted = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            // Without a handler only a kill ends the process, and that needs no help.
-            warn!(%error, "cannot hear Ctrl-C");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminated) => {
-                tokio::select! {
-                    () = interrupted => {}
-                    _ = terminated.recv() => {}
-                }
-            }
-            Err(error) => {
-                warn!(%error, "cannot hear SIGTERM");
-                interrupted.await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    interrupted.await;
-}
-
-/// Logs to standard output: lines for people by default, JSON with `LOG_FORMAT=json`.
-/// Either way an event carries the fields of the span it happened in, which is where
-/// the id of the request is. The solver sets its logging up the same way.
-fn init_logging() {
-    // An empty `RUST_LOG` would mean errors only. It is taken as not set.
-    let filter = std::env::var("RUST_LOG")
-        .ok()
-        .filter(|directives| !directives.trim().is_empty())
-        .and_then(|directives| EnvFilter::try_new(directives).ok())
-        .unwrap_or_else(|| EnvFilter::new("info"));
-    let json = std::env::var("LOG_FORMAT").is_ok_and(|format| format.eq_ignore_ascii_case("json"));
-    let logging = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        // Colours for a person at a terminal. In a file they are in the way of
-        // searching for an id.
-        .with_ansi(std::io::stdout().is_terminal());
-    if json {
-        logging.json().init();
-    } else {
-        logging.init();
-    }
 }

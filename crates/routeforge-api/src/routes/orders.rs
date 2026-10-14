@@ -27,7 +27,7 @@ use routeforge_domain::{
 use utoipa_actix_web::service_config::ServiceConfig;
 use uuid::Uuid;
 
-use crate::app::{AppState, NotAcceptable, NotLoggedIn, NotNow, NotThere};
+use crate::app::{AppState, NotAcceptable, NotLoggedIn, NotNow, NotThere, TooManyStreams};
 use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::events::Signal;
@@ -206,6 +206,7 @@ async fn list_order_stops(
         (status = 200, description = "The events, for as long as the stream is read",
             body = String, content_type = "text/event-stream"),
         NotLoggedIn,
+        TooManyStreams,
     )
 )]
 #[get("/api/orders/events")]
@@ -251,12 +252,7 @@ impl Watch for OrdersWatch {
     }
 
     async fn read(&mut self, state: &AppState) -> Result<Vec<Bytes>, ApiError> {
-        let own = OrderFilter {
-            client_id: Some(self.client_id),
-            service_date: Some(self.service_date),
-            ..OrderFilter::default()
-        };
-        let orders = orders::list(&state.pool, &own)
+        let orders = orders::of_client_on(&state.pool, self.client_id, self.service_date)
             .await?
             .into_iter()
             .map(|order| (order.id, order.status))
@@ -369,6 +365,48 @@ mod tests {
 
     fn the_12th() -> Value {
         json!({ "service_date": "2026-10-12" })
+    }
+
+    /// Nobody holds more event streams open than so many (D85). A stream that ends,
+    /// however it ends, makes room for another.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn one_person_holds_only_so_many_streams_open(pool: PgPool) {
+        let api = testing::api_with_streams(&pool, 2);
+        let ada = api.actor(Role::Client).await;
+        let bob = api.actor(Role::Operator).await;
+
+        let first = api.open(&ada, EVENTS).await;
+        let _second = api.open(&ada, EVENTS).await;
+        let refused = api.get(Some(&ada), EVENTS).await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.content_type.as_deref(), Some(PROBLEM_JSON));
+        assert!(refused.headers.contains_key(header::RETRY_AFTER));
+        let detail = refused.body["detail"].as_str().unwrap();
+        assert!(detail.contains("2 event streams"), "{detail}");
+
+        // The count is of streams of every kind, and of one person: somebody else
+        // has streams of their own.
+        let _bobs = api.open(&bob, "/api/system/stats/events").await;
+        let _plans = api.open(&bob, EVENTS).await;
+        let refused = api.get(Some(&bob), "/api/system/stats/events").await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+
+        // One that is dropped gives its place back.
+        drop(first);
+        let _third = api.open(&ada, EVENTS).await;
+    }
+
+    /// A stream that is refused for a reason of its own gives its place back at once.
+    #[sqlx::test(migrator = "routeforge_domain::db::MIGRATOR")]
+    async fn a_stream_that_is_refused_holds_no_place(pool: PgPool) {
+        let api = testing::api_with_streams(&pool, 1);
+        let operator = api.actor(Role::Operator).await;
+        let nowhere = format!("/api/plans/{}/events", PlanId::generate());
+        for _ in 0..3 {
+            let refused = api.get(Some(&operator), &nowhere).await;
+            assert_eq!(refused.status, StatusCode::NOT_FOUND);
+        }
+        let _open = api.open(&operator, EVENTS).await;
     }
 
     /// What the page of a client lives on (D77): the stream says that something has

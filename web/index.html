@@ -1270,8 +1270,14 @@ function renderPlan() {
     if (plan.error) $('plan-error').textContent = `It failed: ${plan.error}`;
   }
   const busy = state.plans.some(isActive);
-  $('plan').disabled = busy || !state.depot;
-  $('plan').title = busy ? 'The day has a plan in progress.' : (state.depot ? '' : 'No depot has been set.');
+  // A day whose plan is done is planned again once that plan is discarded (D83).
+  const standing = state.plans.some((known) => known.status === 'done');
+  $('plan').disabled = busy || standing || !state.depot;
+  $('plan').title = busy
+    ? 'The day has a plan in progress.'
+    : standing
+      ? 'The day has a plan that is done: discard it, and the day can be planned afresh.'
+      : (state.depot ? '' : 'No depot has been set.');
   $('cancel').disabled = !isActive(plan);
   $('discard').disabled = !plan || plan.status !== 'done';
 }
@@ -1526,8 +1532,9 @@ function renderSystem() {
   const stats = state.stats;
   if (!stats) return;
   const queue = stats.queue;
-  $('queue').textContent = `Jobs: ${queue.queued} queued, ${queue.running} running, ${queue.done} done, `
-    + `${queue.failed} failed, ${queue.cancelled} stopped.`;
+  // What ended is counted of the last day (D84).
+  $('queue').textContent = `Jobs: ${queue.queued} queued, ${queue.running} running. In the last day `
+    + `${queue.done} done, ${queue.failed} failed, ${queue.cancelled} stopped.`;
   $('workers-line').textContent = stats.workers_alive === 0
     ? 'No worker has been seen lately. Is a solver running?'
     : `${stats.workers_alive} ${stats.workers_alive === 1 ? 'worker' : 'workers'}, ${stats.workers_busy} busy.`;

@@ -9,7 +9,7 @@ use routeforge_domain::db::{queue, workers};
 use routeforge_domain::{OrdersChanged, PlanChanged, SystemStats};
 use utoipa_actix_web::service_config::ServiceConfig;
 
-use crate::app::{AppState, NotAllowed, NotLoggedIn};
+use crate::app::{AppState, NotAllowed, NotLoggedIn, TooManyStreams};
 use crate::auth::Staff;
 use crate::error::ApiError;
 use crate::events::Signal;
@@ -18,6 +18,10 @@ use crate::stream::{self, Heard, Pace, Watch};
 pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
     config.service(get_system_stats).service(watch_system_stats);
 }
+
+/// The jobs that ended are counted of the last day: the work of a day is what an
+/// operator looks at, and every job there ever was is a count that only grows (D84).
+pub(crate) const ENDED_WITHIN: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Read the state of the queue and its workers
 ///
@@ -68,6 +72,7 @@ async fn get_system_stats(
             body = String, content_type = "text/event-stream"),
         NotLoggedIn,
         NotAllowed,
+        TooManyStreams,
     )
 )]
 #[get("/api/system/stats/events")]
@@ -80,7 +85,7 @@ async fn watch_system_stats(
 
 /// The queue and the workers, as they are now.
 async fn stats(state: &AppState) -> Result<SystemStats, ApiError> {
-    let queue = queue::depth(&state.pool).await?;
+    let queue = queue::depth(&state.pool, ENDED_WITHIN).await?;
     let workers = workers::list(&state.pool, state.worker_alive).await?;
     let busy = workers
         .iter()
@@ -152,6 +157,7 @@ mod tests {
     use routeforge_domain::{JobProgress, Role, WorkerId};
     use serde_json::{Value, json};
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     use super::*;
     use crate::testing::{self, date};
@@ -176,6 +182,7 @@ mod tests {
         // Two plans waiting, and three workers: one holds a job, one is idle, and one
         // has not been heard of for longer than counts as alive.
         api.depot().await;
+        let mut asked_for = Vec::new();
         for day in [12, 13] {
             let asked = api
                 .post(
@@ -185,6 +192,7 @@ mod tests {
                 )
                 .await;
             assert_eq!(asked.status, StatusCode::CREATED);
+            asked_for.push(asked.body["id"].as_str().unwrap().parse::<Uuid>().unwrap());
         }
         let (busy, idle, silent) = (
             WorkerId::generate(),
@@ -220,6 +228,29 @@ mod tests {
         assert_eq!(workers[0]["current_job"], json!(held.lease.job_id));
         assert_eq!(workers[1]["id"], json!(idle));
         assert_eq!(workers[1]["current_job"], json!(null));
+
+        // A job that ended is counted for a day, and then no longer (D84).
+        assert!(
+            queue::cancel_plan(&pool, asked_for[1].into())
+                .await
+                .unwrap()
+        );
+        let queue_now =
+            async || api.get(Some(&operator), "/api/system/stats").await.body["queue"].clone();
+        assert_eq!(
+            queue_now().await,
+            json!({ "queued": 0, "running": 1, "done": 0, "failed": 0, "cancelled": 1 })
+        );
+        sqlx::query(
+            "UPDATE jobs SET finished_at = now() - interval '25 hours' WHERE status = 'cancelled'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            queue_now().await,
+            json!({ "queued": 0, "running": 1, "done": 0, "failed": 0, "cancelled": 0 })
+        );
     }
 
     /// How long a stream is listened to before it is taken to have nothing to say.

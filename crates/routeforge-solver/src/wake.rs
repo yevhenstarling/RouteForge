@@ -12,16 +12,12 @@ use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 use routeforge_domain::WorkerId;
 use routeforge_domain::db::queue::JOBS_CHANNEL;
+use routeforge_domain::service::Backoff;
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::warn;
-
-/// How long the listener waits before it tries again after an error: this long at
-/// first, then twice as long each time, up to [`RETRY_UP_TO`].
-const RETRY_FROM: Duration = Duration::from_secs(1);
-const RETRY_UP_TO: Duration = Duration::from_secs(30);
 
 /// The wake-ups of a process, as its workers see them.
 ///
@@ -62,11 +58,12 @@ pub(crate) fn listen(pool: PgPool) -> (Wake, JoinHandle<()>) {
 
 async fn listener(pool: PgPool, wake: watch::Sender<u64>) {
     let count = || wake.send_modify(|count| *count = count.wrapping_add(1));
-    let mut retry_in = RETRY_FROM;
+    // A second at first, then twice as long each time, up to half a minute.
+    let mut retry = Backoff::STANDARD;
     loop {
         let error = match subscribe(&pool).await {
             Ok(mut listener) => {
-                retry_in = RETRY_FROM;
+                retry.reset();
                 // A job may have been announced while nobody was listening.
                 count();
                 loop {
@@ -83,9 +80,9 @@ async fn listener(pool: PgPool, wake: watch::Sender<u64>) {
         if matches!(error, sqlx::Error::PoolClosed) || wake.is_closed() {
             return;
         }
+        let retry_in = retry.pause();
         warn!(%error, ?retry_in, "not listening for jobs for now; polling goes on");
         tokio::time::sleep(retry_in).await;
-        retry_in = (retry_in * 2).min(RETRY_UP_TO);
     }
 }
 

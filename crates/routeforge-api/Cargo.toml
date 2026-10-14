@@ -8,7 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-routeforge-domain = { workspace = true, features = ["db", "openapi"] }
+routeforge-domain = { workspace = true, features = ["db", "openapi", "service"] }
 
 actix-web.workspace = true
 anyhow.workspace = true
@@ -29,11 +29,15 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-actix-web.workspace = true
-tracing-subscriber.workspace = true
 utoipa = { workspace = true, features = ["actix_extras"] }
 utoipa-actix-web.workspace = true
 utoipa-swagger-ui.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# For the tests that read what the API logs. The API itself logs through
+# `routeforge_domain::service` (D81).
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -37,11 +37,9 @@ mod testing;
 mod wake;
 mod worker;
 
-use std::io::IsTerminal;
-
+use routeforge_domain::service::{init_logging, told_to_stop};
 use tokio::sync::watch;
-use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing::info;
 
 use crate::config::Config;
 use crate::osrm::Provider;
@@ -68,65 +66,15 @@ async fn main() -> anyhow::Result<()> {
     let Some(pool) = startup::connect(&database_url, &config, &mut shutdown).await? else {
         return Ok(());
     };
-    if startup::wait_for_schema(&pool, startup::SCHEMA_CHECK, &mut shutdown).await {
-        worker::run(pool.clone(), config, distances, shutdown).await;
-    }
+    let ran = if startup::wait_for_schema(&pool, startup::SCHEMA_CHECK, &mut shutdown).await {
+        worker::run(pool.clone(), config, distances, shutdown).await
+    } else {
+        Ok(())
+    };
     pool.close().await;
+    // A worker that was lost ends the process with its reason, and with a status that
+    // says something went wrong (D82).
+    ran?;
     info!("the solver has stopped");
     Ok(())
-}
-
-/// Logs to standard output: lines for people by default, JSON with `LOG_FORMAT=json`.
-/// Either way an event carries the fields of the spans it happened in, which is where
-/// the ids of the worker, the job, the plan and the request are (D33).
-fn init_logging() {
-    // An empty `RUST_LOG` would mean errors only. It is taken as not set.
-    let filter = std::env::var("RUST_LOG")
-        .ok()
-        .filter(|directives| !directives.trim().is_empty())
-        .and_then(|directives| EnvFilter::try_new(directives).ok())
-        .unwrap_or_else(|| EnvFilter::new("info"));
-    let json = std::env::var("LOG_FORMAT").is_ok_and(|format| format.eq_ignore_ascii_case("json"));
-    let logging = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        // Colours for a person at a terminal. In a container's log they are in the
-        // way of searching for an id.
-        .with_ansi(std::io::stdout().is_terminal());
-    if json {
-        logging.json().init();
-    } else {
-        logging.init();
-    }
-}
-
-/// Returns when the process is asked to stop: Ctrl-C anywhere, and SIGTERM where
-/// there is one, which is what `docker stop` sends.
-async fn told_to_stop() {
-    let interrupted = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            // Without a handler only a kill ends the process, and that needs no help.
-            warn!(%error, "cannot hear Ctrl-C");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminated) => {
-                tokio::select! {
-                    () = interrupted => {}
-                    _ = terminated.recv() => {}
-                }
-            }
-            Err(error) => {
-                warn!(%error, "cannot hear SIGTERM");
-                interrupted.await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    interrupted.await;
 }
