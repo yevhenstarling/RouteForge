@@ -76,7 +76,10 @@ mod tests {
     use super::*;
     use crate::{startup, testing};
 
-    /// Short enough for a test to wait out.
+    /// Short enough for a test to wait out, for the test that waits for an answer that
+    /// does not come. Where one does come, the probe is given the time it has in the
+    /// image: beside a hundred other tests, the thread that answers can take longer
+    /// than this to be scheduled, and the test failed for it once.
     const BRIEFLY: Duration = Duration::from_millis(200);
 
     /// Something on a port of this machine that takes one request and answers it with
@@ -107,7 +110,7 @@ mod tests {
     fn it_asks_whether_the_api_is_ready_and_takes_only_a_yes() {
         let ready = "HTTP/1.1 200 OK\r\ncontent-length: 18\r\n\r\n{\"status\":\"ready\"}";
         let (address, request) = answering(Some(ready));
-        probe_within(address, BRIEFLY).unwrap();
+        probe_within(address, WITHIN).unwrap();
         let request = request.recv().unwrap();
         assert!(request.starts_with("GET /readyz HTTP/1.1\r\n"), "{request}");
         assert!(
@@ -125,7 +128,7 @@ mod tests {
             ("", "``"),
         ] {
             let (address, _request) = answering(Some(reply));
-            let error = probe_within(address, BRIEFLY).unwrap_err();
+            let error = probe_within(address, WITHIN).unwrap_err();
             assert!(error.to_string().contains(said), "{reply:?}: {error}");
         }
     }
@@ -141,7 +144,7 @@ mod tests {
 
         let (address, request) = answering(Some("HTTP/1.1 200 OK\r\n\r\n"));
         let everywhere = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), address.port());
-        probe_within(everywhere, BRIEFLY).unwrap();
+        probe_within(everywhere, WITHIN).unwrap();
         let request = request.recv().unwrap();
         assert!(request.contains(&format!("Host: {address}")), "{request}");
     }
