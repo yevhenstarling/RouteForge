@@ -153,14 +153,40 @@ async function launch() {
   const targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
   const tab = targets.find((target) => target.type === 'page');
   if (!tab) throw new Failure('the browser has no tab to drive');
-  return { child, profile, address: tab.webSocketDebuggerUrl };
+  return { child, profile, port, address: tab.webSocketDebuggerUrl };
 }
 
-async function shutDown({ child, profile }) {
-  if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-  } else {
-    child.kill('SIGTERM');
+/**
+ * Closes the browser, and takes its profile away.
+ *
+ * The process that was started is not the browser for long: on Windows Edge hands over
+ * to another one and ends, so killing its tree kills nothing. So the browser is told to
+ * close over the protocol, and is waited for until it no longer answers. One that still
+ * does is ended by what it was started with, its profile.
+ */
+async function shutDown({ child, profile, port }) {
+  const answers = async () => {
+    try {
+      return (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    } catch {
+      return null;
+    }
+  };
+  const browser = await answers();
+  if (browser) {
+    const cdp = await Cdp.connect(browser.webSocketDebuggerUrl).catch(() => null);
+    cdp?.send('Browser.close').catch(() => {});
+  }
+  const closed = await within(10_000, 'the browser to close', async () => (await answers()) === null)
+    .catch(() => false);
+  if (!closed) {
+    child.kill('SIGKILL');
+    if (process.platform === 'win32') {
+      const ofThisRun = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${profile}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`;
+      spawnSync('powershell', ['-NoProfile', '-Command', ofThisRun], { stdio: 'ignore' });
+    } else {
+      spawnSync('pkill', ['-f', profile], { stdio: 'ignore' });
+    }
   }
   await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }).catch(() => {});
 }
