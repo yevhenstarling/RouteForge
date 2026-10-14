@@ -130,7 +130,7 @@ pub struct DemoRequest {
     pub count: u32,
     /// The same seed gives the same orders round the same depot.
     pub seed: u32,
-    /// How far from the depot an order may lie, in kilometres. 5 if not given.
+    /// How far from the depot an order may lie, in kilometres. 10 if not given.
     pub radius_km: Option<f64>,
 }
 

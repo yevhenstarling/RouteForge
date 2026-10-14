@@ -48,6 +48,7 @@ mod request_id;
 mod routes;
 mod startup;
 mod stream;
+mod streets;
 #[cfg(test)]
 mod testing;
 mod validate;

@@ -73,7 +73,7 @@
             "type": "integer"
           },
           "radius_km": {
-            "description": "How far from the depot an order may lie, in kilometres. 5 if not given.",
+            "description": "How far from the depot an order may lie, in kilometres. 10 if not given.",
             "format": "double",
             "type": [
               "number",
@@ -1532,7 +1532,7 @@
     },
     "/api/demo/orders": {
       "post": {
-        "description": "Stores `count` pending orders for the day, spread evenly over a disc round the\ndepot: about one in five a pickup, the rest deliveries, each with a demand of 1 to\n3. They are the caller's orders. All of them are stored, or none.",
+        "description": "Stores `count` pending orders for the day, within `radius_km` of the depot. Each is\nat a point of a street of Kyiv, picked at random. Round a depot with no street of\nKyiv within the radius they are spread evenly over the disc instead. About one in\nfive is a pickup, the rest are deliveries, each with a demand of 1 to 3. They are the\ncaller's orders. All of them are stored, or none.",
         "operationId": "create_demo_orders",
         "requestBody": {
           "content": {

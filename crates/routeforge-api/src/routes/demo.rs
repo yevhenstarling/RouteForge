@@ -1,5 +1,5 @@
-//! Orders for a demonstration: a day's worth of them, scattered round the depot. For
-//! admins.
+//! Orders for a demonstration: a day's worth of them, on the streets round the depot.
+//! For admins.
 //!
 //! They are made here, in the API, so that showing the system needs no tool beside it
 //! and no sixth crate. The same seed gives the same orders round the same depot, so a
@@ -8,6 +8,7 @@
 use std::f64::consts::TAU;
 
 use actix_web::{HttpResponse, post, web};
+use rand::seq::IndexedRandom;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use routeforge_domain::db::{depots, orders};
@@ -19,6 +20,7 @@ use utoipa_actix_web::service_config::ServiceConfig;
 use crate::app::{AppState, NotAcceptable, NotAllowed, NotLoggedIn, NotNow};
 use crate::auth::Admin;
 use crate::error::ApiError;
+use crate::streets;
 use crate::validate::{self, DEMO_RADIUS_DEFAULT_KM};
 
 pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
@@ -27,9 +29,11 @@ pub(crate) fn configure(config: &mut ServiceConfig<'_>) {
 
 /// Generate orders for a demonstration
 ///
-/// Stores `count` pending orders for the day, spread evenly over a disc round the
-/// depot: about one in five a pickup, the rest deliveries, each with a demand of 1 to
-/// 3. They are the caller's orders. All of them are stored, or none.
+/// Stores `count` pending orders for the day, within `radius_km` of the depot. Each is
+/// at a point of a street of Kyiv, picked at random. Round a depot with no street of
+/// Kyiv within the radius they are spread evenly over the disc instead. About one in
+/// five is a pickup, the rest are deliveries, each with a demand of 1 to 3. They are the
+/// caller's orders. All of them are stored, or none.
 #[utoipa::path(
     tag = "demo",
     security(("bearer" = [])),
@@ -63,27 +67,21 @@ async fn create_demo_orders(
     }))
 }
 
-/// The orders a request asks for: `count` of them within `radius_km` of the depot.
+/// The orders a request asks for: `count` of them within `radius_km` of the depot, on
+/// its streets where there are any (D87).
 ///
 /// Every random choice comes from a generator seeded with the request's seed, and they
 /// are made in a fixed order. `None` if a position would lie beyond a pole.
 fn scatter(depot: LatLon, request: &DemoRequest, client_id: UserId) -> Option<Vec<NewOrder>> {
     let radius_m = request.radius_km.unwrap_or(DEMO_RADIUS_DEFAULT_KM) * 1_000.0;
-    // How much shorter a degree of longitude is here than at the equator.
-    let east_scale = depot.lat().to_radians().cos();
+    let streets = streets::near(depot, radius_m);
     let mut rng = ChaCha8Rng::seed_from_u64(u64::from(request.seed));
 
     let mut order = || {
-        // Even over the disc and not crowded at its middle: a ring's share of the
-        // area grows with its radius, which the root makes up for.
-        let distance = radius_m * rng.random::<f64>().sqrt();
-        let bearing = rng.random_range(0.0..TAU);
-        let north = (distance * bearing.cos() / EARTH_RADIUS_M).to_degrees();
-        let east = (distance * bearing.sin() / (EARTH_RADIUS_M * east_scale)).to_degrees();
-        // Across the date line the longitude starts again from the other end.
-        let lon = (depot.lon() + east + 180.0).rem_euclid(360.0) - 180.0;
-        let location = LatLon::new(depot.lat() + north, lon).ok()?;
-
+        let location = match streets.choose(&mut rng) {
+            Some(&point) => point,
+            None => on_disc(depot, radius_m, &mut rng)?,
+        };
         let kind = if rng.random_range(0..5) == 0 {
             OrderKind::Pickup
         } else {
@@ -101,8 +99,26 @@ fn scatter(depot: LatLon, request: &DemoRequest, client_id: UserId) -> Option<Ve
     (0..request.count).map(|_| order()).collect()
 }
 
+/// A point anywhere on the disc of `radius_m` round `centre`. `None` if it would lie
+/// beyond a pole.
+fn on_disc(centre: LatLon, radius_m: f64, rng: &mut ChaCha8Rng) -> Option<LatLon> {
+    // Even over the disc and not crowded at its middle: a ring's share of the area grows
+    // with its radius, which the root makes up for.
+    let distance = radius_m * rng.random::<f64>().sqrt();
+    let bearing = rng.random_range(0.0..TAU);
+    // How much shorter a degree of longitude is here than at the equator.
+    let east_scale = centre.lat().to_radians().cos();
+    let north = (distance * bearing.cos() / EARTH_RADIUS_M).to_degrees();
+    let east = (distance * bearing.sin() / (EARTH_RADIUS_M * east_scale)).to_degrees();
+    // Across the date line the longitude starts again from the other end.
+    let lon = (centre.lon() + east + 180.0).rem_euclid(360.0) - 180.0;
+    LatLon::new(centre.lat() + north, lon).ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use actix_web::http::StatusCode;
     use routeforge_domain::{Role, haversine_m};
     use serde_json::{Value, json};
@@ -139,9 +155,62 @@ mod tests {
         assert_eq!(longer[..300], first[..]);
     }
 
+    /// How many of `orders` lie on each side of `depot`: north-east, north-west,
+    /// south-east and south-west.
+    fn quadrants(depot: LatLon, orders: &[NewOrder]) -> [usize; 4] {
+        [(true, true), (true, false), (false, true), (false, false)].map(|(north, east)| {
+            orders
+                .iter()
+                .filter(|order| {
+                    (order.location.lat() > depot.lat()) == north
+                        && (order.location.lon() > depot.lon()) == east
+                })
+                .count()
+        })
+    }
+
+    /// What is the same of every demo order, wherever it lies: a day of 2000 of them.
+    fn assert_kinds_and_demands(orders: &[NewOrder]) {
+        assert!(orders.iter().all(|order| (1..=3).contains(&order.demand)));
+        let pickups = orders
+            .iter()
+            .filter(|order| order.kind == OrderKind::Pickup)
+            .count();
+        assert!((300..500).contains(&pickups), "{pickups} of 2000");
+        assert!(orders.iter().all(|order| order.service_date == date(12)));
+    }
+
     #[test]
-    fn the_orders_lie_all_over_a_disc_round_the_depot() {
+    fn in_kyiv_the_orders_lie_on_its_streets() {
         let depot = kyiv();
+        let orders = scatter(depot, &request(2_000, 1, Some(10.0)), UserId::generate()).unwrap();
+
+        let bits = |point: LatLon| (point.lat().to_bits(), point.lon().to_bits());
+        let streets: HashSet<_> = streets::near(depot, 10_000.0)
+            .into_iter()
+            .map(bits)
+            .collect();
+        assert!(
+            orders
+                .iter()
+                .all(|order| streets.contains(&bits(order.location)))
+        );
+        assert!(
+            orders
+                .iter()
+                .all(|order| haversine_m(depot, order.location) <= 10_000.0)
+        );
+        // On every side of the depot, and so on both banks of the Dnipro. Not evenly:
+        // there are more streets on some sides than on others.
+        for quadrant in quadrants(depot, &orders) {
+            assert!(quadrant >= 200, "{quadrant} of 2000");
+        }
+        assert_kinds_and_demands(&orders);
+    }
+
+    #[test]
+    fn away_from_the_streets_the_orders_lie_all_over_a_disc() {
+        let depot = LatLon::new(49.84, 24.03).unwrap();
         let orders = scatter(depot, &request(2_000, 1, Some(10.0)), UserId::generate()).unwrap();
         let distances: Vec<f64> = orders
             .iter()
@@ -154,24 +223,10 @@ mod tests {
         let inner = distances.iter().filter(|&&metres| metres < 5_000.0).count();
         assert!((400..600).contains(&inner), "{inner} of 2000");
         // And on every side of the depot.
-        for (north, east) in [(true, true), (true, false), (false, true), (false, false)] {
-            let quadrant = orders
-                .iter()
-                .filter(|order| {
-                    (order.location.lat() > depot.lat()) == north
-                        && (order.location.lon() > depot.lon()) == east
-                })
-                .count();
+        for quadrant in quadrants(depot, &orders) {
             assert!((400..600).contains(&quadrant), "{quadrant} of 2000");
         }
-
-        assert!(orders.iter().all(|order| (1..=3).contains(&order.demand)));
-        let pickups = orders
-            .iter()
-            .filter(|order| order.kind == OrderKind::Pickup)
-            .count();
-        assert!((300..500).contains(&pickups), "{pickups} of 2000");
-        assert!(orders.iter().all(|order| order.service_date == date(12)));
+        assert_kinds_and_demands(&orders);
     }
 
     #[test]
