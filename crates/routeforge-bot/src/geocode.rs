@@ -15,7 +15,6 @@
 //! [`Geocoder`] is what the dialogue is written against, so that a test can put
 //! something else in its place.
 
-use std::error::Error;
 use std::future::Future;
 use std::time::Duration;
 
@@ -262,20 +261,12 @@ fn view_round(near: LatLon) -> String {
     format!("{west:.4},{south:.4},{east:.4},{north:.4}")
 }
 
-/// An error with what caused it, which is where reqwest says that a connection was
-/// refused or that an answer took too long.
+/// An error with what caused it, as [`api::causes`](crate::api::causes) gives it.
 ///
 /// Without the address that was asked: reqwest names it in its errors, and in this one
 /// it ends in what a person wrote. That is for the service and for nobody's log.
 fn causes(error: reqwest::Error) -> String {
-    let error = error.without_url();
-    let mut text = error.to_string();
-    let mut cause = error.source();
-    while let Some(deeper) = cause {
-        text.push_str(&format!(": {deeper}"));
-        cause = deeper.source();
-    }
-    text
+    crate::api::causes(&error.without_url())
 }
 
 #[cfg(test)]

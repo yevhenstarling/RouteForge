@@ -9,7 +9,8 @@ publish.workspace = true
 
 [dependencies]
 # Without the `db` feature: the bot reaches the system only through the HTTP API.
-routeforge-domain.workspace = true
+# `service` is the logging and the stop signal the three services share (D81).
+routeforge-domain = { workspace = true, features = ["service"] }
 
 anyhow.workspace = true
 chrono.workspace = true
@@ -19,7 +20,6 @@ teloxide.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

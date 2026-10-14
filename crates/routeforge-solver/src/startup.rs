@@ -10,17 +10,13 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use routeforge_domain::db;
+use routeforge_domain::service::Backoff;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::worker::{Shutdown, stopped};
-
-/// How long to wait before connecting again after a failure: this long at first, then
-/// twice as long each time, up to [`RETRY_UP_TO`].
-const RETRY_FROM: Duration = Duration::from_secs(1);
-const RETRY_UP_TO: Duration = Duration::from_secs(30);
 
 /// How often a solver looks whether the schema has arrived.
 pub(crate) const SCHEMA_CHECK: Duration = Duration::from_secs(1);
@@ -44,22 +40,24 @@ pub(crate) async fn connect(
         // keeping a lease goes. Better to know than to go on waiting.
         .acquire_timeout(config.heartbeat);
 
-    let mut retry_in = RETRY_FROM;
+    // A second at first, then twice as long each time, up to half a minute.
+    let mut retry = Backoff::STANDARD;
     loop {
         let connecting = options.clone().connect_with(database.clone());
-        tokio::select! {
+        let error = tokio::select! {
             biased;
             () = stopped(shutdown) => return Ok(None),
             connected = connecting => match connected {
                 Ok(pool) => return Ok(Some(pool)),
-                Err(error) => warn!(%error, ?retry_in, "could not connect to the database"),
+                Err(error) => error,
             },
-        }
+        };
+        let retry_in = retry.pause();
+        warn!(%error, ?retry_in, "could not connect to the database");
         tokio::select! {
             () = stopped(shutdown) => return Ok(None),
             () = tokio::time::sleep(retry_in) => {}
         }
-        retry_in = (retry_in * 2).min(RETRY_UP_TO);
     }
 }
 

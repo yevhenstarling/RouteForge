@@ -51,12 +51,10 @@ mod stream;
 mod testing;
 mod validate;
 
-use std::io::IsTerminal;
-
 use actix_web::{HttpServer, web};
 use anyhow::{Context, bail};
+use routeforge_domain::service::{init_logging, told_to_stop};
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
 
 use crate::app::{AppState, app};
 use crate::auth::{Passwords, ServiceKey, Tokens};
@@ -146,59 +144,4 @@ async fn serve() -> anyhow::Result<()> {
     pool.close().await;
     info!("the API has stopped");
     Ok(())
-}
-
-/// Returns when the process is asked to stop: Ctrl-C anywhere, and SIGTERM where
-/// there is one, which is what `docker stop` sends. The solver listens the same way.
-async fn told_to_stop() {
-    let interrupted = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            // Without a handler only a kill ends the process, and that needs no help.
-            warn!(%error, "cannot hear Ctrl-C");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminated) => {
-                tokio::select! {
-                    () = interrupted => {}
-                    _ = terminated.recv() => {}
-                }
-            }
-            Err(error) => {
-                warn!(%error, "cannot hear SIGTERM");
-                interrupted.await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    interrupted.await;
-}
-
-/// Logs to standard output: lines for people by default, JSON with `LOG_FORMAT=json`.
-/// Either way an event carries the fields of the span it happened in, which is where
-/// the id of the request is. The solver sets its logging up the same way.
-fn init_logging() {
-    // An empty `RUST_LOG` would mean errors only. It is taken as not set.
-    let filter = std::env::var("RUST_LOG")
-        .ok()
-        .filter(|directives| !directives.trim().is_empty())
-        .and_then(|directives| EnvFilter::try_new(directives).ok())
-        .unwrap_or_else(|| EnvFilter::new("info"));
-    let json = std::env::var("LOG_FORMAT").is_ok_and(|format| format.eq_ignore_ascii_case("json"));
-    let logging = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        // Colours for a person at a terminal. In a file they are in the way of
-        // searching for an id.
-        .with_ansi(std::io::stdout().is_terminal());
-    if json {
-        logging.json().init();
-    } else {
-        logging.init();
-    }
 }

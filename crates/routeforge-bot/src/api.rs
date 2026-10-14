@@ -202,7 +202,7 @@ fn words_of(problem: Problem) -> String {
 
 /// An error with what caused it, which is where reqwest says that a connection was
 /// refused or that an answer took too long.
-fn causes(error: &dyn Error) -> String {
+pub(crate) fn causes(error: &dyn Error) -> String {
     let mut text = error.to_string();
     let mut cause = error.source();
     while let Some(deeper) = cause {

@@ -29,8 +29,7 @@ const TOKEN: &str = "the.token.of-ada";
 /// A bot that waits for nothing longer than a test can.
 const PACE: Pace = Pace {
     poll: Duration::from_secs(1),
-    retry_from: Duration::from_millis(20),
-    retry_up_to: Duration::from_millis(100),
+    retry: Backoff::new(Duration::from_millis(20), Duration::from_millis(100)),
     stop_within: Duration::from_secs(5),
 };
 
@@ -508,8 +507,7 @@ async fn told_to_stop_while_telegram_is_away_the_bot_stops_at_once() {
     let (stop, stopping) = watch::channel(false);
     // A bot that would wait a minute between its attempts.
     let patient = Pace {
-        retry_from: Duration::from_secs(60),
-        retry_up_to: Duration::from_secs(60),
+        retry: Backoff::new(Duration::from_secs(60), Duration::from_secs(60)),
         ..PACE
     };
     let away = bot(BOT_TOKEN, Some(nowhere)).unwrap();

@@ -14,6 +14,9 @@ db = ["dep:sqlx"]
 # OpenAPI schemas for the types the HTTP API sends and receives.
 # Enabled by routeforge-api, which serves the document.
 openapi = ["dep:utoipa"]
+# What the three services share: their logging, the signal that stops them, and how
+# long they wait before trying again (D81). Enabled by all three, the bot included.
+service = ["dep:tokio", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 chrono.workspace = true
@@ -21,15 +24,18 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, optional = true }
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-# The crate's own tests always get both features, so `cargo test -p routeforge-domain`
-# cannot skip the database tests, or the schemas, by leaving one out. Dev-dependencies
-# do not reach the bot.
-routeforge-domain = { workspace = true, features = ["db", "openapi"] }
+# The crate's own tests always get every feature, so `cargo test -p routeforge-domain`
+# cannot skip the database tests, the schemas or the service module by leaving one
+# out. Dev-dependencies do not reach the bot.
+routeforge-domain = { workspace = true, features = ["db", "openapi", "service"] }
 tokio.workspace = true
 
 [lints]

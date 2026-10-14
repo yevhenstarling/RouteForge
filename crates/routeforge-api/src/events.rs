@@ -11,11 +11,11 @@
 //! by the channel. Either way the stream reads what it shows again.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::NaiveDate;
 use routeforge_domain::db::orders::ORDERS_CHANNEL;
 use routeforge_domain::db::queue::{PLANS_CHANNEL, PROGRESS_CHANNEL};
+use routeforge_domain::service::Backoff;
 use routeforge_domain::{PlanId, RouteProgress};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
@@ -26,11 +26,6 @@ use tracing::{debug, warn};
 /// How many signals a stream may fall behind by before it has missed some. A plan
 /// with every worker searching announces a few dozen a second.
 pub(crate) const BACKLOG: usize = 1024;
-
-/// How long the listener waits before it tries again after an error: this long at
-/// first, then twice as long each time, up to [`RETRY_UP_TO`]. As in the solver.
-const RETRY_FROM: Duration = Duration::from_secs(1);
-const RETRY_UP_TO: Duration = Duration::from_secs(30);
 
 /// What the listener passes on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,11 +97,12 @@ fn pass_on(signals: &broadcast::Sender<Signal>, signal: Signal) {
 }
 
 async fn listener(pool: PgPool, signals: broadcast::Sender<Signal>) {
-    let mut retry_in = RETRY_FROM;
+    // As the solver waits for its database (D37).
+    let mut retry = Backoff::STANDARD;
     loop {
         let error = match subscribe(&pool).await {
             Ok(mut listener) => {
-                retry_in = RETRY_FROM;
+                retry.reset();
                 // What was announced while nobody listened is not known.
                 pass_on(&signals, Signal::Missed);
                 loop {
@@ -128,9 +124,9 @@ async fn listener(pool: PgPool, signals: broadcast::Sender<Signal>) {
         if matches!(error, sqlx::Error::PoolClosed) {
             return;
         }
+        let retry_in = retry.pause();
         warn!(%error, ?retry_in, "not listening for changes for now; the streams go on reading at their own pace");
         tokio::time::sleep(retry_in).await;
-        retry_in = (retry_in * 2).min(RETRY_UP_TO);
     }
 }
 
