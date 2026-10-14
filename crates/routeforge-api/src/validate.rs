@@ -28,7 +28,7 @@ pub(crate) const PAGE_LARGEST: u32 = 1_000;
 
 /// The demo orders are stored one by one, in one transaction.
 pub(crate) const DEMO_MOST: u32 = 2_000;
-pub(crate) const DEMO_RADIUS_DEFAULT_KM: f64 = 5.0;
+pub(crate) const DEMO_RADIUS_DEFAULT_KM: f64 = 10.0;
 /// Beyond this the flat map the solver clusters on is no longer a good one (D29).
 pub(crate) const DEMO_RADIUS_LARGEST_KM: f64 = 30.0;
 

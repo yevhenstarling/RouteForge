@@ -21,7 +21,7 @@ The first build compiles everything and takes several minutes. On Windows, run i
 - Swagger UI is at <http://127.0.0.1:8080/docs/>
 - the admin is `admin@example.com`, with the password `routeforge`
 
-On a new database the page offers an admin "Set up a demo city". Press it, generate orders, and press Plan: the routes are drawn while the solvers search for them.
+On a new database the page offers an admin "Set up a demo city". Press it, generate orders, and press Plan: the routes are drawn while the solvers search for them. The orders are put at random on the streets of Kyiv, within 10 km of the depot.
 
 What there is to see on the page:
 
@@ -61,16 +61,16 @@ This is what it showed on the development machine, which has 16 logical processo
 
 | Solvers | Seconds | Speed-up | Kilometres |
 |---|---|---|---|
-| 1 | 15.5 | 1.0 | 126.13 |
-| 2 | 8.3 | 1.9 | 126.13 |
-| 4 | 4.5 | 3.5 | 126.13 |
-| 8 | 4.8 | 3.2 | 126.13 |
+| 1 | 15.4 | 1.0 | 226.70 |
+| 2 | 8.2 | 1.9 | 226.70 |
+| 4 | 4.5 | 3.4 | 226.70 |
+| 8 | 4.6 | 3.3 | 226.70 |
 
 - The routes were the same in every run, stop for stop.
-- Four solvers are three and a half times as fast as one, and not four times. A search that had the machine to itself took 3.8 seconds, and each of four side by side took 4.4.
+- Four solvers are 3.4 times as fast as one, and not four times. A search that had the machine to itself took 3.8 seconds, and each of four side by side took 4.5.
 - Eight solvers are no faster than four. The day has four routes.
 
-In the failure run a solver was killed two seconds into its route. Another solver took the route over 27.9 seconds after the kill, when the lease of the dead one had run out. The plan was done 40.5 seconds after it was asked for, with each of its 300 orders on exactly one route.
+In the failure run a solver was killed two seconds into its route. Another solver took the route over 27.9 seconds after the kill, when the lease of the dead one had run out. The plan was done 40.4 seconds after it was asked for, with each of its 300 orders on exactly one route.
 
 `scripts/demo.ps1 scaling -Solvers 1,2,4,8` prints the table for your machine.
 
@@ -160,18 +160,18 @@ What it changes, for the demonstration's day of 300 orders on four vans:
 
 | | As the crow flies | By road |
 |---|---|---|
-| The routes that were found on great circles | 126 km | 604 km |
-| The routes that were found by road | 182 km | 476 km |
+| The routes that were found on great circles | 227 km | 572 km |
+| The routes that were found by road | 258 km | 476 km |
 
-The routes that look shortest on the map are a quarter longer to drive than the ones that were searched for by road.
+The routes that look shortest on the map are a fifth longer to drive than the ones that were searched for by road.
 
-By road everything is several times the straight line. The stops are some four hundred metres apart, and over such a distance one-way streets and turns that are not allowed count for much. The Dnipro runs through the middle, with few bridges. And a demo order is a random point and no address: one in five was more than a hundred metres from any road a car may use, and was moved to the nearest.
+By road everything is two to two and a half times the straight line. The stops are some 750 metres apart, and over such a distance one-way streets and turns that are not allowed count for much. The Dnipro runs through the middle, with few bridges. A demo order is on a street, so the server moves none of them far onto its roads: the farthest by 25 metres.
 
 A route that the server gives no distances for is searched for on great circles, and says `as the crow flies`. So a plan is done whether the server is there or not. Stopped in the middle of a plan, it left one route by road and three as the crow flies.
 
 The way a route takes is asked of the server once, when the route is stored, and kept with it. A route by road that the server gave no way for is drawn from stop to stop, and says so.
 
-The roads are OpenStreetMap's, © OpenStreetMap contributors, under the Open Database Licence, as [BBBike](https://download.bbbike.org/osm/bbbike/) extracts them. They are not part of this repository.
+The roads are OpenStreetMap's, © OpenStreetMap contributors, under the Open Database Licence, as [BBBike](https://download.bbbike.org/osm/bbbike/) extracts them. They are not part of this repository. The streets that demo orders are put on are: `node scripts/streets.mjs` takes them out of the same extract, as a point every 25 metres, into `crates/routeforge-api/data/kyiv-streets.bin`, under the same licence.
 
 ## The bot
 
@@ -200,6 +200,7 @@ The days the bot offers are those of its clock, which is on UTC in a container u
 What the system does not do, or does only up to a point:
 
 - **One order is one stop.** A parcel goes from the depot to a client, or from a client to the depot. A courier makes one round a day, and there are no time windows.
+- **A demo order is on a street, not at a door.** It may be on a main road where it crosses a park or an island, with no house beside it. Round a depot outside Kyiv the streets are not known, and demo orders are anywhere on the disc round it.
 - **A day is planned once.** A day whose plan is done is planned again when that plan has been discarded, and then with every order of it. An order that comes in after the day was planned waits for that.
 - **A route that is still searched for is drawn as straight lines,** by road as well. It follows its streets once it is stored. One that was stored while the OSRM server was away stays straight until its day is planned again.
 - **The vans are a simulation.** No courier reports where they are. Each page reckons its own vans, so a page that opens a plan later starts them from the depot, and Refresh sends them out again.
