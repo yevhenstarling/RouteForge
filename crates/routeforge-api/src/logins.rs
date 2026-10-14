@@ -16,6 +16,7 @@
 //! The counts are in memory, in this process. They are gone when the API is started
 //! again, and two APIs would count apart.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -62,7 +63,9 @@ impl Logins {
     /// # Errors
     ///
     /// With how long it is until the next may be made, if the address has had its
-    /// share. The refused try is not counted, so asking again does not put it off.
+    /// share. The refused try is not counted, so asking again does not put it off. A
+    /// new address waits as well when every address that is counted has had its share:
+    /// see [`make_room`](Self::make_room).
     pub(crate) fn begin(&self, address: &str, now: Instant) -> Result<(), Duration> {
         let key = key(address);
         let mut tried = self.lock();
@@ -77,7 +80,7 @@ impl Logins {
             }
         }
         if tried.len() >= MOST_ADDRESSES && !tried.contains_key(&key) {
-            make_room(&mut tried, now, self.window);
+            self.make_room(&mut tried, now)?;
         }
         tried.insert(
             key,
@@ -87,6 +90,37 @@ impl Logins {
             },
         );
         Ok(())
+    }
+
+    /// Makes room for one more address. The counts whose window is over go first, and
+    /// if none is, the newest of those with the fewest tries.
+    ///
+    /// A count that has reached its limit stays, whatever comes. Forgotten, it would
+    /// give its address its tries again, and logins for addresses of somebody's own
+    /// making would be a way to have that done (D68).
+    ///
+    /// # Errors
+    ///
+    /// When every address that is counted has had its tries: how long it is until the
+    /// first of their windows is over. A login cannot get there, since each try takes a
+    /// hash and only so many are hashed at a time, but a new address waits rather than
+    /// make room at the cost of an old one.
+    fn make_room(&self, tried: &mut HashMap<String, Tries>, now: Instant) -> Result<(), Duration> {
+        tried.retain(|_, tries| now < tries.since + self.window);
+        if tried.len() < MOST_ADDRESSES {
+            return Ok(());
+        }
+        let least = tried
+            .iter()
+            .filter(|(_, tries)| tries.count < self.most)
+            .min_by_key(|(_, tries)| (tries.count, Reverse(tries.since)))
+            .map(|(address, _)| address.clone());
+        if let Some(least) = least {
+            tried.remove(&least);
+            return Ok(());
+        }
+        let first_over = tried.values().map(|tries| tries.since + self.window).min();
+        Err(first_over.map_or(self.window, |over_at| over_at - now))
     }
 
     /// Takes back a try that was counted and came to nothing: the API could not check
@@ -122,21 +156,6 @@ fn key(address: &str) -> String {
         .take(LONGEST_ADDRESS + 1)
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-/// Makes room for one more address: the counts whose window is over go, and if none is,
-/// the one that was begun first.
-fn make_room(tried: &mut HashMap<String, Tries>, now: Instant, window: Duration) {
-    tried.retain(|_, tries| now < tries.since + window);
-    if tried.len() >= MOST_ADDRESSES {
-        let oldest = tried
-            .iter()
-            .min_by_key(|(_, tries)| tries.since)
-            .map(|(address, _)| address.clone());
-        if let Some(oldest) = oldest {
-            tried.remove(&oldest);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -234,29 +253,79 @@ mod tests {
     }
 
     /// Addresses nobody has cost a try each and an entry each. The entries are bounded:
-    /// the ones whose window is over go first, and then the oldest.
+    /// the ones whose window is over go first, and then one of those with the fewest
+    /// tries.
     #[test]
     fn the_addresses_that_are_counted_are_bounded() {
-        let logins = Logins::new(1, MINUTE);
+        let logins = Logins::new(2, MINUTE);
         let start = Instant::now();
-        // One that is watched, begun first, and then as many as there is room for.
+        // One with both its tries, begun first, and then as many with one as there is
+        // room for.
+        assert_eq!(logins.begin("ada@example.com", start), Ok(()));
         assert_eq!(logins.begin("ada@example.com", start), Ok(()));
         for number in 1..MOST_ADDRESSES {
             let address = format!("{number}@example.com");
             assert_eq!(logins.begin(&address, start + seconds(1)), Ok(()));
         }
         assert_eq!(logins.lock().len(), MOST_ADDRESSES);
-        assert!(logins.begin("ada@example.com", start + seconds(2)).is_err());
 
-        // One more, with every window still running: the oldest count goes.
+        // One more, with every window still running: a count of one try goes, and not
+        // the oldest, which has had its tries.
         assert_eq!(logins.begin("new@example.com", start + seconds(2)), Ok(()));
         assert_eq!(logins.lock().len(), MOST_ADDRESSES);
-        assert_eq!(logins.begin("ada@example.com", start + seconds(2)), Ok(()));
+        assert!(logins.lock().contains_key("new@example.com"));
+        assert!(logins.begin("ada@example.com", start + seconds(2)).is_err());
 
-        // One more when every window but the last two is over: those all go.
+        // One more when every window but the last one is over: those all go.
         let later = start + MINUTE + seconds(1);
         assert_eq!(logins.begin("late@example.com", later), Ok(()));
         let left = logins.lock().len();
-        assert_eq!(left, 3, "the two of a moment ago, and the new one");
+        assert_eq!(left, 2, "the one of a moment ago, and the new one");
+    }
+
+    /// Whoever has had their tries at an address does not get them again by sending
+    /// logins for addresses of their own making until its count is pushed out (D68).
+    #[test]
+    fn a_flood_of_new_addresses_does_not_give_an_address_its_tries_again() {
+        let logins = Logins::new(5, MINUTE);
+        let start = Instant::now();
+        for _ in 0..5 {
+            assert_eq!(logins.begin("ada@example.com", start), Ok(()));
+        }
+        assert!(logins.begin("ada@example.com", start).is_err());
+
+        // More made-up addresses than are counted, all within the window. Each is
+        // counted, and each makes room for the next.
+        for number in 0..MOST_ADDRESSES + 100 {
+            let address = format!("{number}@example.com");
+            assert_eq!(logins.begin(&address, start + seconds(1)), Ok(()));
+        }
+        assert_eq!(logins.lock().len(), MOST_ADDRESSES);
+        assert_eq!(
+            logins.begin("ada@example.com", start + seconds(2)),
+            Err(seconds(58))
+        );
+    }
+
+    /// When every address that is counted has had its tries, none of them is forgotten
+    /// to make room: a new one waits until the first window is over.
+    #[test]
+    fn when_every_count_is_at_its_limit_a_new_address_waits() {
+        let logins = Logins::new(1, MINUTE);
+        let start = Instant::now();
+        for number in 0..MOST_ADDRESSES {
+            let address = format!("{number}@example.com");
+            let at = start + seconds(number as u64 % 10);
+            assert_eq!(logins.begin(&address, at), Ok(()));
+        }
+        assert_eq!(
+            logins.begin("new@example.com", start + seconds(20)),
+            Err(seconds(40))
+        );
+        assert_eq!(logins.lock().len(), MOST_ADDRESSES);
+
+        // The windows that began first are over, and their counts make room.
+        assert_eq!(logins.begin("new@example.com", start + MINUTE), Ok(()));
+        assert!(logins.begin("0@example.com", start + MINUTE).is_ok());
     }
 }
