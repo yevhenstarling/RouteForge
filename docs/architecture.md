@@ -156,6 +156,7 @@ Every decision with its number, what it holds, and whether it holds now. A decis
 | [D84](#d84-the-live-view-counts-the-jobs-of-the-last-day-and-forgets-the-workers-of-long-ago-in-place) | The live view counts the jobs of the last day, and forgets the workers of long ago | in place |
 | [D85](#d85-one-person-holds-only-so-many-event-streams-open-in-place) | One person holds only so many event streams open | in place |
 | [D86](#d86-a-script-tries-the-page-in-a-browser-in-place) | A script tries the page in a browser | in place |
+| [D87](#d87-demo-orders-lie-on-the-streets-of-kyiv-in-place) | Demo orders lie on the streets of Kyiv | in place |
 
 ### D1. One order is one stop, relative to a depot (in place)
 
@@ -752,15 +753,15 @@ Why:
 
 ### D46. Demo orders come from the API, from a seed (in place)
 
-`POST /api/demo/orders`, for admins, stores up to 2000 pending orders for a date, spread evenly over a disc round the depot. Its radius is 5 km by default and 30 km at most. About one in five is a pickup, and each has a demand of 1 to 3. They belong to the admin who asked. They are stored in one statement, `orders::create_many`, since Phase 12, and in one transaction of an insert each before that.
+`POST /api/demo/orders`, for admins, stores up to 2000 pending orders for a date, within a radius of the depot. The radius is 10 km by default, 5 km before Phase 13, and 30 km at most. Since Phase 13 each order is at a point of a street of Kyiv (D87). Round a depot with no street within the radius, they are spread evenly over the disc, as all of them were before. About one in five is a pickup, and each has a demand of 1 to 3. They belong to the admin who asked. They are stored in one statement, `orders::create_many`, since Phase 12, and in one transaction of an insert each before that.
 
-Every random choice comes from a ChaCha8 generator seeded with the request's seed, as in `routeforge-tsp` (D5). The same seed gives the same orders round the same depot.
+Every random choice comes from a ChaCha8 generator seeded with the request's seed, as in `routeforge-tsp` (D5). The same seed gives the same orders round the same depot, from the same streets.
 
 Why:
 
 - A demonstration needs a few hundred orders, and a tool to make them would be a sixth crate. In the API it is one more endpoint.
 - With a seed, the scaling run of Phase 6 plans the same day with one solver and with four, and anybody can repeat a demonstration.
-- The distance from the depot is the radius times the square root of a random number. Without the root the orders would crowd round the depot, since a ring's share of the disc grows with its radius.
+- On the disc, the distance from the depot is the radius times the square root of a random number. Without the root the orders would crowd round the depot, since a ring's share of the disc grows with its radius.
 - Beyond some 30 km the flat map the plans are clustered on is no longer a good one (D29).
 
 ### D47. The API ends at once when it cannot start (in place)
@@ -1043,26 +1044,26 @@ How:
 - **After each run the script checks what the system is judged by** (D20): every order the plan took is on exactly one route.
 - **Each plan is asked for with a request id of the script's making,** which it prints. `docker compose logs api solver` has it in the lines of the API and of every solver that worked on the plan (D42).
 
-Measured on the development machine, with 16 logical processors and Docker Desktop on WSL2, at the end of Phase 8. A new database, 300 orders, four vans of 132, 200 million moves a route:
+Measured on the development machine, with 16 logical processors and Docker Desktop on WSL2, in Phase 13, on the day of D87: orders on the streets within 10 km of the depot. A new database, 300 orders, four vans of 132, 200 million moves a route:
 
 | Solvers | Seconds | Speed-up | Routes | Kilometres |
 |---|---|---|---|---|
-| 1 | 15.5 | 1.0 | 4 | 126.13 |
-| 2 | 8.3 | 1.9 | 4 | 126.13 |
-| 4 | 4.5 | 3.5 | 4 | 126.13 |
-| 8 | 4.8 | 3.2 | 4 | 126.13 |
+| 1 | 15.4 | 1.0 | 4 | 226.70 |
+| 2 | 8.2 | 1.9 | 4 | 226.70 |
+| 4 | 4.5 | 3.4 | 4 | 226.70 |
+| 8 | 4.6 | 3.3 | 4 | 226.70 |
 
-The routes were the same in every run, and a second round gave 15.4, 8.2, 4.5 and 4.5 seconds.
+The routes were the same in every run, and a second round gave 15.1, 8.3, 4.5 and 4.6 seconds.
 
-- Four solvers are three and a half times as fast as one, and not four times. The routes are much of a length, with 73, 73, 81 and 73 stops, so that is not the reason. A search that ran alone took 3.8 seconds, each of two side by side took 4.1, and each of four took 4.4: the processor gives one busy core more than it gives each of four.
+- Four solvers are 3.4 times as fast as one, and not four times. The routes have 82, 85, 84 and 49 stops, but each is searched for the same number of moves, and the one of 49 stops took 3.7 seconds where the others took 3.8 to 3.9. So that is not the reason. A search that ran alone took 3.8 seconds, each of two side by side took 4.1, and each of four took 4.5: the processor gives one busy core more than it gives each of four.
 - Eight solvers are no faster than four. The day has four routes.
 - The numbers want a machine that is doing nothing else. In Phase 6 the same run, made while the machine was still clearing away other containers, took nearly twice as long with one solver.
 
-The failure run, with four solvers and ten seconds a route: the route was taken over 27.9 seconds after the kill, and the plan was done 40.5 seconds after it was asked for, with 300 stops on four routes and every order on exactly one. The solver that took the route over logs the job with `attempt=2`. A lease runs for thirty seconds from the last heartbeat (D33), which came up to five seconds before the kill, and a worker with nothing to do looks at the queue every five. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` set in the shell make it quicker: compose passes them on, and the scripts change no setting themselves.
+The failure run, with four solvers and ten seconds a route: the route was taken over 27.9 seconds after the kill, and the plan was done 40.4 seconds after it was asked for, with 300 stops on four routes and every order on exactly one. The solver that took the route over logs the job with `attempt=2`. A lease runs for thirty seconds from the last heartbeat (D33), which came up to five seconds before the kill, and a worker with nothing to do looks at the queue every five. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` set in the shell make it quicker: compose passes them on, and the scripts change no setting themselves.
 
-The numbers of Phase 6 were of vans of 165 under the rule of D7: 15.2, 8.1, 4.5 and 4.6 seconds, for routes of 87, 86, 78 and 49 stops and 123.60 km. The same orders go onto vans of 132 now, and the sweep cuts the day into four routes that are more alike (D65).
+Before Phase 13 the day was of random points within 5 km of the depot (D46). At the end of Phase 8 it took 15.5, 8.3, 4.5 and 4.8 seconds, for routes of 73, 73, 81 and 73 stops and 126.13 km, and the failure run was done after 40.5 seconds. The numbers of Phase 6 were of the same orders on vans of 165, under the rule of D7: 15.2, 8.1, 4.5 and 4.6 seconds, for routes of 87, 86, 78 and 49 stops and 123.60 km. On vans of 132 the sweep cut that day into four routes that were more alike (D65).
 
-With an OSRM server in the stack (D67) the scripts run as they are. The same day by road was 475.92 km, the same routes with one solver and with four, in 16.0 and 5.3 seconds.
+With an OSRM server in the stack (D67) the scripts run as they are. The same day by road was 476.17 km, the same routes with one solver and with four, in 14.8 and 4.3 seconds. The day of Phase 8 was 475.92 km by road, in 16.0 and 5.3 seconds.
 
 Why:
 
@@ -1321,22 +1322,23 @@ Why:
 What it does not do:
 
 - What a search announces while it runs is the length on the matrix it searches, the symmetric one (D49). The length that is stored is the directed one, so the last announcement and the stored route differ a little.
-- OSRM moves every position onto the nearest road it has. A demo order is a point somewhere in the city (D46), which may be in a park or on the river as well as at a door, and its distances are those of the road it was moved to.
+- OSRM moves every position onto the nearest road it has, and its distances are those of the road it was moved to. A demo order is on a street since Phase 13 (D87), and is moved a few metres at most. An order placed by a click or by the bot may be in a park or on the river as well as at a door.
 - A route of more stops than the server was started for is refused by it, and searched for on great circles. The stack starts it for 2000 (D67).
 
 Measured on the development machine, against the server of D67. A table of 50 positions took 0.05 seconds, one of 337 took 0.14, one of 1000 took 0.73, and one of 2001 took 2.56 and was an answer of 28 MB. One of 2002 was refused with `TooBig`.
 
-What a day comes to, in the stack as compose runs it: the demonstration's 300 orders on four vans, seed 7, 200 million moves a route.
+What a day comes to, in the stack as compose runs it: the demonstration's 300 orders on four vans, seed 7, 200 million moves a route. Measured again in Phase 13, with the orders on the streets within 10 km of the depot (D87).
 
 | | As the crow flies | By road |
 |---|---|---|
-| The routes that were found on great circles | 126.13 km | 603.61 km |
-| The routes that were found by road | 182.05 km | 475.92 km |
+| The routes that were found on great circles | 226.70 km | 571.61 km |
+| The routes that were found by road | 257.87 km | 476.17 km |
 
-- The routes found on great circles are 27 % longer to drive than those found by road. Each driven the shorter way round, which a search on great circles does not know of, they are 586.68 km, and 23 % longer.
-- The lengths by road in the right-hand column were asked of the server again, leg by leg, by a script outside the stack. They came to 475.91 km for the 475.92 km that are stored.
-- The four routes by road, driven the other way round, come to 545.07 km. Each was stored the shorter way.
-- By road the day is several times its length as the crow flies. The stops are some four hundred metres apart. The Dnipro runs between them. And 66 of the 304 positions were more than a hundred metres from a road, one of them 1.25 km: a demo order is a random point (D46).
+- The routes found on great circles are 20 % longer to drive than those found by road. Each driven the shorter way round, which a search on great circles does not know of, they are 533.50 km, and 12 % longer.
+- The lengths by road in the right-hand column were asked of the server again, leg by leg, by a script outside the stack. They came to 476.16 km for the 476.17 km that are stored.
+- The four routes by road, driven the other way round, come to 521.78 km. Each was stored the shorter way.
+- By road the day is two to two and a half times its length as the crow flies. The stops are some 750 metres apart. The Dnipro runs between them. Of the 300 orders and the depot, the server moved none more than 25 metres onto its roads: a demo order is on a street (D87).
+- In Phase 8 the day was of random points within 5 km of the depot (D46), and the table was 126.13 and 603.61 km, then 182.05 and 475.92 km. The routes found on great circles were 27 % longer to drive. The stops were some four hundred metres apart, and 66 of the 304 positions were more than a hundred metres from a road, one of them 1.25 km.
 - With the server stopped while the first of four routes was searched for, by one solver, the plan was done all the same: one route by road and three on great circles, each labelled. Each of the three waited nearly four seconds for the name of the server to fail.
 
 Tests: the request as OSRM takes it, longitude first; the table read back; each way of failing, by its own name; a table that differs by direction searched on the mean; a route stored the shorter way round, and not turned round when that would overload the courier; a route on great circles stored as the search found it; a route with no table searched on great circles and labelled so; the lease kept while a table is waited for, and the wait ended by a cancel.
@@ -1497,7 +1499,7 @@ Why:
 - A search under way is not drawn along the streets. It announces its best route four times a second (D49), and each announcement would be a request to the server.
 - `list_for_plan` reads a row for each stop of a route. The way is selected with the first row of its route alone, so that a route of three hundred stops does not carry its way three hundred times.
 
-What it takes, measured against the server of D67 on the development machine:
+What it takes, measured against the server of D67 on the development machine in Phase 9, on days of random points within 5 km of the depot (D46):
 
 - **Time.** Next to nothing beside the table. By the server's own log, in the stack: for a planned day of 300 orders on four vans the four tables took 19 to 29 ms and the four ways 5 to 9 ms. For a day of 2000 orders, with routes of 347 to 556 stops, the tables took 94 to 216 ms and the ways 24 to 30 ms. A way through stops in no order at all is longer and takes longer: 71 ms through 330 of them, and 155 ms through 500.
 - **Room.** A way has a point every 35 metres or so, and a point is four letters. For the day of 300 orders, which came to 505.55 km by road, the four ways had 2067 to 4848 points and were 8 to 19 thousand letters, and the answer of `GET /api/plans/{id}/routes` was 108 kB. For the day of 2000 orders the ways had 12 to 17 thousand points each, and the answer was 517 kB.
@@ -1577,7 +1579,7 @@ What they do not do:
 - A search that was over before its first announcement has no chart: a chart takes two lengths.
 - Neither is there for a client, who sees no plan (D41).
 
-Tried in a headless Edge, against an API and solvers on the host. On a day of 300 orders on four vans, the chart of each route fell once, a quarter of a second in, and stood: one went from 146.97 km to 129.49 km. On a day of 1200 orders the charts went on falling for one to six of the ten seconds: one route went from 78.64 km to 63.87 km at once, and to 62.84 km in four steps after. A sheet of 86 stops left the depot with 131 on board and came back with 37, and the most in its column was the 131 its row names. A row brought the map to its stop, which was in the Dnipro: a demo order is a random point (D46).
+Tried in a headless Edge, against an API and solvers on the host. On a day of 300 orders on four vans, the chart of each route fell once, a quarter of a second in, and stood: one went from 146.97 km to 129.49 km. On a day of 1200 orders the charts went on falling for one to six of the ten seconds: one route went from 78.64 km to 63.87 km at once, and to 62.84 km in four steps after. A sheet of 86 stops left the depot with 131 on board and came back with 37, and the most in its column was the 131 its row names. A row brought the map to its stop, which was in the Dnipro: a demo order was a random point then (D46), and is on a street since Phase 13 (D87).
 
 With two workers for four routes, the row of a route that was stored stayed the element it was while the two others were searched for, and its button opened its sheet while the plan was still at it. The rows of the searches were made anew, as they have to be.
 
@@ -1859,3 +1861,34 @@ Why:
 What it does not do: run by itself, or look at the pictures. It takes one when it fails, and says where it is.
 
 Tried against an API and a solver of four workers on the host, on a new database: it passed in 6.4 seconds. With the rule of D83 taken out of the page, it failed where Plan could be pressed. Against the stack of a clone with no `.env`, it passed in 4.6 seconds.
+
+### D87. Demo orders lie on the streets of Kyiv (in place)
+
+Decided with the project owner on 2026-10-14, in Phase 13. Changes D46.
+
+A demo order is at a point of a street, picked at random among the points of the streets within the radius of the depot. The radius is 10 km unless the request names another. Round a depot with no street within it, the orders are spread evenly over the disc, as D46 has them.
+
+- **The streets** are in `crates/routeforge-api/data/kyiv-streets.bin`, which is compiled into the API. `scripts/streets.mjs` takes them out of the extract of OpenStreetMap that `scripts/osrm-prepare` fetches for the OSRM server (D67). It keeps the ways whose `highway` is `primary`, `secondary`, `tertiary`, `unclassified`, `residential` or `living_street`, and that are not a bridge, a tunnel, an area or private. Along each it puts a point every 25 metres, inside the rectangle the extract was cut to.
+- **The file** is the south-west corner of that rectangle, as two little-endian `i32` in hundred-thousandths of a degree, and then each point, as two little-endian `u16` north and east of the corner in the same unit: a metre or so. The extract of 2026-10-12 gave 18 991 streets, 5018 km of them, as 202 297 points in 790 kB. The points are sorted, so the same extract gives the same file, byte for byte.
+- **Where the streets are many, so are the orders.** Every point within the radius is as likely as another, so a part of the city with twice the streets gets twice the orders. Two orders may share a point.
+- **Each request reads the file** and keeps the points within the radius: 67 718 of them within 10 km of the demonstration's depot, in some 8 ms in a release build. Nothing is kept between requests, which only an admin makes.
+- **The radius** takes in both banks of the Dnipro, and keeps within the extract, which ends some 16 km south of the demonstration's depot and 24 km east of it. A larger radius is still taken, up to 30 km (D29), and its orders end where the extract does.
+
+Why:
+
+- A random point was in the Dnipro, in a forest or in a field as often as it was by a house. 66 of the 304 positions of the day of D66 were more than a hundred metres from a road, and one of them 1.25 km. The map of such a day is not a city's.
+- In the repository, because the approved description has the demonstration need no network (D8). Moving each point onto a road through OSRM, as the solvers' tables do, works only where OSRM is turned on, which it is not on a clone (D67). It would also give the API a client of OSRM, which only the solver has.
+- Not a shape of the river and the forests drawn by hand: it would be rough, and a point would still be in a smaller park or on a lake.
+- A street, and not a street with a house by it. In a try, a quarter of the points within 10 km had no building of the extract within 50 metres. Among them were the main roads across the parks and the islands, but also wide avenues whose houses stand back from them, and whole quarters of private houses, of which OpenStreetMap has few.
+- A script of Node, as `scripts/page-check.mjs` is (D86). Reading an extract takes zlib and a reader of protocol buffers, which Node has and PowerShell and sh do not. In Rust it would have been a sixth crate, or a dependency of the API for something the API never does.
+- The file, and not the extract: the extract is 36 MB, and stays out of the repository (D67).
+
+What it does not do:
+
+- An order is on a street, not at a door. It may be on a main road where it crosses a park or an island, with no house beside it.
+- Kyiv alone. A depot elsewhere gets the disc of D46. Another city would be another file, and the API reads one.
+- A file made from a newer extract gives other orders for the same seed, and so other numbers in the README, which were measured with the file of 2026-10-12.
+
+Measured in Phase 13, on the day of the demonstration's scripts, 300 orders with seed 7: all 300 were points of the file, on both banks of the river. As the crow flies the day is 226.70 km, where the day of 5 km was 126.13. By road it is 476.17 km, where that day was 475.92: the day is longer, and its detours are gone (D57, D66).
+
+Tests: the file whole and in Kyiv; the points within a radius all there and no others, and none round Lviv; 2000 orders round Kyiv each on a street, within the radius and on every side of the depot; round Lviv, evenly over the disc. Taking the streets out of `scatter`, the radius out of the streets, and the disc away from a depot with no streets each made a test fail.

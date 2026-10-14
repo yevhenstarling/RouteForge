@@ -31,7 +31,9 @@ The page with the map is then at `http://127.0.0.1:8080/` and Swagger UI at `htt
 
 `scripts/demo.ps1` (or `.sh`, which needs `curl` and `jq`) makes the scaling run and the failure run on that stack (D57). It plans tomorrow, and on that day it cancels and discards the plans that are in its way.
 
-The numbers in the README are made by `cargo run -p routeforge-tsp --release --example quality`, by `cargo bench -p routeforge-tsp` and by `scripts/demo.ps1 scaling -Solvers 1,2,4,8`, on a machine that is doing nothing else. After a change to the search, make them again.
+Demo orders are put on the streets in `crates/routeforge-api/data/kyiv-streets.bin`, which `node scripts/streets.mjs` makes from the extract that `scripts/osrm-prepare` fetches (D87). Make it again with the script rather than edit it.
+
+The numbers in the README are made by `cargo run -p routeforge-tsp --release --example quality`, by `cargo bench -p routeforge-tsp` and by `scripts/demo.ps1 scaling -Solvers 1,2,4,8`, on a machine that is doing nothing else. After a change to the search, or a new file of streets, which gives other orders for the same seed, make them again.
 
 The bot idles until `.env` has `TELEGRAM_BOT_TOKEN`, a token from @BotFather (D62). Nothing else has to be set for it. Whoever writes to it gets a client's account, and `/start` says the account's id, which an admin needs to make it an operator's (D59). It takes an address in words only where `.env` has `GEOCODER_URL`, a service that speaks as Nominatim does (D72).
 

@@ -48,6 +48,7 @@ Confirmed with the project owner:
   - the stats count the jobs of the last day and old workers are forgotten, over deleting old jobs and over leaving it as it was (D84);
   - all four extras that were offered: a script that tries the page, the bot's dialogue split by what it does, an index of the decisions, and the plumbing of the three services in one place, of which the last was not recommended (D81, D86);
   - the work as Phase 12 on a branch of its own, merged into `dev`.
+- **Phase 13 puts demo orders on the streets, over a disc twice as wide.** The project owner asked for it on 2026-10-14, after Phase 12, and chose the options recommended to them: the streets taken from the extract that OSRM is prepared from and kept in the repository, over moving each order onto a road through OSRM and over a shape of the river and the forests drawn by hand; and the README's numbers measured again on the new day (D87).
 
 Derived from the description:
 
@@ -74,11 +75,12 @@ RouteForge/
 ├─ crates/
 │  ├─ routeforge-tsp/       pure algorithms; benches/, examples/
 │  ├─ routeforge-domain/    types, geo, db + queue (feature `db`); migrations/
-│  ├─ routeforge-api/       actix-web binary
+│  ├─ routeforge-api/       actix-web binary; data/, the streets demo orders are put on
 │  ├─ routeforge-solver/    worker binary
 │  └─ routeforge-bot/       teloxide binary
 ├─ web/                     index.html, vendor/leaflet
-├─ scripts/                 sqlx-prepare, demo and osrm-prepare, each as .ps1 and .sh
+├─ scripts/                 sqlx-prepare, demo and osrm-prepare, each as .ps1 and .sh;
+│                           page-check.mjs and streets.mjs, for Node
 ├─ docs/                    description.md, plan.md, architecture.md
 ├─ .sqlx/                   offline query metadata (committed)
 └─ osrm/                    the roads scripts/osrm-prepare fetched (not committed)
@@ -101,12 +103,15 @@ RouteForge/
 | 10 | The client's page | A client placing an order on the page and seeing it planned, beside an operator's page | L | done |
 | 11 | Free text for the bot | An order placed by a sentence | M | not decided on; needs an Anthropic API key |
 | 12 | Fixes from the review | What the review of 2026-10-14 found, mended, and the page tried by a script | L | done |
+| 13 | Demo orders on the streets | A demo day on the streets of Kyiv, within 10 km of the depot, and the README's numbers of it | S | done |
 
 **Cut line.** Phases 0 to 6 are the core claim of the project. Phase 7 is in the approved description, so it stays, but it comes last because nothing depends on it; its minimum is two operations (create an order, list my orders). Phase 8 is where things get dropped first: OSRM is optional by the description, and the LLM part of the bot waits there for a key (D58). In the end one thing was dropped there: the LLM part, for which there was no key.
 
 Phases 9 to 11 were added when all of that was done, and nothing depends on any of them. Each stands by itself, so they can be taken in any order, or left. Phases 9 and 10 make a demonstration show more, and both are built. Phase 11 is the one part of the approved description that is not built.
 
 Phase 12 was added on 2026-10-14, after a review of the code (`docs/review.md`), and holds what the review found that code can mend.
+
+Phase 13 was added the same day, when the project owner asked for demo orders on the streets and over a disc twice as wide.
 
 ## Phase 0: skeleton and tooling
 
@@ -774,6 +779,41 @@ What later phases need from it:
 - A new event stream goes through `stream::open`, which takes its place among the user's (D85).
 - After a change to the page, `node scripts/page-check.mjs` against a stack that was built with it.
 
+## Phase 13: demo orders on the streets
+
+Built. Added on 2026-10-14, after Phase 12, at the project owner's request. Demo orders were in the Dnipro and in the forests, and were to be near the roads, over a circle twice as wide. The owner chose the streets of the extract that OSRM is prepared from, kept in the repository, and the README's numbers measured again on the new day.
+
+Done when: every demo order round the demonstration's depot is at a point of a street, within 10 km of it unless the request says otherwise; a depot elsewhere still gets its orders; the README's numbers are of the new day; and the checks of `CLAUDE.md` pass.
+
+Delivered:
+
+- **`scripts/streets.mjs`** reads the extract and writes `crates/routeforge-api/data/kyiv-streets.bin`: a point every 25 metres along the streets a car may stop in for a parcel, 202 297 of them in 790 kB (D87). It needs Node 22 and no package, and the same extract gives the same file.
+- **`streets::near`** in the API gives the points within a radius of a place, and `scatter` picks among them with the generator of the request's seed. Round a depot with none, the disc of D46.
+- **The radius** is 10 km unless the request names one, where it was 5. The page and the demo scripts name none.
+
+In `openapi.json`: the description of `POST /api/demo/orders`, and the default of its `radius_km`. No endpoint, setting, migration or dependency is new. `.gitattributes` keeps the file of streets as it is written.
+
+Tests: 3 more, 580 in all, all of them in the API, which has 154 now. They hold the file whole and in Kyiv; the points within a radius all there and no others, and none round Lviv; and 2000 orders round Kyiv each on a street, within the radius and on every side of the depot. The test of an even disc has its depot at Lviv now, where there are no streets to pick from. Three faults were put in on purpose: `scatter` without the streets, the streets without the radius, and no disc for a depot with no streets. Each made a test fail.
+
+Tried, with the development database left alone:
+
+- **The checks of `CLAUDE.md`:** format, clippy with warnings as errors, the bot without `db`, and the 580 tests.
+- **The streets, drawn:** the Dnipro and the forests are empty of points but for the roads that cross them, and a second run of the script wrote the same bytes.
+- **The demonstration,** with `scripts/demo.ps1` on a stack of its own, the project `routeforge-measure` on other ports, built in 33 seconds with the layers of the dependencies there already. The day: 300 orders on four vans of 132, seed 7, all 300 at points of the file, in routes of 82, 85, 84 and 49 stops, 226.70 km. With one, two, four and eight solvers it took 15.4, 8.2, 4.5 and 4.6 seconds, and a second round 15.1, 8.3, 4.5 and 4.6, with the same routes every time. A search took 3.7 to 3.9 seconds alone, 4.0 to 4.1 beside one other and 4.4 to 4.5 beside three. In the failure run the killed solver's route was taken over 27.9 seconds after the kill, and logged with `attempt=2`, and the plan was done after 40.4 seconds with every order on exactly one route.
+- **The stack with the roads:** the same day by road was 476.17 km, in 14.8 seconds with one solver and 4.3 with four, the same routes. Measured leg by leg against the server, by a script outside the stack, as D66 has it: the routes found on great circles came to 571.61 km by road, 533.50 each the shorter way round; the routes found by road to 476.16 km, 257.87 as the crow flies, and 521.78 the other way round. The server moved none of the 301 positions more than 25 metres onto its roads, where the day of 5 km had 66 of 304 more than a hundred metres from one.
+- **The page,** against that stack: `scripts/page-check.mjs` passed in 4.3 seconds. In pictures of the day with the tiles, every stop is on a street, on both banks. A few are on the roads across the islands, of which the README's known limits say.
+
+Taken down with its volume and its images. Not tried, because nothing of them was changed: `scripts/demo.sh`, which asks the same endpoint as the `.ps1`, and the bot.
+
+What is left, for whoever goes on:
+
+- Phase 11, and the try with Telegram, as before.
+- An order on a street is not at a door. The main roads across the parks and the islands get orders as the streets of houses do. A filter by the buildings of the extract was tried and not taken (D87).
+
+What later phases need from it:
+
+- Newer streets are `node scripts/streets.mjs` after `scripts/osrm-prepare`, and then the README's numbers measured again: a new file gives other orders for the same seed.
+
 ## Known traps
 
 - **sqlx compile-time queries** are checked against the metadata in `.sqlx/`, not against a database: `.cargo/config.toml` sets `SQLX_OFFLINE`. After changing a query or a migration, run `scripts/sqlx-prepare` and commit the result, or the build fails with "no cached data for this query". The script needs `sqlx-cli`, and the command that installs it is at the top of the script. To have the compiler ask the live database while writing queries, set `SQLX_OFFLINE=false` in the shell.
@@ -873,20 +913,21 @@ What later phases need from it:
 - For Phase 9: nothing new. The lines along the streets show where an OSRM server is asked, which takes the roads that `scripts/osrm-prepare` fetches. An OSRM server that was started before Phase 9 takes a way through 500 positions and no more: `docker compose up` makes it anew from the compose file as it is now.
 - For Phase 10: nothing. An account for the client's page is opened on the page, and the admin is the one the stack starts with.
 - For Phase 12: Node 22 or later and Edge or Chrome on a machine where `scripts/page-check.mjs` is run. Nothing else.
+- For Phase 13: nothing. Newer streets need Node 22 and the extract that `scripts/osrm-prepare` fetches.
 - For Phase 11, the free text of the bot: the decision whether to build it, and an Anthropic API key, made in the Claude Console at platform.claude.com, on an account with credit. A Claude subscription does not include one (D58). The phase is not begun without the key.
 - The owner said on 2026-10-12 that the bootcamp holds the project to nothing formal: no rubric, and no word on whether the bot may come without its LLM part. If that changes, the README's paragraph on the bot is where the difference from the approved description is said.
 
 ## Verification
 
 1. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` with the compose `db` up, and `cargo bench -p routeforge-tsp`.
-2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, `admin@example.com` with the password `routeforge` (D54), set up the demo city, generate 300 orders, press Plan. Routes appear and improve live; `/docs` lists every endpoint. With 1200 orders in the field before the city is set up, the routes are long enough to be seen improving for seconds (D49).
+2. Fresh clone: `docker compose up --build --scale solver=4`, open `http://localhost:8080`, log in as the seeded admin, `admin@example.com` with the password `routeforge` (D54), set up the demo city, generate 300 orders, which are on the streets of Kyiv (D87), and press Plan. Routes appear and improve live; `/docs` lists every endpoint. With 1200 orders in the field before the city is set up, the routes are long enough to be seen improving for seconds (D49).
 3. Determinism: run a plan, discard it (D30), and run it again with the same seed and an iteration budget; the routes are identical. The scaling run of `scripts/demo` does this with every run it makes (D57).
 4. Scaling: `scripts/demo scaling` plans the same day with 1 solver and with 4, discarded in between. With `-Solvers 1,2,4,8`, or `DEMO_SOLVERS='1 2 4 8'` for the sh one, completion time drops until workers outnumber routes.
 5. Failure: `scripts/demo failure` kills one solver mid-solve; within the lease time another worker takes over and every order is still routed exactly once.
 6. Tracing: take the `X-Request-Id` of the plan request and find it in the logs of the API and of every solver that worked on that plan. The demo scripts print the one they sent.
 7. Offline: disconnect the network and repeat step 2 without `--build`, which asks the registry (D54). Routes draw without map tiles. The bot idles if it has no token, and with one it says that it cannot reach Telegram and goes on trying (D62).
 8. Bot: place an order by chat and see it on the map, as "Needed from the project owner" says step by step. Without a token: `cargo test -p routeforge-bot` places the same order against a stand-in for Telegram (D64), and an order placed through the API appears on an open page without Refresh (D63).
-9. Roads: `scripts/osrm-prepare`, the two lines in `.env`, and step 2 again. Every route says `by road`, and the day is several times as long as it was. `docker compose stop osrm` in the middle of a plan leaves the plan done, with the routes that came after it `as the crow flies` (D66).
+9. Roads: `scripts/osrm-prepare`, the two lines in `.env`, and step 2 again. Every route says `by road`, and the day is about twice as long as it was. `docker compose stop osrm` in the middle of a plan leaves the plan done, with the routes that came after it `as the crow flies` (D66).
 10. Load: on the page, each route says the most its van has on board, and none says more than the van carries. With the demo city's vans, three of four leave the depot full (D65).
 11. Numbers: `cargo run -p routeforge-tsp --release --example quality` and `cargo bench -p routeforge-tsp` print what the README's tables were made from.
 12. The map: while a plan is searched for, each route has a chart in its row that falls, for seconds if the day has 1200 orders. When the plan is done, a van sets out along each route and is back within a minute, and the page says that the vans are simulated. The button in a route's row, or a click on its line, opens its sheet, and a row of the sheet shows its stop. With the roads of step 9 the stored routes follow the streets, and so do the vans (D73 to D75).
