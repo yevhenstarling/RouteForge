@@ -110,17 +110,17 @@ How far above the shortest tour a search ends, on three instances of TSPLIB whos
 | 10 million moves | 0.03 % | 0.00 % | 0.01 % | 0.2 s |
 | 100 million moves | 0.00 % | 0.00 % | 0.00 % | 2 s |
 
-A random day on four couriers has no published answer. This is how far above the shortest total that any of the searches found:
+A random day on six couriers has no published answer. This is how far above the shortest total that any of the searches found:
 
-| | 300 stops, routes of 49 to 85 | 1200 stops, routes of 220 to 331 |
+| | 1200 stops, routes of 109 to 223 | 2000 stops, routes of 176 to 377 |
 |---|---|---|
-| Nearest neighbour | 34.7 % | 23.3 % |
-| 2-opt and Or-opt, to their end | 2.2 % | 3.7 % |
-| The whole search, 1 million moves | 0.6 % | 3.9 % |
-| 10 million moves | 0.03 % | 2.0 % |
-| 100 million moves | 0.00 % | 0.7 % |
+| Nearest neighbour | 29.3 % | 27.5 % |
+| 2-opt and Or-opt, to their end | 3.9 % | 2.7 % |
+| The whole search, 1 million moves | 3.7 % | 3.5 % |
+| 10 million moves | 1.1 % | 1.3 % |
+| 100 million moves | 0.3 % | 0.4 % |
 
-A budget counts every move, those of 2-opt and Or-opt as well. On a route of three hundred stops they take more than a million before annealing begins, which is why a million moves are no better there than 2-opt and Or-opt alone. The API gives a route ten seconds unless the plan says otherwise, which is some five hundred million moves.
+A budget counts every move, those of 2-opt and Or-opt as well. On the routes of the larger day, of some 360 stops, they take more than a million before annealing begins. So a million moves end them early, and come out longer than 2-opt and Or-opt left to their end. The API gives a route ten seconds unless the plan says otherwise, which is some five hundred million moves.
 
 ### What a stage takes
 

@@ -34,7 +34,7 @@ const SMALLEST_BUDGET: u64 = 100_000;
 const DAY_SEED: u64 = 42;
 
 /// The days that are planned: how many stops, on how many couriers.
-const DAYS: [(usize, usize); 2] = [(300, 4), (1200, 4)];
+const DAYS: [(usize, usize); 2] = [(1200, 6), (2000, 6)];
 
 /// What one way of searching gave for a set of routes.
 struct Row {
