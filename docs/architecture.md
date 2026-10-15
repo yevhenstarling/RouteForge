@@ -1045,26 +1045,27 @@ How:
 - **After each run the script checks what the system is judged by** (D20): every order the plan took is on exactly one route.
 - **Each plan is asked for with a request id of the script's making,** which it prints. `docker compose logs api solver` has it in the lines of the API and of every solver that worked on the plan (D42).
 
-Measured on the development machine, with 16 logical processors and Docker Desktop on WSL2, in Phase 13, on the day of D87: orders on the streets within 10 km of the depot. A new database, 300 orders, four vans of 132, 200 million moves a route:
+Measured on the development machine, with 16 logical processors and Docker Desktop on WSL2, on 2026-10-15, on the day of D88: 1200 orders on the streets within 10 km of the depot (D87), six vans of 352, 200 million moves a route, on a new database:
 
 | Solvers | Seconds | Speed-up | Routes | Kilometres |
 |---|---|---|---|---|
-| 1 | 15.4 | 1.0 | 4 | 226.70 |
-| 2 | 8.2 | 1.9 | 4 | 226.70 |
-| 4 | 4.5 | 3.4 | 4 | 226.70 |
-| 8 | 4.6 | 3.3 | 4 | 226.70 |
+| 1 | 23.6 | 1.0 | 6 | 410.19 |
+| 2 | 12.7 | 1.9 | 6 | 410.19 |
+| 4 | 9.0 | 2.6 | 6 | 410.19 |
+| 8 | 5.4 | 4.3 | 6 | 410.19 |
 
-The routes were the same in every run, and a second round gave 15.1, 8.3, 4.5 and 4.6 seconds.
+The routes were the same in every run, and a second round gave 23.8, 12.8, 8.7 and 5.2 seconds.
 
-- Four solvers are 3.4 times as fast as one, and not four times. The routes have 82, 85, 84 and 49 stops, but each is searched for the same number of moves, and the one of 49 stops took 3.7 seconds where the others took 3.8 to 3.9. So that is not the reason. A search that ran alone took 3.8 seconds, each of two side by side took 4.1, and each of four took 4.5: the processor gives one busy core more than it gives each of four.
-- Eight solvers are no faster than four. The day has four routes.
+- The routes have 215, 212, 227, 198, 219 and 129 stops. Each is searched for the same number of moves, and each took 3.9 to 4.0 seconds when it had the machine to itself, the one of 129 stops among them. So the size of a route is not what its time depends on.
+- Four solvers are 2.6 times as fast as one, and not four times. Six routes take four solvers two rounds, four routes and then two. And a search is slower beside others: beside one more it took 4.2 to 4.3 seconds, beside three more 4.4 to 4.7, and beside five more 4.8 to 5.2. The processor gives one busy core more than it gives each of several.
+- Eight solvers are 4.3 times as fast as one. Six of them have a route each, and two have nothing to do.
 - The numbers want a machine that is doing nothing else. In Phase 6 the same run, made while the machine was still clearing away other containers, took nearly twice as long with one solver.
 
-The failure run, with four solvers and ten seconds a route: the route was taken over 27.9 seconds after the kill, and the plan was done 40.4 seconds after it was asked for, with 300 stops on four routes and every order on exactly one. The solver that took the route over logs the job with `attempt=2`. A lease runs for thirty seconds from the last heartbeat (D33), which came up to five seconds before the kill, and a worker with nothing to do looks at the queue every five. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` set in the shell make it quicker: compose passes them on, and the scripts change no setting themselves.
+The failure run, with four solvers and ten seconds a route: the route was taken over 28.8 seconds after the kill, and the plan was done 41.0 seconds after it was asked for, with 1200 stops on six routes and every order on exactly one. The solver that took the route over logs the job with `attempt=2`. A lease runs for thirty seconds from the last heartbeat (D33), which came up to five seconds before the kill, and a worker with nothing to do looks at the queue every five. `SOLVER_LEASE_SECS` and `SOLVER_HEARTBEAT_SECS` set in the shell make it quicker: compose passes them on, and the scripts change no setting themselves.
 
-Before Phase 13 the day was of random points within 5 km of the depot (D46). At the end of Phase 8 it took 15.5, 8.3, 4.5 and 4.8 seconds, for routes of 73, 73, 81 and 73 stops and 126.13 km, and the failure run was done after 40.5 seconds. The numbers of Phase 6 were of the same orders on vans of 165, under the rule of D7: 15.2, 8.1, 4.5 and 4.6 seconds, for routes of 87, 86, 78 and 49 stops and 123.60 km. On vans of 132 the sweep cut that day into four routes that were more alike (D65).
+In Phase 13 the day was 300 orders on four vans of 132, in routes of 82, 85, 84 and 49 stops: 226.70 km, in 15.4, 8.2, 4.5 and 4.6 seconds, and the failure run was done after 40.4 seconds. Eight solvers were no faster than four, since that day had four routes. Before Phase 13 the day was of random points within 5 km of the depot (D46). At the end of Phase 8 it took 15.5, 8.3, 4.5 and 4.8 seconds, for routes of 73, 73, 81 and 73 stops and 126.13 km, and the failure run was done after 40.5 seconds. The numbers of Phase 6 were of the same orders on vans of 165, under the rule of D7: 15.2, 8.1, 4.5 and 4.6 seconds, for routes of 87, 86, 78 and 49 stops and 123.60 km. On vans of 132 the sweep cut that day into four routes that were more alike (D65).
 
-With an OSRM server in the stack (D67) the scripts run as they are. The same day by road was 476.17 km, the same routes with one solver and with four, in 14.8 and 4.3 seconds. The day of Phase 8 was 475.92 km by road, in 16.0 and 5.3 seconds.
+With an OSRM server in the stack (D67) the scripts run as they are. The same day by road was 1198.99 km, the same routes with one solver and with four, in 22.2 and 8.2 seconds. The day of Phase 13 was 476.17 km by road, in 14.8 and 4.3 seconds, and that of Phase 8 475.92 km, in 16.0 and 5.3.
 
 Why:
 
@@ -1328,19 +1329,20 @@ What it does not do:
 
 Measured on the development machine, against the server of D67. A table of 50 positions took 0.05 seconds, one of 337 took 0.14, one of 1000 took 0.73, and one of 2001 took 2.56 and was an answer of 28 MB. One of 2002 was refused with `TooBig`.
 
-What a day comes to, in the stack as compose runs it: the demonstration's 300 orders on four vans, seed 7, 200 million moves a route. Measured again in Phase 13, with the orders on the streets within 10 km of the depot (D87).
+What a day comes to, in the stack as compose runs it: the demonstration's 1200 orders on six vans (D88), seed 7, 200 million moves a route, on the streets within 10 km of the depot (D87). Measured on 2026-10-15.
 
 | | As the crow flies | By road |
 |---|---|---|
-| The routes that were found on great circles | 226.70 km | 571.61 km |
-| The routes that were found by road | 257.87 km | 476.17 km |
+| The routes that were found on great circles | 410.19 km | 1531.69 km |
+| The routes that were found by road | 544.24 km | 1198.99 km |
 
-- The routes found on great circles are 20 % longer to drive than those found by road. Each driven the shorter way round, which a search on great circles does not know of, they are 533.50 km, and 12 % longer.
-- The lengths by road in the right-hand column were asked of the server again, leg by leg, by a script outside the stack. They came to 476.16 km for the 476.17 km that are stored.
-- The four routes by road, driven the other way round, come to 521.78 km. Each was stored the shorter way.
-- By road the day is two to two and a half times its length as the crow flies. The stops are some 750 metres apart. The Dnipro runs between them. Of the 300 orders and the depot, the server moved none more than 25 metres onto its roads: a demo order is on a street (D87).
+- The routes found on great circles are 28 % longer to drive than those found by road. Each driven the shorter way round, which a search on great circles does not know of, they are 1512.18 km, and 26 % longer.
+- The lengths by road in the right-hand column were asked of the server again, leg by leg, by a script outside the stack. They came to 1198.96 km for the 1198.99 km that are stored.
+- The six routes by road, driven the other way round, come to 1251.72 km. Each was stored the shorter way.
+- By road the routes found by road are 2.2 times their length as the crow flies, and those found on great circles 3.7 times. The stops are some 340 metres apart, and over legs that short one-way streets and turns that are not allowed count for much. The Dnipro runs between them. Of the 1200 orders and the depot, the server moved three more than 25 metres onto its roads, the farthest 79 metres: a demo order is on a street (D87).
+- In Phase 13 the day was 300 orders on four vans, and the table was 226.70 and 571.61 km, then 257.87 and 476.17 km. The routes found on great circles were 20 % longer to drive, and the stops some 750 metres apart.
 - In Phase 8 the day was of random points within 5 km of the depot (D46), and the table was 126.13 and 603.61 km, then 182.05 and 475.92 km. The routes found on great circles were 27 % longer to drive. The stops were some four hundred metres apart, and 66 of the 304 positions were more than a hundred metres from a road, one of them 1.25 km.
-- With the server stopped while the first of four routes was searched for, by one solver, the plan was done all the same: one route by road and three on great circles, each labelled. Each of the three waited nearly four seconds for the name of the server to fail.
+- With the server stopped while the first of six routes was searched for, by one solver, the plan was done all the same: one route by road, which got no way to keep (D73), and five on great circles, each labelled. Each of the five waited nearly four seconds for the name of the server to fail.
 
 Tests: the request as OSRM takes it, longitude first; the table read back; each way of failing, by its own name; a table that differs by direction searched on the mean; a route stored the shorter way round, and not turned round when that would overload the courier; a route on great circles stored as the search found it; a route with no table searched on great circles and labelled so; the lease kept while a table is waited for, and the wait ended by a cancel.
 
@@ -1898,14 +1900,15 @@ Tests: the file whole and in Kyiv; the points within a radius all there and no o
 
 Decided with the project owner on 2026-10-15. Changes the sizes of D52 and D57.
 
-The demo city of the page and the demonstration's scripts make six vans, each with room for a sixth of the orders asked for and a tenth more. The page asks for 1200 orders unless it is told otherwise, and the scripts generate as many as the vans carry with that tenth to spare, which is 1200 again. That is six vans of 352, and routes of some 200 stops, where it was four vans of 132, 300 orders, and routes of 49 to 85 stops.
+The demo city of the page and the demonstration's scripts make six vans, each with room for a sixth of the orders asked for and a tenth more. The page asks for 1200 orders unless it is told otherwise, and the scripts generate as many as the vans carry with that tenth to spare, which is 1200 again. That is six vans of 352, and routes of 198 to 227 stops and one of 129 (D57), where it was four vans of 132, 300 orders, and routes of 49 to 85 stops.
 
 - **The stack keeps four solvers.** Six routes are more than four solvers search for at once, so two of them wait in the queue until a solver is free.
 - **The day before is in it.** A longer run from the same seed starts as the shorter one did (D46), so the 300 orders of the old day are among the 1200 of the new one.
 
 Why:
 
-- Load. With four routes on four solvers the queue was empty as soon as the plan was split, and a fifth solver had nothing to do. With six routes, work waits in the queue for a solver.
+- Load. With four routes on four solvers the queue was empty as soon as the plan was split, and a fifth solver had nothing to do. With six routes, work waits in the queue for a solver: four solvers search for the day in two rounds, and eight are faster than four (D57).
+- A route of some 200 stops is long enough to be seen getting shorter. Followed on the plan's stream, which is what the chart in its row draws, such a route went on getting shorter for one and a half to five seconds of its ten (D49, D75). A route of the day before was at its final length a quarter of a second in, and of the new day only the one of 129 stops is.
 - Routes of 50 to 100 stops, nearer to what a courier calls at in a day, were weighed and not taken: they would have given the system less to do.
 
 What it does not do:

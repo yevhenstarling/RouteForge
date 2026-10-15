@@ -25,7 +25,7 @@ On a new database the page offers an admin "Set up a demo city". Press it, gener
 
 What there is to see on the page:
 
-- **A plan as it is made.** A route is a dashed line while a solver searches for it, and a solid one when it is stored. A small chart in its row shows its length falling as the search goes on. With 300 orders a route is at its final length a quarter of a second in, and the chart is one step. With 1200 it goes on falling for seconds.
+- **A plan as it is made.** A route is a dashed line while a solver searches for it, and a solid one when it is stored. A small chart in its row shows its length falling as the search goes on. On a day of 1200 orders, which the demo city is set up for, the routes of some 200 stops went on falling for one and a half to five seconds, and one of 129 stops was at its final length a quarter of a second in.
 - **Vans that drive the routes** of a plan that is done. They are simulated. Each page moves its own along the stored routes, at a speed at which the longest route takes a minute. Nothing tracks a courier, and the project is not to.
 - **A route sheet** for each stored route: its stops in the order the courier calls, with what is on board after each. A click on a route's line opens its sheet, and a row of the sheet shows its stop on the map.
 - **The queue and the workers,** as they are, and the jobs that ended in the last day.
@@ -57,20 +57,20 @@ It brings the stack up if it is not, and shows two things:
 
 It plans tomorrow, so it stays out of the way of what you do on the page, which opens on today.
 
-This is what it showed on the development machine, which has 16 logical processors and runs Docker Desktop on WSL2. The day had 300 orders on four vans, and every route was searched for 200 million moves:
+This is what it showed on the development machine, which has 16 logical processors and runs Docker Desktop on WSL2. The day had 1200 orders on six vans, and every route was searched for 200 million moves:
 
 | Solvers | Seconds | Speed-up | Kilometres |
 |---|---|---|---|
-| 1 | 15.4 | 1.0 | 226.70 |
-| 2 | 8.2 | 1.9 | 226.70 |
-| 4 | 4.5 | 3.4 | 226.70 |
-| 8 | 4.6 | 3.3 | 226.70 |
+| 1 | 23.6 | 1.0 | 410.19 |
+| 2 | 12.7 | 1.9 | 410.19 |
+| 4 | 9.0 | 2.6 | 410.19 |
+| 8 | 5.4 | 4.3 | 410.19 |
 
 - The routes were the same in every run, stop for stop.
-- Four solvers are 3.4 times as fast as one, and not four times. A search that had the machine to itself took 3.8 seconds, and each of four side by side took 4.5.
-- Eight solvers are no faster than four. The day has four routes.
+- Four solvers are 2.6 times as fast as one. The day has six routes, so four solvers search for them in two rounds, four and then two. And a search is slower beside others: one that had the machine to itself took 4.0 seconds, and each of four side by side 4.4 to 4.7.
+- Eight solvers are 4.3 times as fast. Six of them have a route each, and two have nothing to do.
 
-In the failure run a solver was killed two seconds into its route. Another solver took the route over 27.9 seconds after the kill, when the lease of the dead one had run out. The plan was done 40.4 seconds after it was asked for, with each of its 300 orders on exactly one route.
+In the failure run a solver was killed two seconds into its route. Another solver took the route over 28.8 seconds after the kill, when the lease of the dead one had run out. The plan was done 41.0 seconds after it was asked for, with each of its 1200 orders on exactly one route.
 
 `scripts/demo.ps1 scaling -Solvers 1,2,4,8` prints the table for your machine.
 
@@ -156,18 +156,18 @@ OSRM_URL=http://osrm:5000
 
 and start the stack as before. The page then writes `by road` beside the length of each route, where it wrote `as the crow flies`, and draws each stored route along the streets it takes. The vans drive along them too.
 
-What it changes, for the demonstration's day of 300 orders on four vans:
+What it changes, for the demonstration's day of 1200 orders on six vans:
 
 | | As the crow flies | By road |
 |---|---|---|
-| The routes that were found on great circles | 227 km | 572 km |
-| The routes that were found by road | 258 km | 476 km |
+| The routes that were found on great circles | 410 km | 1532 km |
+| The routes that were found by road | 544 km | 1199 km |
 
-The routes that look shortest on the map are a fifth longer to drive than the ones that were searched for by road.
+The routes that look shortest on the map are more than a quarter longer to drive than the ones that were searched for by road.
 
-By road everything is two to two and a half times the straight line. The stops are some 750 metres apart, and over such a distance one-way streets and turns that are not allowed count for much. The Dnipro runs through the middle, with few bridges. A demo order is on a street, so the server moves none of them far onto its roads: the farthest by 25 metres.
+By road the routes are two to four times their straight line: those that were searched for by road 2.2 times, the others 3.7. The stops are some 340 metres apart, and over such a distance one-way streets and turns that are not allowed count for much. The Dnipro runs through the middle, with few bridges. A demo order is on a street, so the server moves few of them far onto its roads: three of the 1201 positions by more than 25 metres, the farthest by 79.
 
-A route that the server gives no distances for is searched for on great circles, and says `as the crow flies`. So a plan is done whether the server is there or not. Stopped in the middle of a plan, it left one route by road and three as the crow flies.
+A route that the server gives no distances for is searched for on great circles, and says `as the crow flies`. So a plan is done whether the server is there or not. Stopped in the middle of a plan, it left one route by road and five as the crow flies.
 
 The way a route takes is asked of the server once, when the route is stored, and kept with it. A route by road that the server gave no way for is drawn from stop to stop, and says so.
 
