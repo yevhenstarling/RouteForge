@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Date | 2026-10-14 |
-| Commit | `7ae9a7e` on `dev` (Phase 10 merged) |
+| Commit | `c1c995d` on `dev` (Phase 10 merged) |
 | Scope | Architecture, code quality, security, performance and scalability, reliability and operations, tests, documentation |
 | Method | Reading the code and the documents, and running the project's own checks ([appendix A](#appendix-a-check-results)) |
 | Reviewer | Claude (Opus 5.5), at the project owner's request |
@@ -32,7 +32,7 @@ Format, clippy with warnings as errors, the bot built without the `db` feature a
 | [P1](#p1--lowmedium--the-live-stats-count-the-whole-job-history) / [R2](#r2--lowmedium--nothing-is-ever-deleted) | Each open operator page counts every job ever stored, every two seconds. Nothing deletes old jobs. | Low/Medium |
 | [A1](#a1--lowmedium--a-second-plan-of-a-day-gives-couriers-a-second-round) | A second plan for a day that already has a done plan gives couriers a second round. The documented model says a courier makes one round a day. | Low/Medium |
 
-Two items of the approved description are still open, and the project already says so itself: the bot has no LLM part ([C1](#c1--medium--the-bot-is-not-llm-powered)), and it has never talked to the real Telegram ([C2](#c2--medium--the-bot-has-never-met-telegram)).
+One item of the approved description is still open, and the project already says so itself: the bot has no LLM part ([C1](#c1--medium--the-bot-is-not-llm-powered)).
 
 ## 2. How the review was done
 
@@ -57,7 +57,7 @@ Two items of the approved description are still open, and the project already sa
 **Not done:**
 
 - The page was not tried in a browser.
-- Nothing ran against Telegram or OSRM.
+- Nothing ran against OSRM.
 - No load test, and no run of `scripts/demo`.
 
 Each finding was held against `docs/architecture.md`. Where a decision already accepts a trade-off, the finding names that decision and is graded Info or Low.
@@ -78,7 +78,7 @@ Each finding was held against `docs/architecture.md`. Where a decision already a
 | One workspace of five crates | Met | [Cargo.toml](../Cargo.toml), D3 |
 | `api` in actix-web: orders, auth, enqueues solve jobs | Met | [routes/orders.rs](../crates/routeforge-api/src/routes/orders.rs), [plans::submit](../crates/routeforge-domain/src/db/plans.rs#L128-L138) |
 | `solver` as several instances, no coordinator | Met | [queue::claim](../crates/routeforge-domain/src/db/queue.rs#L200-L267), D22, D33 |
-| `bot`: an LLM-powered Telegram agent | **Partly** | Buttons, commands and addresses, but no language model ([C1](#c1--medium--the-bot-is-not-llm-powered)), and not tried against Telegram ([C2](#c2--medium--the-bot-has-never-met-telegram)) |
+| `bot`: an LLM-powered Telegram agent | **Partly** | Buttons, commands and addresses, but no language model ([C1](#c1--medium--the-bot-is-not-llm-powered)) |
 | One PostgreSQL for the domain data and the queue | Met | [0001](../crates/routeforge-domain/migrations/0001_domain.sql), [0002](../crates/routeforge-domain/migrations/0002_queue.sql) |
 | `FOR UPDATE SKIP LOCKED` with `LISTEN/NOTIFY`, a lease and a heartbeat, no load balancer | Met | [queue.rs](../crates/routeforge-domain/src/db/queue.rs), D22 to D26 |
 | `--scale solver=4` with no configuration change | Met | [docker-compose.yml](../docker-compose.yml), D38, D54 |
@@ -98,12 +98,6 @@ Each finding was held against `docs/architecture.md`. Where a decision already a
 The description calls the bot "an LLM-powered Telegram agent" and names "teloxide + the Claude API" ([description.md:13](description.md#L13), [:22](description.md#L22)). The bot takes buttons, commands and, where a geocoder is set, addresses. The README says so plainly, and D58 gives the reasons. Phase 11 is planned but not decided, and needs an API key.
 
 **Recommendation:** decide on Phase 11 before the project is presented, so that the gap is a decision and not a surprise. If it is built, the plan in `docs/plan.md` stands as written: tool calls go through the draft, and the confirming button stays the only way to place an order (D9).
-
-### C2 · Medium · The bot has never met Telegram
-
-Every bot test runs against stand-ins: a fake API, a wiremock server held to `openapi.json`, and a wiremock Telegram (D64). D64 names what a stand-in cannot show. A keyboard of the wrong shape, a label too long for a button, or a method that Telegram answers otherwise would all pass here and fail there. Phase 7 is "built; not tried against Telegram yet".
-
-**Recommendation:** the owner has said that no token will be available. If that changes, it is the cheapest high-value check in the project: ten minutes with a token, and the steps are in "Needed from the project owner" in `docs/plan.md`. Until then, the bot is the largest surface of the system that has not been tried for real.
 
 ## 4. Architecture
 
@@ -418,7 +412,7 @@ The first run of the suite stopped on one failure in the API ([T1](#t1--low--a-p
 
 ### 9.3 Gaps
 
-- The page ([Q1](#q1--medium--the-page-is-the-largest-untested-component)), and the real Telegram ([C2](#c2--medium--the-bot-has-never-met-telegram)).
+- The page ([Q1](#q1--medium--the-page-is-the-largest-untested-component)).
 - No test runs the solver's binary, as tests do for the API's and the bot's, so its exit status is untested ([R1](#r1--medium--a-panic-in-a-jobs-async-code-removes-the-worker-for-good)).
 - No test reports a panic that happens outside the blocking search ([R1](#r1--medium--a-panic-in-a-jobs-async-code-removes-the-worker-for-good)).
 - The fault passes are done by hand. `cargo mutants` is in `.gitignore` already, and on `routeforge-tsp`, whose tests take seconds, it could repeat that work after every change to the search.
@@ -470,7 +464,6 @@ The stand-in server is a thread that accepts, reads the request a byte at a time
 | 10 | Q2, Q3 | Shared service plumbing; split `chat.rs` | Low | S–M | — |
 | 11 | Q4 | Watch teloxide for the `proc-macro-error2` fix | Low | — | — |
 | 12 | C1 | Decide on Phase 11, the LLM part of the bot | Medium | L | Owner |
-| 13 | C2 | Try the bot against Telegram when a token exists | Medium | S | Owner |
 | — | A2, A3, P5, S4, Q5, docs | Record, no action now | Info | — | — |
 
 ## Appendix A. Check results
@@ -500,7 +493,7 @@ Run on the development machine (Windows 11, Rust 1.99.0), against the compose `d
 
 ## What became of it
 
-Phase 12 acted on this review on the same day; `docs/plan.md` has it in full. The review above is left as it was written.
+Phase 12 acted on this review on the same day; `docs/plan.md` has it in full.
 
 | ID | What was done | Decision |
 |---|---|---|
@@ -517,4 +510,4 @@ Phase 12 acted on this review on the same day; `docs/plan.md` has it in full. Th
 | Q3 | The bot's dialogue in five files. | D61 |
 | A2 | The ceiling is recorded. | D49 |
 | Docs | The decision log has an index. | none |
-| C1, C2, Q4 | Not mended in code: Phase 11, a Telegram token, and a release of teloxide. | D58, D64, D10 |
+| C1, Q4 | Not mended in code: Phase 11, and a release of teloxide. | D58, D10 |

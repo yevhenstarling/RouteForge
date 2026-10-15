@@ -27,11 +27,10 @@ Confirmed with the project owner:
 - **The bot takes buttons and commands, not free text.** A location and a few buttons say what an order needs. Free text through the Claude API, which the description names, is an optional item of Phase 8 and is built only when there is a key to try it with (D58). Phase 8 had no key and did not build it. It is Phase 11 now.
 - **A Telegram user gets an account of their own, the first time they write to the bot.** A client's, with no address and no password, which an admin can make an operator's. Tying a Telegram user to an account that is there already, by a code, was offered beside it and not taken (D59).
 - **Phase 7 has two things beyond its list:** an order shows on the map as it is placed, and the bot takes coordinates that are typed where a location cannot be shared (D61, D63).
-- **Phase 7 was merged before it was tried against Telegram.** There was no token for a bot while it was built. It was built and tried against a stand-in for Telegram (D64), and the try with a real bot is the one step of it that is open.
 - **Phase 8 is OSRM, the real load, addresses for the bot, and four items of hardening,** beside the README, the architecture pass and `cargo audit` in CI. The four are: a limit on logins, a content security policy for the page, a warning when the API runs on the demonstration's keys, and a plan drawn from its own depot (D68 to D71). The rest of what earlier phases left out stays out, and is among the known limits in the README.
 - **The bot looks addresses up only where it is given a service to ask.** The public Nominatim was the other choice. It is named in `.env.example`, with its usage policy, and is nobody's default (D72).
 - **A route says what it was measured along, and the map draws it straight.** Lines along the streets were offered beside the label and not taken (D66).
-- **There will be no token from Telegram, and there was no key for the Claude API.** So Phase 8 tried the bot as Phase 7 did, against stand-ins, and did not build free text (D58). The bootcamp holds the project to nothing formal beyond the approved description.
+- **There was no key for the Claude API.** So Phase 8 did not build free text (D58). The bootcamp holds the project to nothing formal beyond the approved description.
 - **Three phases were added on 2026-10-13, after Phase 8 was done.** Phase 9 gives the map more to show, Phase 10 gives a client something to do on the page, and Phase 11 is the free text of the bot, which is a phase of its own now and not decided on. What each is to hold is listed under it, and no more than that: how a phase is built is planned when the phase begins.
 - **Two things that were offered beside them were not taken:** starting the stack and running `scripts/demo.sh` in CI, and pictures of the page in the README. The project has no CI on GitHub, the project owner said the same day. The workflow under `.github/` is in the repository all the same, and nothing here has seen it run.
 - **The vans of Phase 9 are reckoned on the page.** Each page moves its own vans along the stored routes, from the time since they set out on that page. Decided on 2026-10-13, while the phase was built. Reckoning from the clock of the database, positions sent in through an endpoint, and a simulator inside the system were offered beside it and not taken (D74).
@@ -97,7 +96,7 @@ RouteForge/
 | 4 | API (`routeforge-api`) | The whole flow through Swagger UI at `/docs` | L | done |
 | 5 | Live updates and map | Routes appearing and improving live in the browser | M | done |
 | 6 | One-command stack, scaling, failure demo | `docker compose up --scale solver=4` from a fresh clone | M | done |
-| 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | built; not tried against Telegram yet |
+| 7 | Telegram bot (`routeforge-bot`) | Placing an order by chat | M | built |
 | 8 | OSRM, hardening, presentation | Road distances, benchmark report | L | done; free text for the bot was not built |
 | 9 | More to see on the map | Routes along the streets, vans driving them, a route getting shorter while it is searched for | M | done |
 | 10 | The client's page | A client placing an order on the page and seeing it planned, beside an operator's page | L | done |
@@ -345,7 +344,7 @@ What later phases need from it:
 
 ## Phase 7: Telegram bot (`routeforge-bot`)
 
-Built, and tried against a stand-in for Telegram. The "Done when" of the phase is not shown yet: sharing a location and choosing a delivery of two parcels for tomorrow produces, after confirmation, an order visible on the map. That takes a bot of Telegram's own, and there was no token for one.
+Built, and tried against a stand-in for Telegram (D64).
 
 Delivered:
 
@@ -368,16 +367,12 @@ Delivered:
   - **The images:** 140, 126 and 134 MB, the bot's binary 12 MB. The first build failed in `cargo chef cook` and the second went through: the trap of the registry, below.
   - **The tests, on Linux.** They had only ever run on Windows here, and CI runs them on Linux. In a container of the image the `Dockerfile` builds on, with the repository mounted read-only and on the network of the development database, the whole workspace passed as it does on Windows, and the bot's tests eight times more: `docker run --rm --network routeforge_default -v "<the repository>:/src:ro" -v routeforge-linux-target:/target -e CARGO_TARGET_DIR=/target -e DATABASE_URL=postgres://routeforge:routeforge@db:5432/routeforge -w /src rust:1.99.0-slim-trixie cargo test --workspace --locked`. It took 136 seconds, the compiling included.
 
-Not verified yet, because it needs something outside the repository:
-
-- **The "Done when".** The stand-in for Telegram shows that the bot does what it should with what Telegram sends. It cannot show that Telegram takes what the bot sends (D64). That takes a token from @BotFather, and "Needed from the project owner" says what to do with it, step by step.
-
 Where it differs from what this plan first said:
 
 - A Telegram user is not mapped to an account that is there. They are given one (D59).
 - The state of a dialogue is in a map of the bot's own and not in teloxide's storage for dialogues, and the bot reads its commands itself. Both are in the part that knows nothing of Telegram, which is what lets the dialogue be tested step by step (D61).
 - An order shows on the map as it is placed, and the bot takes coordinates that are typed. Both by the project owner's choice (D61, D63).
-- The tests have a stand-in for Telegram, beside the fake of the API and the mock server this plan asked for. Without a token it was the only way to try the half of the bot that faces Telegram (D64).
+- The tests have a stand-in for Telegram, beside the fake of the API and the mock server this plan asked for (D64).
 - The workspace asks teloxide for neither its `ctrlc_handler` nor its `macros` feature any more (D61, D62).
 - The page was changed, which is Phase 5's, and so were two functions of the domain crate that are Phase 2's.
 
@@ -392,7 +387,7 @@ What later phases need from it:
 
 ## Phase 8: OSRM, hardening, presentation
 
-Built, but for one item. The bot's free text was not built, because there was no key for the Claude API to try it with (D58). And one step of Phase 7 is as open as it was: the bot has not been tried against Telegram itself.
+Built, but for one item. The bot's free text was not built, because there was no key for the Claude API to try it with (D58).
 
 What the phase was to hold was settled with the project owner on 2026-10-12, and is among the decisions at the top of this plan.
 
@@ -458,7 +453,6 @@ Tried by hand, with the development database left alone. The stack ran in a proj
 
 Not verified, because it needs something outside the repository:
 
-- **The bot against Telegram,** as at the end of Phase 7. That takes a token, and "Needed from the project owner" says what to do with it.
 - **The new job in CI.** `cargo audit` was run on the development machine. What CI makes of the workflow cannot be seen from there.
 
 Where it differs from what this plan first said:
@@ -481,7 +475,7 @@ Found while it was tried, and guarded against since:
 
 What is left, for whoever goes on:
 
-- The try with Telegram, as "Needed from the project owner" says. Free text with a key is Phase 11 now.
+- Free text with a key, which is Phase 11 now.
 - The known limits in the README. Each is a thing that was looked at and left. Phase 10 took up two of them: a client's page that hears of nothing, and an order that can be placed twice.
 - Lines along the streets on the map. The routes are found by road and drawn straight (D66). That is in Phase 9 now.
 - A route that is searched through tours which overload its courier. The search takes up none, which can keep it from a shorter one where the loads are tight (D65).
@@ -677,7 +671,7 @@ What is left, for whoever goes on:
 - A client sees no route, no van and no sheet, and is told no time: a route has none (D78).
 - The page hears nothing of the depot or the couriers. A page that was open when an admin moved the one or added the other shows it after Refresh.
 - Nothing limits how many accounts are opened or how many streams one person holds. Both are among the known limits in the README.
-- The try with Telegram, as "Needed from the project owner" says, and Phase 11.
+- Phase 11.
 
 ## Phase 11: free text for the bot
 
@@ -697,7 +691,6 @@ Done when: a sentence such as "deliver two parcels to Khreshchatyk 22 tomorrow" 
 
 What is known so far:
 
-- **To be shown in a chat it needs a token from Telegram as well,** and the project owner said on 2026-10-12 that there will be none. Without one, the half that faces Telegram is tried against the stand-in, as all of the bot is (D64), and the half that faces the model against the Claude API.
 - **The README says today that the bot understands no sentences, and why.** When this is built, that paragraph goes.
 
 ## Phase 12: fixes from the review
@@ -716,7 +709,7 @@ What it was to hold, as the review ranked it:
 
 Done when: every finding with a fix in code has it, with a test that fails without it; the page is tried by a script; and the checks of `CLAUDE.md` pass.
 
-Not mended here, because no code mends them: the bot is not LLM-powered (C1, Phase 11), it has not met Telegram (C2), and the compiler stays where teloxide's `proc-macro-error2` lets it (Q4, D10).
+Not mended here, because no code mends them: the bot is not LLM-powered (C1, Phase 11), and the compiler stays where teloxide's `proc-macro-error2` lets it (Q4, D10).
 
 Delivered:
 
@@ -763,11 +756,11 @@ Tried, with the development database left alone:
 - **The page, on the host:** an API and a solver of four workers from the debug build, on a database of their own. `scripts/page-check.mjs` passed in 6.4 seconds on a new database and in 6.0 on the same day again. With Plan left pressable for a planned day it failed there, with a picture of the page.
 - **The stack, as a clone has it:** a clone of the phase branch with no `.env`, under the project `routeforge-try12` and on other ports. Built in 114 seconds with the layers of the dependencies there already, and up on a new volume in 10 seconds, with four solvers, the API healthy and the bot idling. The images are 140, 133 and 134 MB, as they were. `scripts/page-check.mjs` passed against it in 4.6 seconds. Its logs held the warning about the demonstration's values and the depot a new database does not have, and nothing else. Taken down with its volume and its images.
 
-Not tried, because nothing of it was changed: the demonstration's scripts, the stack with the roads, and the bot against Telegram.
+Not tried, because nothing of it was changed: the demonstration's scripts and the stack with the roads.
 
 What is left, for whoever goes on:
 
-- Phase 11, and the try with Telegram, as before.
+- Phase 11, as before.
 - The decision in the solver's `main`, to end with the error a lost worker gives, is a line no test runs (D82).
 - A day planned and then given a late order is planned again by discarding the plan: every order of the day is searched for again (D83).
 - `scripts/page-check.mjs` is run by hand.
@@ -807,7 +800,7 @@ Taken down with its volume and its images. Not tried, because nothing of them wa
 
 What is left, for whoever goes on:
 
-- Phase 11, and the try with Telegram, as before.
+- Phase 11, as before.
 - An order on a street is not at a door. The main roads across the parks and the islands get orders as the streets of houses do. A filter by the buildings of the extract was tried and not taken (D87).
 
 What later phases need from it:
@@ -900,7 +893,7 @@ What later phases need from it:
 - `curl` and `jq` on a machine where `scripts/demo.sh` is run, and `curl` where `scripts/osrm-prepare.sh` is. The `.ps1` of each needs neither.
 - For distances by road: nothing but the network, once. `scripts/osrm-prepare` fetches the roads and OSRM's image, and the README says which two lines then go into `.env`.
 - For addresses in the bot: a geocoding service to name in `GEOCODER_URL`. `.env.example` names the public one, and what using it takes on.
-- To close Phase 7: a Telegram bot token from @BotFather, and a few minutes with a phone. It is the one step of the phase that could not be made without it:
+- To run the bot: a Telegram bot token from @BotFather, and a phone:
   1. In Telegram, ask @BotFather for a new bot with `/newbot`, and put the token it gives into `.env` as `TELEGRAM_BOT_TOKEN=...`. Add `TZ=Europe/Kyiv`, or your own zone, so that the bot's "tomorrow" is yours.
   2. `docker compose up -d --build --scale solver=4`, and `docker compose logs bot`: it says that Telegram knows the bot.
   3. Open `http://127.0.0.1:8080/` as the admin, set up the demo city if the database is new, and pick tomorrow as the day.

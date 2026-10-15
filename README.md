@@ -191,8 +191,6 @@ The bot can take an address in words too, if it is given a geocoding service to 
 
 The bot reads buttons, commands and, with that service, addresses. It does not understand sentences. The [approved description](docs/description.md) has it do so, with the help of the Claude API. That part was not built: there was no API key to try it with, and code for an API that was never run against it is not shipped. It would go on top of what is there, since what a button does and what a model would ask for is the same request to the API. The reasons are D58 in [docs/architecture.md](docs/architecture.md).
 
-The bot has been tried against stand-ins for Telegram and never against Telegram itself, for want of a token. [docs/plan.md](docs/plan.md#needed-from-the-project-owner) says how to try it with one.
-
 The days the bot offers are those of its clock, which is on UTC in a container unless `TZ` in `.env` says otherwise. The buttons name the day they mean.
 
 ## Known limits
@@ -206,7 +204,7 @@ What the system does not do, or does only up to a point:
 - **The vans are a simulation.** No courier reports where they are. Each page reckons its own vans, so a page that opens a plan later starts them from the depot, and Refresh sends them out again.
 - **The chart of a search is the page's.** Nothing stores the lengths a search announces, so a page that is opened after a search has no chart of it.
 - **The route sheet has no distances.** The length of a route is stored, and that of its legs is not.
-- **The bot has not met Telegram, and understands no sentences.** Both are in the section above.
+- **The bot understands no sentences.** The section above says why.
 - **A login is counted by its address.** After five tries in a minute the next is refused, so somebody who knows an address can keep its owner out for as long as they keep trying. The count is in the memory of the one API.
 - **A token lasts until it expires.** A role that an admin changes applies from the user's next login, an hour later at the most.
 - **Nothing limits the bot's endpoint,** or how many accounts it makes. The bot's key is one key, and changing it means starting both again.

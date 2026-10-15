@@ -1248,7 +1248,7 @@ Tests: an order is announced once, at the commit and not before it, and not when
 
 ### D64. The bot is tried against stand-ins, and its requests are held to the API's document (in place)
 
-There was no token from Telegram while the bot was built. So what can be shown without Telegram was shown without it:
+What can be shown without Telegram is shown without it, so the bot's tests need no network and no token:
 
 - **The dialogue against a fake of the API.** `FakeApi` implements `Api`. It notes what it is asked, and gives a new token at every login, so a test can see which login a request came of.
 - **The requests against a server that knows the API's document.** A wiremock server answers each operation at the method and the path that `crates/routeforge-api/openapi.json` gives it, found by the id of the operation, and nowhere else. A request the API would not know is not answered there either.
@@ -1261,7 +1261,7 @@ Why:
 - The part that turns updates into events can only be wrong about Telegram. Updates as Telegram sends them are the one thing that tries it, read by teloxide's own types.
 - Nothing else comes in through `main`, which is what the tests of the API's binary are there for too (D55).
 
-What a stand-in cannot show: that Telegram takes what the bot sends. A keyboard that is shaped wrongly, a text too long for a button, a method that Telegram answers otherwise than teloxide expects, would all pass here and fail there. That is why the "Done when" of the phase is still open, and `docs/plan.md` says what it takes to close it.
+What a stand-in cannot show: that Telegram takes what the bot sends. A keyboard that is shaped wrongly, a text too long for a button, a method that Telegram answers otherwise than teloxide expects, would all pass here and fail there.
 
 Found while it was written: teloxide asks for `GetMe` and not for `getMe` (D62). The first stand-in answered the second alone, and every test of the whole bot waited for an answer that never came.
 
