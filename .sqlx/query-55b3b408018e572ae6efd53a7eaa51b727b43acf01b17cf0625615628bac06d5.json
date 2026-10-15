@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH released AS (\n             UPDATE jobs\n             SET status = 'queued', attempt = attempt - 1, claimed_by = NULL, lease_expires_at = NULL\n             WHERE id = $1 AND status = 'running' AND claimed_by = $2 AND attempt = $3\n             RETURNING kind, plan_id\n         )\n         SELECT pg_notify($4, kind) AS workers, pg_notify($5, plan_id::text) AS watchers\n         FROM released",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workers",
+        "type_info": "Void",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "watchers",
+        "type_info": "Void",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "55b3b408018e572ae6efd53a7eaa51b727b43acf01b17cf0625615628bac06d5"
+}

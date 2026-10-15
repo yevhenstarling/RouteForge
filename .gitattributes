@@ -1,0 +1,9 @@
+# LF everywhere, so shell scripts and Dockerfiles work when checked out on Windows.
+* text=auto eol=lf
+
+# Vendored files are kept byte for byte, so that they can be checked against the
+# release they were taken from.
+web/vendor/** -text
+
+# The points demo orders lie on: numbers that scripts/streets.mjs writes (D87).
+crates/routeforge-api/data/*.bin binary

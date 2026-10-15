@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: routeforge
+          POSTGRES_PASSWORD: routeforge
+          POSTGRES_DB: routeforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U routeforge -d routeforge"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      # For the tests, which make a database each, and for `cargo sqlx`. The build does
+      # not use it: .cargo/config.toml sets SQLX_OFFLINE, so queries are checked against
+      # the metadata in .sqlx/.
+      DATABASE_URL: postgres://routeforge:routeforge@localhost:5432/routeforge
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs the toolchain and components named in rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The bot must build without the `db` feature of routeforge-domain.
+      - name: Bot builds without database code
+        run: cargo check -p routeforge-bot --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # Postgres only and no TLS, so it needs no OpenSSL. The same command as in
+      # scripts/sqlx-prepare.
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres
+
+      # Fails when a query or a migration has changed and .sqlx/ was not regenerated.
+      - name: Query metadata is up to date
+        run: |
+          cargo sqlx migrate run --source crates/routeforge-domain/migrations
+          cargo sqlx prepare --workspace --check -- --all-targets
+
+  # The dependencies in Cargo.lock against the advisory database as it is on the day.
+  # A job of its own: an advisory that is published tomorrow fails this and leaves
+  # the checks of the code as they were. What is ignored, and why, is in
+  # .cargo/audit.toml (D12).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Audit
+        run: cargo audit
+
+  # The image `docker compose up` builds. It has to build from the base image alone:
+  # with no database (D28) and with no native library that the base does not have (D12).
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the solver image
+        run: docker build --target solver --tag routeforge-solver .

@@ -1,0 +1,29 @@
+[package]
+name = "routeforge-bot"
+description = "RouteForge Telegram bot: places orders through the HTTP API, by buttons and commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Without the `db` feature: the bot reaches the system only through the HTTP API.
+# `service` is the logging and the stop signal the three services share (D81).
+routeforge-domain = { workspace = true, features = ["service"] }
+
+anyhow.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+teloxide.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

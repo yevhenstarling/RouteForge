@@ -1,0 +1,164 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH placed AS (\n               INSERT INTO orders (id, client_id, kind, service_date, lat, lon, address, demand,\n                                   idempotency_key)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n               ON CONFLICT (client_id, idempotency_key) WHERE idempotency_key IS NOT NULL\n               DO UPDATE SET idempotency_key = orders.idempotency_key\n               RETURNING id, client_id, kind, status, service_date, lat, lon, address, demand,\n                         plan_id, created_at\n           )\n           SELECT id AS \"id!\", client_id AS \"client_id!\", kind AS \"kind!\", status AS \"status!\",\n                  service_date AS \"service_date!\", lat AS \"lat!\", lon AS \"lon!\", address,\n                  demand AS \"demand!\", plan_id, created_at AS \"created_at!\",\n                  CASE WHEN id = $1\n                       THEN pg_notify($10, to_char(service_date, 'YYYY-MM-DD'))\n                  END AS watchers\n           FROM placed",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "client_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "client_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "service_date!",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "service_date"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "lat!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "lat"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "lon!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "lon"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "address",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "address"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "demand!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "demand"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "plan_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "plan_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "orders",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "watchers",
+        "type_info": "Void",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Date",
+        "Float8",
+        "Float8",
+        "Text",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      null
+    ]
+  },
+  "hash": "bf299265a053b863dfbdd5e7e07cec585aea9567aea7e28ae0f4cc5591bbd245"
+}

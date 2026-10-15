@@ -1,0 +1,196 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, service_date, depot_id, status, seed, budget_time_ms, budget_iterations,\n                created_by, orders_total, orders_unassigned, routes_total, routes_done, error,\n                created_at, finished_at\n         FROM plans\n         WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "service_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "service_date"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "depot_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "depot_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "seed",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "seed"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "budget_time_ms",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "budget_time_ms"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "budget_iterations",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "budget_iterations"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "orders_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "orders_total"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "orders_unassigned",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "orders_unassigned"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "routes_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "routes_total"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "routes_done",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "routes_done"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "error"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "plans",
+            "name": "finished_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "d7ba86f647695a067862e08316f907c96273b35858458d7b78ea025e0be8c611"
+}

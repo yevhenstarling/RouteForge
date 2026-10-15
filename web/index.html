@@ -1,0 +1,2081 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RouteForge</title>
+<!-- An empty icon, so that the browser does not ask the API for one. -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<style>
+  :root {
+    --ink: #1c2330;
+    --muted: #5d6675;
+    --line: #d9dde3;
+    --paper: #ffffff;
+    --wash: #f5f6f8;
+    --accent: #1f5fbf;
+    --bad: #b3261e;
+    --good: #1e7d46;
+    --warn: #a15c00;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex;
+    flex-direction: column;
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--ink);
+    background: var(--wash);
+  }
+  h1 { font-size: 17px; margin: 0 8px 0 0; }
+  h2 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  p { margin: 4px 0; }
+  button, input, select { font: inherit; color: inherit; }
+  button {
+    padding: 4px 10px;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: var(--paper);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { color: var(--muted); cursor: default; opacity: .6; }
+  button.main { border-color: var(--accent); background: var(--accent); color: #fff; }
+  input, select { padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+  input[type="number"] { width: 5.5em; }
+  label { color: var(--muted); }
+  label > input, label > select { margin-left: 4px; color: var(--ink); }
+
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--paper);
+  }
+  .spacer { flex: 1; }
+  .link::before { content: "\25CF  "; }
+  .link.live { color: var(--good); }
+  .link.lost { color: var(--warn); }
+
+  main { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 390px; }
+  /* What shows where there are no tiles: paper with a faint grid, and not a hole. */
+  #map {
+    min-height: 0;
+    background-color: #f1efe9;
+    background-image:
+      linear-gradient(#e4e1d8 1px, transparent 1px),
+      linear-gradient(90deg, #e4e1d8 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+  /* Leaflet listens for the focus of whatever has a tooltip, and to the browser a line
+     that is listened to like that is one a click gives the focus to. It then draws the
+     outline of the focus as a box round the whole of a route. Nothing on the map is
+     reached by keyboard, so nobody loses their place without it. */
+  .leaflet-interactive:focus { outline: none; }
+  aside { overflow-y: auto; padding: 4px 14px 20px; border-left: 1px solid var(--line); background: var(--paper); }
+  section { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  section:last-child { border-bottom: 0; }
+  form.row, .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+
+  #message { min-height: 1.4em; margin: 8px 0 0; }
+  #message.error { color: var(--bad); }
+  .note { color: var(--muted); }
+  .status { font-weight: 600; }
+  .status.queued, .status.routing { color: var(--accent); }
+  .status.done { color: var(--good); }
+  .status.failed { color: var(--bad); }
+  .status.cancelled, .status.discarded { color: var(--muted); }
+
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: grid; grid-template-columns: 14px 1fr auto; gap: 2px 8px; align-items: baseline; padding: 4px 0; }
+  li .swatch { width: 12px; height: 12px; border-radius: 3px; align-self: center; }
+  li .name { font-weight: 600; }
+  li .numbers { font-variant-numeric: tabular-nums; text-align: right; }
+  li .detail { grid-column: 2 / 4; color: var(--muted); }
+  /* The length of a route while it was searched for. It is stretched to the width of
+     its row, and its lines keep their thickness all the same. */
+  li .chart { grid-column: 2 / 4; width: 100%; height: 30px; }
+  .chart path { fill: none; vector-effect: non-scaling-stroke; }
+  .chart .floor { stroke: var(--line); stroke-width: 1; }
+  .chart .fall { stroke-width: 1.6; stroke-linejoin: round; }
+  button.small { padding: 1px 8px; font-size: 12px; }
+  li .sheet { grid-column: 2 / 4; justify-self: start; margin: 2px 0; }
+  /* An order of one's own: a row that shows it on the map, with what can be done to it. */
+  li.order { cursor: pointer; }
+  li.order:hover { background: var(--wash); }
+  li.shown, li.shown:hover { background: #e3edfb; }
+  li .acts { grid-column: 2 / 4; display: flex; gap: 6px; margin: 2px 0; }
+  .numbers.planned { color: var(--good); }
+  .numbers.cancelled { color: var(--muted); }
+  #order-address { width: 15em; }
+
+  /* The route sheet: long for a long route, so it scrolls by itself. */
+  #sheet-rows { max-height: 44vh; overflow-y: auto; margin-top: 6px; border: 1px solid var(--line); border-radius: 5px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 3px 6px; text-align: left; vertical-align: baseline; border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; font-size: 12px; font-weight: 600; color: var(--muted); background: var(--wash); }
+  tr:last-child td { border-bottom: 0; }
+  .count { text-align: right; white-space: nowrap; }
+  tr.stop { cursor: pointer; }
+  tr.stop:hover { background: var(--wash); }
+  tr.shown, tr.shown:hover { background: #e3edfb; }
+  tr.depot td { color: var(--muted); }
+
+  #login-view { flex: 1; display: grid; place-items: center; }
+  #login { display: grid; gap: 10px; width: 300px; padding: 22px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
+  #login label { display: grid; gap: 3px; }
+  #login label > input { margin: 0; padding: 6px 8px; }
+  #login-message { min-height: 1.4em; margin: 0; color: var(--bad); }
+
+  @media (max-width: 820px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 55vh auto; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+
+<div id="login-view" hidden>
+  <form id="login">
+    <h1>RouteForge</h1>
+    <label>Email <input type="email" id="email" autocomplete="username" required></label>
+    <label>Password <input type="password" id="password" autocomplete="current-password" required></label>
+    <button type="submit" class="main">Log in</button>
+    <button type="button" id="register">Open an account</button>
+    <p class="note">An account places orders and sees its own. Its password has 8 characters or more.</p>
+    <p id="login-message" role="alert"></p>
+  </form>
+</div>
+
+<header id="bar" hidden>
+  <h1>RouteForge</h1>
+  <label>Day <input type="date" id="date" required></label>
+  <button type="button" id="refresh">Refresh</button>
+  <span id="link" class="link" hidden></span>
+  <span class="spacer"></span>
+  <label><input type="checkbox" id="tiles" checked> Map tiles</label>
+  <span id="who" class="note"></span>
+  <button type="button" id="logout">Log out</button>
+</header>
+
+<main id="app" hidden>
+  <div id="map"></div>
+  <aside>
+    <p id="message" role="status" aria-live="polite"></p>
+
+    <section>
+      <h2>Day</h2>
+      <p id="orders-summary"></p>
+      <div id="setup" hidden>
+        <p class="note" id="setup-note"></p>
+        <div class="row"><button type="button" id="set-up">Set up a demo city</button></div>
+      </div>
+      <form id="demo" class="row" hidden>
+        <label>Orders <input type="number" id="demo-count" min="1" max="2000" value="1200" required></label>
+        <label>Seed <input type="number" id="demo-seed" min="0" max="4294967295" value="1" required></label>
+        <button type="submit" id="generate">Generate demo orders</button>
+      </form>
+      <p id="order-hint" class="note"></p>
+    </section>
+
+    <section id="order" hidden>
+      <h2>New order</h2>
+      <p id="order-line"></p>
+      <form id="order-form" class="row">
+        <label>Kind
+          <select id="order-kind">
+            <option value="delivery">Delivery to here</option>
+            <option value="pickup">Pickup from here</option>
+          </select>
+        </label>
+        <label>Parcels <input type="number" id="order-parcels" min="1" max="5" value="1" required></label>
+        <label>Address <input type="text" id="order-address" maxlength="300" placeholder="if you like"></label>
+        <button type="submit" class="main" id="place">Place the order</button>
+        <button type="button" id="order-drop">Cancel</button>
+      </form>
+    </section>
+
+    <section id="mine" hidden>
+      <h2>Your orders</h2>
+      <p id="mine-note" class="note"></p>
+      <ul id="order-list"></ul>
+    </section>
+
+    <section id="planning" hidden>
+      <h2>Plan</h2>
+      <p id="no-plan" class="note">No plan for this day yet.</p>
+      <label id="plan-choice" hidden>Plans of the day <select id="plans"></select></label>
+      <p id="plan-line"></p>
+      <p id="plan-error" class="note"></p>
+      <form id="plan-form" class="row">
+        <label>Budget <input type="number" id="budget" min="0" step="any" placeholder="10"></label>
+        <select id="budget-unit" aria-label="What the budget counts">
+          <option value="seconds">seconds a route</option>
+          <option value="moves">million moves a route</option>
+        </select>
+        <label>Seed <input type="number" id="seed" min="0" max="4294967295" placeholder="any"></label>
+        <button type="submit" class="main" id="plan">Plan</button>
+        <button type="button" id="cancel">Cancel</button>
+        <button type="button" id="discard">Discard</button>
+      </form>
+    </section>
+
+    <section id="routes" hidden>
+      <h2>Routes</h2>
+      <ul id="route-list"></ul>
+      <p id="routes-total" class="note"></p>
+      <div id="vans" hidden>
+        <div class="row"><button type="button" id="drive">Drive the routes</button></div>
+        <p id="vans-note" class="note"></p>
+      </div>
+    </section>
+
+    <section id="sheet" hidden>
+      <h2>Route sheet</h2>
+      <p id="sheet-line"></p>
+      <p class="note">A row shows its stop on the map.</p>
+      <div id="sheet-rows">
+        <table>
+          <thead>
+            <tr><th class="count">#</th><th>Stop</th><th class="count">Parcels</th><th class="count">On board</th></tr>
+          </thead>
+          <tbody id="sheet-body"></tbody>
+        </table>
+      </div>
+      <div class="row"><button type="button" id="sheet-close">Close</button></div>
+    </section>
+
+    <section id="system" hidden>
+      <h2>Queue and workers</h2>
+      <p id="queue"></p>
+      <p id="workers-line" class="note"></p>
+      <ul id="workers"></ul>
+    </section>
+  </aside>
+</main>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script>
+(() => {
+'use strict';
+
+// Where the demo city is set up, and where the map looks before there is a depot.
+const KYIV = { lat: 50.45, lon: 30.52 };
+// The one thing the page asks another host for. The switch in the bar turns it off,
+// and everything but the streets is drawn without it.
+const TILES = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const TILE_CREDIT = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+// A courier's colour is its place in the list of couriers, which is the order they
+// were added in. So a courier keeps its colour from plan to plan.
+const COLOURS = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf',
+  '#e377c2', '#8c564b', '#bcbd22', '#3a5fcd', '#008080', '#b8860b'];
+const NO_COURIER = '#8a8f98';
+// How many vans the demo city has: more than the four solvers of the stack as it is
+// shown, so that routes wait in the queue for a solver (D88).
+const VANS = 6;
+// The share of the demo orders that are deliveries: four in five (D46).
+const DELIVERED = 0.8;
+// What the length of a route was measured along, as the API says it and in words (D66).
+const ALONG = { road: 'by road', great_circle: 'as the crow flies' };
+const SESSION = 'routeforge.session';
+// How often the orders of the day are read again without anybody having said that one
+// was placed. Whoever places one says so, but a word like that can be lost.
+const ORDERS_EVERY_MS = 30000;
+// How much of a route's length the chart of its search shows: from the shortest length
+// so far up to this share above it, and what is longer runs off the top. A search
+// loses a fifth of the length in its first quarter of a second, and a hundredth or two
+// in all the seconds after (D49). On a scale from the first length to the last that is
+// a cliff and a flat line, and the fall that goes on would not be seen.
+const CHART_SHARE = 0.02;
+// The chart as it is reckoned. It is stretched to the row it is shown in.
+const CHART = { width: 100, height: 30 };
+// How thick the line of a stored route is, and that of the route whose sheet is open.
+const ROUTE_WEIGHT = 3;
+const OPEN_ROUTE_WEIGHT = 5.5;
+// How long the vans take over the longest route of a plan, in milliseconds. They all
+// drive at one speed, so a van with a shorter route is back sooner (D74).
+const DRIVE_MS = 60000;
+// The header a key travels in that makes placing an order safe to repeat (D76).
+const KEY_HEADER = 'Idempotency-Key';
+// What is said when an order went out and no answer came back. The API may have placed
+// it all the same, and asked again with the same key it places it once.
+const NO_ANSWER = 'The API did not answer, so the order may or may not be placed. '
+  + 'Press the button again: it is placed once, however often it is asked for.';
+
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  session: null,        // { token, user, expiresAt }
+  date: today(),
+  depot: null,
+  planDepot: null,      // the depot the shown plan was made for, if it has moved since
+  couriers: [],
+  orders: new Map(),    // id -> order, those of the day
+  plans: [],            // those of the day, newest first
+  planId: null,         // the plan that is shown
+  plan: null,
+  jobs: [],             // its route jobs
+  progress: new Map(),  // job id -> what its search last announced
+  routes: [],           // its stored routes
+  sheetOf: null,        // the courier whose route sheet is open
+  shownStop: null,      // the order whose stop the sheet last showed on the map
+  stats: null,
+  stops: new Map(),     // order id -> where a planned order of one's own is on its route
+  draft: null,          // the order that is being put together: { lat, lon, key, keyFor }
+  shownOrder: null,     // the order of one's own that was last shown on the map
+};
+
+let map = null;
+let tiles = null;
+const layers = {};
+// What each kind of thing on the map is drawn with. See `makeMap`.
+let dots = null;
+let lines = null;
+const markers = new Map();      // order id -> its dot on the map
+const provisional = new Map();  // job id -> the dashed line of a search under way
+const ways = new Map();         // route id -> the way of a stored route, as points
+const searches = new Map();     // job id -> the lengths its search announced, for its chart
+const rows = new Map();         // job id -> its row in the list of routes, and what it says
+const routeLines = new Map();   // courier id -> the line of its stored route on the map
+let sheetSays = '';             // what the open route sheet was last written from
+const vans = new Map();         // route id -> a van on the map, and the track it drives
+let drive = null;               // { since, speed, frame } while the vans are on their way
+let setOutFor = null;           // the plan whose vans have set out by themselves
+let haveDriven = false;         // whether the vans of the shown plan have driven here
+let areBack = false;            // whether they got to the end of their routes
+const orderRows = new Map();    // order id -> its row in the list of one's own orders, and what it says
+const elsewhere = new Set();    // plans that were heard of and are of another day than the one shown
+const heardOf = new Set();      // plans that were heard of since the plans of the day were last read
+// Whether each stream is open; null if it is not wanted.
+const link = { plan: null, stats: null, orders: null };
+let stopWatchingPlan = () => {};
+let stopWatchingStats = () => {};
+let stopWatchingOrders = () => {};
+let routesAsked = 0;
+let ordersTimer = null;
+let ordersEvery = null;         // the timer of the reads that nobody asked for
+let plansTimer = null;
+
+// ---------------------------------------------------------------- small things
+
+function today() {
+  const now = new Date();
+  const two = (number) => String(number).padStart(2, '0');
+  return `${now.getFullYear()}-${two(now.getMonth() + 1)}-${two(now.getDate())}`;
+}
+
+const isStaff = () => state.session !== null && state.session.user.role !== 'client';
+const isAdmin = () => state.session !== null && state.session.user.role === 'admin';
+// Whether an order can be placed for the day that is shown: not for one that has passed.
+// The days are written as `2026-10-14`, which sorts as the days do.
+const canOrder = () => state.date >= today();
+const isActive = (plan) => plan !== null && (plan.status === 'queued' || plan.status === 'routing');
+const km = (metres) => `${(metres / 1000).toFixed(2)} km`;
+const moves = (count) => (count >= 1e6 ? `${(count / 1e6).toFixed(1)} M moves` : `${count} moves`);
+const point = (location) => [location.lat, location.lon];
+
+/** An element with a class and a text. Text from the API only ever gets in this way. */
+function el(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function say(text, isError = false) {
+  $('message').textContent = text;
+  $('message').classList.toggle('error', isError);
+}
+
+function colourOf(courierId) {
+  const at = state.couriers.findIndex((courier) => courier.id === courierId);
+  return at < 0 ? NO_COURIER : COLOURS[at % COLOURS.length];
+}
+
+/**
+ * What a courier has on board along a route (D65): first as it leaves the depot, and
+ * then after each stop. It leaves with every delivery. A delivery comes off at its
+ * stop, and a pickup comes on at its own.
+ */
+function onBoardAlong(stops) {
+  let onBoard = 0;
+  for (const stop of stops) {
+    if (stop.kind === 'delivery') onBoard += stop.demand;
+  }
+  const loads = [onBoard];
+  for (const stop of stops) {
+    onBoard += stop.kind === 'pickup' ? stop.demand : -stop.demand;
+    loads.push(onBoard);
+  }
+  return loads;
+}
+
+/** What a stored route has its courier carry, in words: `at most 131 of 132 on board`. */
+function carried(route) {
+  const courier = state.couriers.find((known) => known.id === route.courier_id);
+  // The route sheet writes out the same loads, so the two cannot disagree.
+  const most = Math.max(...onBoardAlong(route.stops));
+  return courier ? `at most ${most} of ${courier.capacity} on board` : `at most ${most} on board`;
+}
+
+/** What a stored route's length was measured along: `by road`, or `as the crow flies`. */
+function along(route) {
+  return ALONG[route.distances] || String(route.distances);
+}
+
+/**
+ * What is to be said of how a stored route is drawn. A route by road is drawn along
+ * the streets it takes, unless the routing service did not say which they are (D73).
+ */
+function drawn(route) {
+  return route.distances === 'road' && !route.path ? ', drawn from stop to stop' : '';
+}
+
+/**
+ * The points of a line that is written as an encoded polyline with six decimal places
+ * (D73): each point as how far it is from the one before, the latitude first, five bits
+ * to a letter. The API sends nothing as a line that is not one.
+ */
+function pointsOf(line) {
+  const points = [];
+  let at = 0;
+  const number = () => {
+    let written = 0;
+    let bits = 0;
+    let six;
+    do {
+      six = line.charCodeAt(at) - 63;
+      at += 1;
+      // Not with `<<`, which reckons in 32 bits where a number may take 35.
+      written += (six & 31) * 2 ** bits;
+      bits += 5;
+    } while (six >= 32);
+    // The lowest bit is the sign: a number below nought was written as its complement.
+    return written % 2 === 1 ? -(written + 1) / 2 : written / 2;
+  };
+  let lat = 0;
+  let lon = 0;
+  while (at < line.length) {
+    lat += number();
+    lon += number();
+    points.push([lat / 1e6, lon / 1e6]);
+  }
+  return points;
+}
+
+/**
+ * What a stored route is drawn with: the way it takes along the streets, where it has
+ * one, and otherwise the straight line from the depot through its stops and back.
+ */
+function trackOf(route, depot) {
+  if (route.path) {
+    // The routes are read again whenever their plan changes, and a way is thousands
+    // of points.
+    if (!ways.has(route.id)) ways.set(route.id, pointsOf(route.path));
+    const way = ways.get(route.id);
+    if (way.length > 1) return way;
+  }
+  return [point(depot.location), ...route.stops.map((stop) => point(stop.location)), point(depot.location)];
+}
+
+function nameOf(courierId) {
+  const courier = state.couriers.find((known) => known.id === courierId);
+  return courier ? courier.name : `Courier ${courierId.slice(-4)}`;
+}
+
+// ---------------------------------------------------------------- the API
+
+/** An answer of the API that is no success, with the problem it sent (RFC 9457). */
+class Refused extends Error {
+  constructor(status, problem) {
+    super(problem && problem.detail ? problem.detail : `The API answered ${status}.`);
+    this.status = status;
+    this.problem = problem;
+  }
+}
+
+/** An order that went out and got no answer: it may be placed, or not (D76). */
+class Unanswered extends Error {
+  constructor() {
+    super(NO_ANSWER);
+  }
+}
+
+function describe(error) {
+  if (error instanceof Unanswered) return error.message;
+  if (!(error instanceof Refused)) return 'The API cannot be reached.';
+  const fields = error.problem && error.problem.errors ? error.problem.errors : [];
+  return [error.message, ...fields.map((field) => `${field.field} ${field.message}.`)].join(' ');
+}
+
+async function api(method, path, body, more) {
+  const headers = { ...more };
+  if (state.session) headers.Authorization = `Bearer ${state.session.token}`;
+  const request = { method, headers };
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    request.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, request);
+  const text = await response.text();
+  let answer = null;
+  try {
+    answer = text ? JSON.parse(text) : null;
+  } catch {
+    // Not JSON, so not from the API: something between it and the page answered.
+  }
+  if (response.ok) return answer;
+  // A token lasts an hour. With one that is over, the page is back at the login.
+  if (response.status === 401 && state.session) sessionEnded();
+  throw new Refused(response.status, answer);
+}
+
+/** Runs what a button asks for, and says so if it is refused. */
+async function act(button, action) {
+  button.disabled = true;
+  try {
+    await action();
+  } catch (error) {
+    if (state.session) say(describe(error), true);
+  } finally {
+    button.disabled = false;
+    if (state.session) renderPlan();
+  }
+}
+
+// ---------------------------------------------------------------- event streams
+
+/**
+ * Reads an event stream and hands each event to the handler of its name. Returns what
+ * stops it.
+ *
+ * It is read with `fetch`, because `EventSource` cannot send the token. A stream that
+ * ends is opened again, after a pause that grows: the API ends it when the token has
+ * expired, and the answer to the next attempt then sends the page back to the login.
+ * A stream that is opened starts with everything as it is, so nothing is missed.
+ */
+function watch(path, handlers, isOpen) {
+  const stop = new AbortController();
+  const pauseFor = (ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    stop.signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); });
+  });
+
+  const handle = (block) => {
+    let name = null;
+    let data = '';
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event: ')) name = line.slice(7);
+      else if (line.startsWith('data: ')) data += line.slice(6);
+      // A line that starts with a colon is a comment, sent to keep the stream open.
+    }
+    if (name !== null && handlers[name]) handlers[name](JSON.parse(data));
+  };
+
+  (async () => {
+    let pause = 1000;
+    while (!stop.signal.aborted) {
+      try {
+        const response = await fetch(path, {
+          headers: { Authorization: `Bearer ${state.session.token}`, Accept: 'text/event-stream' },
+          signal: stop.signal,
+        });
+        if (response.status === 401) return sessionEnded();
+        // Nothing to watch any more: the plan is not there.
+        if (response.status === 404) return isOpen(null);
+        if (response.ok) {
+          isOpen(true);
+          pause = 1000;
+          const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+          let arrived = '';
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            arrived += value;
+            let end = arrived.indexOf('\n\n');
+            while (end >= 0) {
+              handle(arrived.slice(0, end));
+              arrived = arrived.slice(end + 2);
+              end = arrived.indexOf('\n\n');
+            }
+          }
+        }
+      } catch {
+        // The API is away, or the stream was stopped. The loop tells which.
+      }
+      if (stop.signal.aborted) return;
+      isOpen(false);
+      await pauseFor(pause);
+      pause = Math.min(pause * 2, 10000);
+    }
+  })();
+
+  return () => stop.abort();
+}
+
+function renderLink() {
+  const wanted = [link.plan, link.stats, link.orders].filter((open) => open !== null);
+  const element = $('link');
+  element.hidden = wanted.length === 0;
+  const lost = wanted.includes(false);
+  element.className = `link ${lost ? 'lost' : 'live'}`;
+  element.textContent = lost ? 'reconnecting' : 'live';
+}
+
+// ---------------------------------------------------------------- the map
+
+function makeMap() {
+  map = L.map('map').setView(point(KYIV), 12);
+  // The stops are dots on a canvas, which takes the two thousand of a large day in its
+  // stride. The routes are lines in SVG, a handful of them, laid over the canvas: so a
+  // line is never hidden under the dots it joins, whichever was drawn last. The depot
+  // has a pane of its own above both.
+  dots = L.canvas({ padding: 0.5 }).addTo(map);
+  lines = L.svg({ padding: 0.5 }).addTo(map);
+  map.createPane('depot').style.zIndex = 450;
+  // The vans drive above everything that stands still.
+  map.createPane('vans').style.zIndex = 460;
+  tiles = L.tileLayer(TILES, { maxZoom: 19, attribution: TILE_CREDIT });
+  let warned = false;
+  tiles.on('tileerror', () => {
+    if (warned) return;
+    warned = true;
+    say('The map tiles cannot be loaded. Everything else is drawn without them.');
+  });
+  for (const name of ['routes', 'provisional', 'stops', 'depot', 'mark', 'pick', 'draft', 'vans']) {
+    layers[name] = L.layerGroup().addTo(map);
+  }
+  // A click on the map begins an order there. What is drawn on the map and is clicked
+  // for itself, a stop or a route or a van, keeps its click to itself: each is made
+  // with `bubblingMouseEvents: false`.
+  map.on('click', (event) => beginOrder(event.latlng.wrap()));
+  let wanted = true;
+  try {
+    wanted = localStorage.getItem('routeforge.tiles') !== 'off';
+  } catch {
+    // No storage: the switch starts as it is drawn, which is on.
+  }
+  $('tiles').checked = wanted;
+  showTiles();
+}
+
+function showTiles() {
+  const wanted = $('tiles').checked;
+  if (wanted) tiles.addTo(map);
+  else tiles.remove();
+  try {
+    localStorage.setItem('routeforge.tiles', wanted ? 'on' : 'off');
+  } catch {
+    // Not remembered, then.
+  }
+}
+
+/** A tooltip of plain text: what it says comes from the API. */
+const tip = (text) => () => el('span', '', text);
+
+function drawDepot() {
+  layers.depot.clearLayers();
+  if (state.planDepot) {
+    // Where the routes of the shown plan start: the depot as it was when the plan was
+    // made (D21). Drawn fainter than the depot there is now, and under it.
+    L.circleMarker(point(state.planDepot.location), {
+      pane: 'depot', radius: 9, color: '#6b7280', weight: 3, dashArray: '4 3', fillColor: '#fff', fillOpacity: 1,
+      bubblingMouseEvents: false,
+    }).bindTooltip(tip(`The depot of this plan: ${state.planDepot.name}`)).addTo(layers.depot);
+  }
+  if (!state.depot) return;
+  L.circleMarker(point(state.depot.location), {
+    pane: 'depot', radius: 9, color: '#111', weight: 3, fillColor: '#fff', fillOpacity: 1,
+    bubblingMouseEvents: false,
+  }).bindTooltip(tip(`Depot: ${state.depot.name}`)).addTo(layers.depot);
+}
+
+/**
+ * Where the routes of the shown plan start and end: the depot the plan was made for
+ * (D21). That is the depot as it is now, unless the depot was moved since. Then it is
+ * the one the plan names, once the page has read it, and nothing until then: a route
+ * drawn from the wrong place would be a wrong route.
+ */
+function depotOfPlan() {
+  const plan = state.plan;
+  if (!plan || (state.depot && plan.depot_id === state.depot.id)) return state.depot;
+  return state.planDepot && state.planDepot.id === plan.depot_id ? state.planDepot : null;
+}
+
+/** Reads the depot of the shown plan, if that is no longer the depot there is. */
+async function loadPlanDepot() {
+  const plan = state.plan;
+  if (!plan || (state.depot && plan.depot_id === state.depot.id)) return;
+  if (state.planDepot && state.planDepot.id === plan.depot_id) return;
+  const depot = await api('GET', `/api/depots/${plan.depot_id}`);
+  // Another plan was picked while this was read.
+  if (!state.plan || state.plan.depot_id !== depot.id) return;
+  state.planDepot = depot;
+  drawDepot();
+  drawRoutes();
+  for (const job of state.jobs) {
+    const announced = state.progress.get(job.job_id);
+    if (announced && job.status === 'running') drawProvisional(job, announced);
+  }
+  // The vans waited for the place they set out from.
+  vansSetOut();
+}
+
+/** Which courier each order of the shown plan is with: by its routes, and by its jobs. */
+function couriersOfOrders() {
+  const courierOf = new Map();
+  // A plan that failed, was cancelled or was discarded has given its orders back.
+  if (!state.plan || (state.plan.status !== 'routing' && state.plan.status !== 'done')) return courierOf;
+  for (const job of state.jobs) {
+    if (job.status === 'cancelled' || job.status === 'failed') continue;
+    for (const orderId of job.order_ids) courierOf.set(orderId, job.courier_id);
+  }
+  for (const route of state.routes) {
+    for (const stop of route.stops) courierOf.set(stop.order_id, route.courier_id);
+  }
+  return courierOf;
+}
+
+/** How large a dot is: smaller on a day with many, so that they do not run into one mass. */
+function dotRadius() {
+  const stops = state.orders.size;
+  if (stops > 1200) return 3;
+  if (stops > 500) return 3.6;
+  return stops > 200 ? 4.4 : 5.2;
+}
+
+function styleOf(order, courierOf) {
+  const courierId = courierOf.get(order.id);
+  // Grey while no plan has it, and dark when a plan other than the one shown has.
+  const colour = courierId ? colourOf(courierId) : (order.status === 'planned' ? '#3f4651' : NO_COURIER);
+  return {
+    renderer: dots,
+    radius: dotRadius(),
+    color: colour,
+    weight: 2,
+    fillColor: colour,
+    // A delivery is a full dot, and a pickup is a ring.
+    fillOpacity: order.kind === 'pickup' ? 0.1 : 0.85,
+    // A click on an order is no click on the map: it begins no order under it.
+    bubblingMouseEvents: false,
+  };
+}
+
+function drawStops() {
+  layers.stops.clearLayers();
+  markers.clear();
+  const courierOf = couriersOfOrders();
+  for (const order of state.orders.values()) {
+    if (order.status === 'cancelled') continue;
+    const words = [order.kind === 'pickup' ? 'Pickup' : 'Delivery', `demand ${order.demand}`];
+    if (order.address) words.push(order.address);
+    const marker = L.circleMarker(point(order.location), styleOf(order, courierOf))
+      .bindTooltip(tip(words.join(', ')))
+      // To a client the map and the list of their orders point at each other.
+      .on('click', () => pickOrder(order.id))
+      .addTo(layers.stops);
+    markers.set(order.id, marker);
+  }
+}
+
+function colourStops() {
+  const courierOf = couriersOfOrders();
+  for (const [orderId, marker] of markers) {
+    const order = state.orders.get(orderId);
+    if (order) marker.setStyle(styleOf(order, courierOf));
+  }
+}
+
+function dropProvisional(jobId) {
+  const line = provisional.get(jobId);
+  if (line) line.remove();
+  provisional.delete(jobId);
+}
+
+function dropAllProvisional() {
+  for (const jobId of [...provisional.keys()]) dropProvisional(jobId);
+}
+
+/** The route a search has so far, as a dashed line that moves while the search goes on. */
+function drawProvisional(job, progress) {
+  const depot = depotOfPlan();
+  if (!depot || !progress.order) return;
+  const stops = [];
+  for (const place of progress.order) {
+    const order = state.orders.get(job.order_ids[place]);
+    if (!order) {
+      // An order the page has not read yet. It will have by the next announcement.
+      loadOrdersSoon();
+      return;
+    }
+    stops.push(point(order.location));
+  }
+  const round = [point(depot.location), ...stops, point(depot.location)];
+  const line = provisional.get(job.job_id);
+  if (line) {
+    line.setLatLngs(round);
+    return;
+  }
+  provisional.set(job.job_id, L.polyline(round, {
+    renderer: lines, interactive: false, color: colourOf(job.courier_id), weight: 2.2,
+    opacity: 0.95, dashArray: '7 6',
+  }).addTo(layers.provisional));
+}
+
+function drawRoutes() {
+  layers.routes.clearLayers();
+  routeLines.clear();
+  const depot = depotOfPlan();
+  if (!depot) return;
+  for (const route of state.routes) {
+    const words = `${nameOf(route.courier_id)}: ${km(route.distance_m)} ${along(route)}${drawn(route)}, `
+      + `${route.stops.length} stops, ${carried(route)}. A click opens its sheet.`;
+    const track = trackOf(route, depot);
+    const weight = state.sheetOf === route.courier_id ? OPEN_ROUTE_WEIGHT : ROUTE_WEIGHT;
+    const line = L.polyline(track, {
+      renderer: lines, color: colourOf(route.courier_id), weight, opacity: 0.95, bubblingMouseEvents: false,
+    })
+      .bindTooltip(tip(words), { sticky: true })
+      .on('click', () => openSheet(route.courier_id))
+      .addTo(layers.routes);
+    routeLines.set(route.courier_id, line);
+    // The route is stored: what the search had on the way has served.
+    const job = state.jobs.find((known) => known.courier_id === route.courier_id);
+    if (job) dropProvisional(job.job_id);
+  }
+}
+
+/**
+ * Sends a van along each stored route of the shown plan. They all drive at one speed,
+ * at which the longest route takes `DRIVE_MS`.
+ *
+ * This is a simulation, for showing a plan (D74). Nothing tracks a courier, and the
+ * project is not to. Where a van is, is reckoned here from the route as it is stored
+ * and from the time since the vans set out, and from nothing else.
+ */
+function startVans() {
+  stopVans();
+  const depot = depotOfPlan();
+  if (!depot) return;
+  let longest = 0;
+  for (const route of state.routes) {
+    const points = trackOf(route, depot).map((place) => L.latLng(place));
+    // How far along the track each of its points is, in metres.
+    const upTo = [0];
+    for (let at = 1; at < points.length; at += 1) {
+      upTo.push(upTo[at - 1] + map.distance(points[at - 1], points[at]));
+    }
+    const length = upTo[upTo.length - 1];
+    // A route without stops goes nowhere.
+    if (!(length > 0)) continue;
+    const marker = L.circleMarker(points[0], {
+      pane: 'vans', radius: 8, color: '#111', weight: 2, fillColor: colourOf(route.courier_id), fillOpacity: 1,
+      bubblingMouseEvents: false,
+    }).bindTooltip(tip(`${nameOf(route.courier_id)}, simulated`)).addTo(layers.vans);
+    vans.set(route.id, { points, upTo, length, marker, next: 1 });
+    longest = Math.max(longest, length);
+  }
+  if (vans.size === 0) return;
+  haveDriven = true;
+  drive = { since: performance.now(), speed: longest / DRIVE_MS, frame: 0 };
+  drive.frame = requestAnimationFrame(moveVans);
+  renderVans();
+}
+
+/** Puts every van where it has got to by `now`, and asks to be called for the next picture. */
+function moveVans(now) {
+  if (drive === null) return;
+  const driven = Math.max(0, now - drive.since) * drive.speed;
+  let onTheWay = false;
+  for (const van of vans.values()) {
+    const gone = Math.min(driven, van.length);
+    // Time only goes on, so the leg a van is on is the one it was on, or a later one.
+    while (van.next < van.points.length - 1 && van.upTo[van.next] < gone) van.next += 1;
+    const from = van.points[van.next - 1];
+    const to = van.points[van.next];
+    const leg = van.upTo[van.next] - van.upTo[van.next - 1];
+    const share = leg > 0 ? (gone - van.upTo[van.next - 1]) / leg : 1;
+    van.marker.setLatLng([from.lat + (to.lat - from.lat) * share, from.lng + (to.lng - from.lng) * share]);
+    if (gone < van.length) onTheWay = true;
+  }
+  if (onTheWay) drive.frame = requestAnimationFrame(moveVans);
+  else stopVans(true);
+}
+
+/** Takes the vans off the map. `back` says that they got to the end of their routes. */
+function stopVans(back = false) {
+  if (drive !== null) cancelAnimationFrame(drive.frame);
+  drive = null;
+  vans.clear();
+  if (layers.vans) layers.vans.clearLayers();
+  areBack = back;
+  renderVans();
+}
+
+/**
+ * Sends the vans out by themselves, once for each plan that is shown: when the page
+ * sees that the plan is done, and has its routes and the depot to draw them from. A
+ * plan that is no longer done has no vans.
+ */
+function vansSetOut() {
+  const plan = state.plan;
+  if (!plan || plan.status !== 'done') {
+    stopVans();
+    return;
+  }
+  renderVans();
+  if (setOutFor === plan.id) return;
+  if (state.routes.length === 0 || state.routes.length < plan.routes_total || !depotOfPlan()) return;
+  setOutFor = plan.id;
+  // Not for somebody who has asked their machine for less motion. The button is there.
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  startVans();
+}
+
+function renderVans() {
+  const plan = state.plan;
+  $('vans').hidden = !plan || plan.status !== 'done' || state.routes.length === 0;
+  let button = haveDriven ? 'Drive again' : 'Drive the routes';
+  if (drive !== null) button = 'Stop the vans';
+  $('drive').textContent = button;
+  $('vans-note').textContent = 'The vans are simulated: nothing tracks a courier. Each drives its route, all at '
+    + `one speed, at which the longest route takes ${DRIVE_MS / 1000} seconds.`
+    + (areBack ? ' They are back at the depot.' : '');
+}
+
+function fit() {
+  const points = [];
+  if (state.depot) points.push(point(state.depot.location));
+  if (state.planDepot) points.push(point(state.planDepot.location));
+  for (const order of state.orders.values()) {
+    if (order.status !== 'cancelled') points.push(point(order.location));
+  }
+  // At once, and not by a zoom that is seen to happen: while Leaflet shows one, it
+  // passes over the next move it is asked for. A day that is picked just after
+  // another would keep the view of the day before.
+  if (points.length === 1) map.setView(points[0], 13, { animate: false });
+  else if (points.length > 1) map.fitBounds(L.latLngBounds(points).pad(0.08), { animate: false });
+}
+
+/**
+ * Goes to a place on the map and puts a ring round it, in a layer of the caller's.
+ * At once, as in `fit`: the place that is asked for next is not passed over.
+ */
+function ring(location, layer) {
+  const where = point(location);
+  layer.clearLayers();
+  L.circleMarker(where, {
+    pane: 'depot', radius: 13, color: '#111', weight: 2.5, fill: false, interactive: false,
+  }).addTo(layer);
+  return where;
+}
+
+// ---------------------------------------------------------------- an order of one's own
+
+/**
+ * Begins an order where the map was clicked, for the day that is shown, or moves the
+ * one that is being put together. Nothing is asked of the API before the button that
+ * places it is pressed.
+ */
+function beginOrder(where) {
+  if (!state.session) return;
+  if (!canOrder()) {
+    say('That day has passed. An order needs a day from today on.', true);
+    return;
+  }
+  // Six decimal places are a tenth of a metre, which is nearer than anybody clicks.
+  const rounded = (degrees) => Math.round(degrees * 1e6) / 1e6;
+  state.draft = { lat: rounded(where.lat), lon: rounded(where.lng), key: null, keyFor: null };
+  drawDraft();
+  renderOrder();
+  $('order').scrollIntoView({ block: 'nearest' });
+}
+
+function drawDraft() {
+  // Before anybody has logged in there is no map yet, and nothing drawn on it.
+  if (map === null) return;
+  layers.draft.clearLayers();
+  const draft = state.draft;
+  if (draft === null) return;
+  // It lets a click through, so that a click beside it, however near, moves it.
+  L.circleMarker([draft.lat, draft.lon], {
+    pane: 'depot', radius: 8, color: '#111', weight: 2, dashArray: '3 3', fillColor: '#fff', fillOpacity: 0.9,
+    interactive: false,
+  }).addTo(layers.draft);
+}
+
+function renderOrder() {
+  const draft = state.draft;
+  $('order').hidden = draft === null;
+  $('order-hint').textContent = canOrder()
+    ? 'A click on the map begins an order for this day.'
+    : 'This day has passed. An order needs a day from today on.';
+  if (draft === null) return;
+  $('order-line').textContent = `At ${draft.lat.toFixed(5)}, ${draft.lon.toFixed(5)}, for ${state.date}. `
+    + 'A click on the map moves it.';
+}
+
+function dropOrder() {
+  state.draft = null;
+  drawDraft();
+  renderOrder();
+}
+
+/** What the form asks for, as the API takes it. */
+function orderAsked(draft) {
+  const address = $('order-address').value.trim();
+  return {
+    kind: $('order-kind').value,
+    service_date: state.date,
+    location: { lat: draft.lat, lon: draft.lon },
+    address: address === '' ? null : address,
+    demand: Number($('order-parcels').value),
+  };
+}
+
+/**
+ * A key nobody else has: 128 random bits as 32 letters. Not `crypto.randomUUID`, which
+ * a page has only where it was served over TLS or from the machine it is shown on.
+ */
+function newKey() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Places the order that is being put together, with a key that makes it safe to ask
+ * for again (D76).
+ *
+ * The key is of the order as it is asked for. When no answer comes back, the order
+ * stays in the form. Asked for again as it was, it goes out with the key it had, and
+ * the API places it once. Changed, it is another order, and gets another key.
+ */
+async function placeOrder() {
+  const draft = state.draft;
+  if (draft === null) return;
+  const asked = orderAsked(draft);
+  const said = JSON.stringify(asked);
+  if (draft.keyFor !== said) {
+    draft.key = newKey();
+    draft.keyFor = said;
+  }
+  let order;
+  try {
+    order = await api('POST', '/api/orders', asked, { [KEY_HEADER]: draft.key });
+  } catch (error) {
+    // Refused: nothing was placed, and the API said why. Anything else is an answer
+    // that did not come, to a request that may have arrived all the same.
+    throw error instanceof Refused ? error : new Unanswered();
+  }
+  // Another order may have been begun while this one was on its way. That one stays.
+  if (state.draft === draft) dropOrder();
+  // Its stream says so as well, to whoever has one. Whichever comes first is taken.
+  if (order.service_date === state.date) {
+    state.orders.set(order.id, order);
+    drawStops();
+    renderDay();
+    renderMine();
+  }
+  say('The order is placed.');
+}
+
+/** Withdraws an order of one's own that is still pending. */
+async function withdraw(orderId) {
+  let order;
+  try {
+    order = await api('POST', `/api/orders/${orderId}/cancel`);
+  } catch (error) {
+    // A plan may have taken it a moment ago. What became of it is read again.
+    loadOrdersSoon();
+    throw error;
+  }
+  if (state.orders.has(order.id)) state.orders.set(order.id, order);
+  drawStops();
+  renderDay();
+  renderMine();
+  say('The order is withdrawn.');
+}
+
+/** Shows an order of one's own on the map: goes to it, and puts a ring round it. */
+function showOrder(order) {
+  state.shownOrder = order.id;
+  const where = ring(order.location, layers.pick);
+  map.setView(where, Math.max(map.getZoom(), 15), { animate: false });
+  renderMine();
+  const marker = markers.get(order.id);
+  if (marker) marker.openTooltip();
+}
+
+/** An order was clicked on the map. To a client that marks its row in their list. */
+function pickOrder(orderId) {
+  const order = state.orders.get(orderId);
+  if (isStaff() || !order) return;
+  state.shownOrder = orderId;
+  // The map stays where it is: whoever clicked the order is looking at it.
+  ring(order.location, layers.pick);
+  renderMine();
+  const shown = orderRows.get(orderId);
+  if (shown) shown.row.scrollIntoView({ block: 'nearest' });
+}
+
+// ---------------------------------------------------------------- what the panels say
+
+function renderDay() {
+  const orders = [...state.orders.values()];
+  const count = (status) => orders.filter((order) => order.status === status).length;
+  const whose = isStaff() ? 'orders' : 'orders of yours';
+  // One order, where a client has placed one.
+  const some = orders.length === 1 ? whose.replace('orders', 'order') : whose;
+  $('orders-summary').textContent = orders.length === 0
+    ? `No ${whose} for this day.`
+    : `${orders.length} ${some}: ${count('pending')} pending, ${count('planned')} planned`
+      + (count('cancelled') ? `, ${count('cancelled')} withdrawn.` : '.');
+
+  const missing = [];
+  if (!state.depot) missing.push('no depot');
+  if (isStaff() && state.couriers.length === 0) missing.push('no courier');
+  $('setup').hidden = !isAdmin() || missing.length === 0;
+  $('setup-note').textContent = `There is ${missing.join(' and ')} yet. The demo city is a depot in Kyiv `
+    + 'and six vans, each large enough for a sixth of the orders asked for below.';
+  $('demo').hidden = !isAdmin();
+  $('generate').disabled = !state.depot;
+  $('generate').title = state.depot ? '' : 'No depot has been set to scatter the orders round.';
+  if (!isAdmin() && !state.depot) {
+    $('orders-summary').textContent += ' No depot has been set yet: an admin sets it.';
+  }
+  renderOrder();
+}
+
+/** What has become of an order of one's own, in words for whoever placed it. */
+function standingOf(order) {
+  if (order.status === 'pending') return 'It waits for its day to be planned.';
+  if (order.status === 'cancelled') return 'Withdrawn.';
+  // Where it is on its route, which is all of a route that a client is told (D78).
+  const stop = state.stops.get(order.id);
+  return stop
+    ? `${stop.courier} has it: stop ${stop.position + 1} of ${stop.stops}.`
+    : 'A plan has taken it. Its route is still searched for.';
+}
+
+/**
+ * A client's own orders of the day, each with what has become of it and with what can
+ * be done to it. An operator has the routes and their sheets for that, and no list:
+ * the orders of an admin are the demo orders, two thousand of them.
+ *
+ * The rows are kept from one drawing to the next, as those of the routes are (D75): a
+ * row is made anew only when what it says has changed. So what is pressed in a row is
+ * there still when the mouse is let go, whatever the stream says meanwhile.
+ */
+function renderMine() {
+  const mine = state.session !== null && !isStaff();
+  $('mine').hidden = !mine;
+  const list = $('order-list');
+  if (!mine) {
+    orderRows.clear();
+    list.replaceChildren();
+    return;
+  }
+  const orders = [...state.orders.values()];
+  if (!state.orders.has(state.shownOrder)) {
+    state.shownOrder = null;
+    layers.pick.clearLayers();
+  }
+  if (orders.map((order) => order.id).join() !== [...orderRows.keys()].join()) {
+    orderRows.clear();
+    list.replaceChildren();
+  }
+  for (const order of orders) {
+    const name = `${order.kind === 'pickup' ? 'Pickup' : 'Delivery'} of ${order.demand}`;
+    const place = order.address || `${order.location.lat.toFixed(5)}, ${order.location.lon.toFixed(5)}`;
+    const stands = order.status === 'cancelled' ? 'withdrawn' : order.status;
+    const detail = `${place}. ${standingOf(order)}`;
+    const shown = state.shownOrder === order.id;
+    const says = JSON.stringify([name, stands, detail, shown]);
+    const before = orderRows.get(order.id);
+    if (before && before.says === says) continue;
+
+    const row = el('li', shown ? 'order shown' : 'order');
+    const swatch = el('span', 'swatch');
+    // As its dot on the map: grey while no plan has it, and dark once one has.
+    swatch.style.background = { pending: NO_COURIER, planned: '#3f4651', cancelled: 'var(--line)' }[order.status];
+    const acts = el('span', 'acts');
+    // A button, for whoever has no mouse. A press anywhere in the row does the same.
+    const show = el('button', 'small', 'Show on the map');
+    show.type = 'button';
+    acts.append(show);
+    if (order.status === 'pending') {
+      const withdrawing = el('button', 'small', 'Withdraw');
+      withdrawing.type = 'button';
+      withdrawing.addEventListener('click', (event) => {
+        // The press is for the button, and not for the row it is in.
+        event.stopPropagation();
+        act(withdrawing, () => withdraw(order.id));
+      });
+      acts.append(withdrawing);
+    }
+    row.append(swatch, el('span', 'name', name), el('span', `numbers ${order.status}`, stands),
+      el('span', 'detail', detail), acts);
+    row.addEventListener('click', () => showOrder(order));
+    if (before) before.row.replaceWith(row);
+    else list.append(row);
+    orderRows.set(order.id, { says, row });
+  }
+  $('mine-note').textContent = orders.length === 0
+    ? 'None for this day yet.'
+    : 'A row shows its order on the map, and a click on an order shows its row.';
+}
+
+function renderPlans() {
+  const select = $('plans');
+  select.replaceChildren();
+  for (const plan of state.plans) {
+    const at = new Date(plan.created_at).toLocaleTimeString();
+    const option = el('option', '', `${at}, ${plan.status}`);
+    option.value = plan.id;
+    option.selected = plan.id === state.planId;
+    select.append(option);
+  }
+  $('plan-choice').hidden = state.plans.length < 2;
+  $('no-plan').hidden = state.plans.length > 0;
+}
+
+function renderPlan() {
+  const plan = state.plan;
+  const line = $('plan-line');
+  line.replaceChildren();
+  $('plan-error').textContent = '';
+  if (plan) {
+    line.append(el('span', `status ${plan.status}`, plan.status));
+    const words = [];
+    if (plan.status !== 'queued') {
+      words.push(`${plan.orders_total} orders`);
+      if (plan.orders_unassigned > 0) words.push(`${plan.orders_unassigned} fit no courier`);
+      words.push(`${plan.routes_done} of ${plan.routes_total} routes`);
+    }
+    const budget = [];
+    if (plan.budget.time_ms !== null) budget.push(`${plan.budget.time_ms / 1000} s`);
+    if (plan.budget.iterations !== null) budget.push(moves(plan.budget.iterations));
+    words.push(`${budget.join(' or ')} a route`, `seed ${plan.seed}`);
+    line.append(`, ${words.join(', ')}`);
+    if (plan.error) $('plan-error').textContent = `It failed: ${plan.error}`;
+  }
+  const busy = state.plans.some(isActive);
+  // A day whose plan is done is planned again once that plan is discarded (D83).
+  const standing = state.plans.some((known) => known.status === 'done');
+  $('plan').disabled = busy || standing || !state.depot;
+  $('plan').title = busy
+    ? 'The day has a plan in progress.'
+    : standing
+      ? 'The day has a plan that is done: discard it, and the day can be planned afresh.'
+      : (state.depot ? '' : 'No depot has been set.');
+  $('cancel').disabled = !isActive(plan);
+  $('discard').disabled = !plan || plan.status !== 'done';
+}
+
+/**
+ * Keeps what a search announced as its best length, for the chart of its route. Nothing
+ * stores these but the page that heard them (D49), so a route whose search this page
+ * did not see has no chart.
+ */
+function noteLength(progress) {
+  let search = searches.get(progress.job_id);
+  if (!search || search.attempt !== progress.attempt) {
+    search = { attempt: progress.attempt, since: performance.now(), points: [] };
+    searches.set(progress.job_id, search);
+  }
+  const last = search.points[search.points.length - 1];
+  if (last && last.moves >= progress.iterations) return;
+  search.points.push({
+    after: performance.now() - search.since,
+    moves: progress.iterations,
+    metres: progress.best_cost_m,
+  });
+}
+
+/**
+ * The length of a route as its search went on, as a small chart: a staircase, since a
+ * length holds until the search announces a shorter one.
+ *
+ * Across is the share of the plan's budget that was used, so the line reaches the right
+ * edge as the search ends. Up is the length, from the shortest so far to `CHART_SHARE`
+ * above it. It is the length as the search measures it, which by road is a little off
+ * the length the route is stored with (D66).
+ */
+function chartOf(search, budget, colour) {
+  const points = search.points;
+  if (points.length < 2) return null;
+  const { width, height } = CHART;
+  const first = points[0].metres;
+  const least = points[points.length - 1].metres;
+  const span = least * CHART_SHARE || 1;
+  const within = (share) => Math.min(1, Math.max(0, share));
+  const across = (point) => {
+    const used = budget.time_ms !== null ? point.after / budget.time_ms : point.moves / budget.iterations;
+    return (width * within(used)).toFixed(2);
+  };
+  // A unit is left free above and below, so that the line is whole at either edge.
+  const down = (point) => (1 + (height - 2) * (1 - within((point.metres - least) / span))).toFixed(2);
+  let fall = `M${across(points[0])} ${down(points[0])}`;
+  for (const point of points.slice(1)) fall += `H${across(point)}V${down(point)}`;
+
+  // Leaflet makes the elements, as it does for its own lines.
+  const part = (name, attributes) => {
+    const element = L.SVG.create(name);
+    for (const [attribute, value] of Object.entries(attributes)) element.setAttribute(attribute, value);
+    return element;
+  };
+  const words = `The length of the best route while it was searched for: ${km(first)} at first, `
+    + `${km(least)} at last. The chart shows the last ${Math.round(CHART_SHARE * 100)} percent.`;
+  const chart = part('svg', {
+    class: 'chart', viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': words,
+  });
+  const title = part('title', {});
+  title.textContent = words;
+  chart.append(title, part('path', { class: 'floor', d: `M0 ${height - 0.5}H${width}` }),
+    part('path', { class: 'fall', d: fall, stroke: colour }));
+  return chart;
+}
+
+function renderRoutes() {
+  const list = $('route-list');
+  const discarded = state.plan !== null && state.plan.status === 'discarded';
+  // The rows are kept from one drawing to the next, and a row is made anew only when
+  // what it says has changed. A search announces itself several times a second, and
+  // what is pressed in a row has to be there still when the mouse is let go.
+  if (state.jobs.map((job) => job.job_id).join() !== [...rows.keys()].join()) {
+    rows.clear();
+    list.replaceChildren();
+  }
+  for (const job of state.jobs) {
+    const route = state.routes.find((stored) => stored.courier_id === job.courier_id);
+    const progress = state.progress.get(job.job_id) || job.progress;
+    const worker = state.stats && state.stats.workers.find((known) => known.id === job.worker_id);
+    const heard = searches.get(job.job_id);
+    const search = heard && heard.attempt === job.attempt && heard.points.length > 1 ? heard : null;
+
+    let stands = { queued: 'waiting for a worker', running: 'searching', done: 'stored',
+      failed: 'failed', cancelled: 'stopped' }[job.status];
+    if (job.status === 'done' && discarded) stands = 'discarded';
+    if (job.status === 'running' && worker) stands += ` on ${worker.hostname}`;
+    if (job.attempt > 1) stands += `, attempt ${job.attempt}`;
+
+    let numbers = '';
+    if (route) {
+      numbers = km(route.distance_m);
+      stands += `, ${along(route)}${drawn(route)}, ${carried(route)}`;
+    } else if (progress && job.status === 'running') {
+      numbers = km(progress.best_cost_m);
+      stands += `, ${moves(progress.iterations)}`;
+      // The first length this page heard of, once the search has got below it. A page
+      // may open its stream after a search has announced its first tour.
+      if (search && search.points[0].metres > progress.best_cost_m) {
+        stands += `, from ${km(search.points[0].metres)}`;
+      }
+    }
+
+    const colour = colourOf(job.courier_id);
+    const name = nameOf(job.courier_id);
+    const detail = `${job.order_ids.length} stops, ${stands}`;
+    const stored = route !== undefined;
+    const open = stored && state.sheetOf === job.courier_id;
+    const says = JSON.stringify([colour, name, numbers, detail, search ? search.points.length : 0, stored, open]);
+    const before = rows.get(job.job_id);
+    if (before && before.says === says) continue;
+
+    const row = el('li');
+    const swatch = el('span', 'swatch');
+    swatch.style.background = colour;
+    row.append(swatch, el('span', 'name', name), el('span', 'numbers', numbers), el('span', 'detail', detail));
+    if (stored) {
+      const sheet = el('button', 'small sheet', open ? 'Close the sheet' : 'Route sheet');
+      sheet.type = 'button';
+      sheet.setAttribute('aria-expanded', String(open));
+      sheet.addEventListener('click', () => (open ? closeSheet() : openSheet(job.courier_id)));
+      row.append(sheet);
+    }
+    if (search && state.plan) row.append(chartOf(search, state.plan.budget, colour));
+    if (before) before.row.replaceWith(row);
+    else list.append(row);
+    rows.set(job.job_id, { says, row });
+  }
+  $('routes').hidden = state.jobs.length === 0;
+  $('routes-total').textContent = totalOf(state.routes);
+}
+
+/** Where a stop is, in words: the address its order came with, or else its position. */
+function placeOf(stop) {
+  const order = state.orders.get(stop.order_id);
+  if (order && order.address) return order.address;
+  return `${stop.location.lat.toFixed(5)}, ${stop.location.lon.toFixed(5)}`;
+}
+
+/** A row of the route sheet, with a cell for each text and its class. */
+function sheetRow(className, cells) {
+  const row = el('tr', className);
+  for (const [text, cellClass] of cells) row.append(el('td', cellClass, text));
+  return row;
+}
+
+/**
+ * The route sheet: the stops of the route that was picked in the order the courier
+ * calls, with what is on board after each (D65). It is written anew only when it would
+ * say something else, so that the place it was scrolled to is kept.
+ */
+function renderSheet() {
+  const route = state.routes.find((stored) => stored.courier_id === state.sheetOf) || null;
+  $('sheet').hidden = route === null;
+  for (const [courierId, line] of routeLines) {
+    const open = courierId === state.sheetOf;
+    line.setStyle({ weight: open ? OPEN_ROUTE_WEIGHT : ROUTE_WEIGHT });
+    if (open) line.bringToFront();
+  }
+  if (route === null) {
+    // No sheet, or its route is gone with its plan.
+    state.sheetOf = null;
+    state.shownStop = null;
+    sheetSays = '';
+    $('sheet-body').replaceChildren();
+    layers.mark.clearLayers();
+    return;
+  }
+
+  const name = nameOf(route.courier_id);
+  const places = route.stops.map(placeOf);
+  const says = JSON.stringify([route.id, name, places]);
+  if (says !== sheetSays) {
+    sheetSays = says;
+    $('sheet-line').textContent = `${name}: ${route.stops.length} stops, ${km(route.distance_m)} `
+      + `${along(route)}, ${carried(route)}.`;
+    const loads = onBoardAlong(route.stops);
+    const written = [sheetRow('depot', [['', 'count'], ['Leaves the depot', ''], ['', 'count'], [loads[0], 'count']])];
+    route.stops.forEach((stop, at) => {
+      const pickup = stop.kind === 'pickup';
+      const row = sheetRow('stop', [
+        ['', 'count'],
+        [`${pickup ? 'Pickup' : 'Delivery'}, ${places[at]}`, ''],
+        [`${pickup ? '+' : '−'}${stop.demand}`, 'count'],
+        [loads[at + 1], 'count'],
+      ]);
+      // The number is a button, for whoever has no mouse. A press anywhere in the row
+      // does the same.
+      const number = el('button', 'small', at + 1);
+      number.type = 'button';
+      number.title = 'Show this stop on the map';
+      row.firstChild.append(number);
+      row.dataset.order = stop.order_id;
+      row.addEventListener('click', () => showStop(stop));
+      written.push(row);
+    });
+    written.push(sheetRow('depot',
+      [['', 'count'], ['Back at the depot', ''], ['', 'count'], [loads[loads.length - 1], 'count']]));
+    $('sheet-body').replaceChildren(...written);
+  }
+  for (const row of $('sheet-body').children) {
+    row.classList.toggle('shown', state.shownStop !== null && row.dataset.order === state.shownStop);
+  }
+}
+
+function openSheet(courierId) {
+  if (state.sheetOf !== courierId) {
+    state.shownStop = null;
+    layers.mark.clearLayers();
+  }
+  state.sheetOf = courierId;
+  renderSheet();
+  renderRoutes();
+  $('sheet').scrollIntoView({ block: 'nearest' });
+}
+
+function closeSheet() {
+  state.sheetOf = null;
+  renderSheet();
+  renderRoutes();
+}
+
+/** Shows a stop of the open sheet on the map: goes to it, and puts a ring round it. */
+function showStop(stop) {
+  state.shownStop = stop.order_id;
+  const where = ring(stop.location, layers.mark);
+  // Near enough to tell the stop from its neighbours, and no further off than the map
+  // is already. At once, as in `fit`: the row that is pressed next is not passed over.
+  map.setView(where, Math.max(map.getZoom(), 15), { animate: false });
+  renderSheet();
+  const marker = markers.get(stop.order_id);
+  if (marker) marker.openTooltip();
+}
+
+/**
+ * What the stored routes come to. A solver that is given a routing service measures by
+ * road, and falls back on great circles for a route the service gave nothing for
+ * (D66). So the routes of a plan may differ in that, and the sum says if they do.
+ */
+function totalOf(routes) {
+  if (routes.length === 0) return '';
+  const total = km(routes.reduce((sum, route) => sum + route.distance_m, 0));
+  const count = `${routes.length} ${routes.length === 1 ? 'route' : 'routes'}`;
+  const byRoad = routes.filter((route) => route.distances === 'road').length;
+  if (byRoad === routes.length || byRoad === 0) return `${total} ${along(routes[0])} over ${count}.`;
+  return `${total} over ${count}: ${byRoad} by road, ${routes.length - byRoad} as the crow flies.`;
+}
+
+function renderSystem() {
+  const stats = state.stats;
+  if (!stats) return;
+  const queue = stats.queue;
+  // What ended is counted of the last day (D84).
+  $('queue').textContent = `Jobs: ${queue.queued} queued, ${queue.running} running. In the last day `
+    + `${queue.done} done, ${queue.failed} failed, ${queue.cancelled} stopped.`;
+  $('workers-line').textContent = stats.workers_alive === 0
+    ? 'No worker has been seen lately. Is a solver running?'
+    : `${stats.workers_alive} ${stats.workers_alive === 1 ? 'worker' : 'workers'}, ${stats.workers_busy} busy.`;
+  const list = $('workers');
+  list.replaceChildren();
+  for (const worker of stats.workers) {
+    const job = state.jobs.find((known) => known.job_id === worker.current_job);
+    const doing = worker.current_job === null ? 'idle'
+      : (job ? `searching for ${nameOf(job.courier_id)}` : 'busy');
+    const row = el('li');
+    const swatch = el('span', 'swatch');
+    swatch.style.background = job ? colourOf(job.courier_id) : (worker.current_job ? '#3f4651' : 'var(--line)');
+    row.append(swatch, el('span', 'name', worker.hostname), el('span', 'numbers', doing));
+    list.append(row);
+  }
+}
+
+// ---------------------------------------------------------------- reading
+
+async function loadDepot() {
+  try {
+    state.depot = await api('GET', '/api/depot');
+  } catch (error) {
+    if (!(error instanceof Refused) || error.status !== 404) throw error;
+    state.depot = null;
+  }
+  drawDepot();
+}
+
+async function loadCouriers() {
+  state.couriers = isStaff() ? await api('GET', '/api/couriers') : [];
+}
+
+/** The orders of the day, a thousand at a time: each page is asked for by the last id of the one before. */
+async function loadOrders() {
+  const day = state.date;
+  const orders = new Map();
+  let after = '';
+  for (;;) {
+    const page = await api('GET', `/api/orders?service_date=${day}&limit=1000${after}`);
+    for (const order of page) orders.set(order.id, order);
+    if (page.length < 1000) break;
+    after = `&after=${page[page.length - 1].id}`;
+  }
+  // Where a client's planned orders are on their routes, which is all of a route that
+  // a client is told (D78). An operator reads the routes themselves.
+  const stops = isStaff() ? [] : await api('GET', `/api/orders/stops?service_date=${day}`);
+  // Another day was picked while this one was read.
+  if (day !== state.date) return;
+  state.orders = orders;
+  state.stops = new Map(stops.map((stop) => [stop.order_id, stop]));
+  drawStops();
+  renderDay();
+  // The addresses of the stops are those of their orders.
+  renderSheet();
+  renderMine();
+}
+
+/** Reads the orders again shortly, once, however often it is asked in between. */
+function loadOrdersSoon() {
+  if (ordersTimer !== null) return;
+  ordersTimer = setTimeout(() => {
+    ordersTimer = null;
+    if (state.session) loadOrders().catch((error) => state.session && say(describe(error), true));
+  }, 300);
+}
+
+async function loadRoutes(planId) {
+  const asked = ++routesAsked;
+  const routes = await api('GET', `/api/plans/${planId}/routes`);
+  // An answer that was overtaken by a later question, or is for a plan no longer shown.
+  if (asked !== routesAsked || planId !== state.planId) return;
+  state.routes = routes;
+  drawRoutes();
+  colourStops();
+  renderRoutes();
+  renderSheet();
+  vansSetOut();
+}
+
+function forgetPlan() {
+  stopWatchingPlan();
+  stopWatchingPlan = () => {};
+  link.plan = null;
+  routesAsked += 1;
+  state.planId = null;
+  state.plan = null;
+  state.planDepot = null;
+  state.jobs = [];
+  state.routes = [];
+  state.sheetOf = null;
+  state.progress.clear();
+  ways.clear();
+  setOutFor = null;
+  haveDriven = false;
+  stopVans();
+  dropAllProvisional();
+  drawDepot();
+  drawRoutes();
+  colourStops();
+  renderPlan();
+  renderRoutes();
+  renderSheet();
+  renderLink();
+}
+
+function showPlan(planId) {
+  forgetPlan();
+  state.planId = planId;
+  state.plan = state.plans.find((plan) => plan.id === planId) || null;
+  renderPlans();
+  renderPlan();
+  loadPlanDepot().catch((error) => state.session && say(describe(error), true));
+  const shown = () => state.planId === planId;
+  stopWatchingPlan = watch(`/api/plans/${planId}/events`, {
+    plan: (plan) => shown() && planChanged(plan),
+    jobs: (jobs) => shown() && jobsChanged(jobs),
+    progress: (progress) => shown() && searchAnnounced(progress),
+  }, (open) => {
+    if (!shown()) return;
+    link.plan = open;
+    renderLink();
+  });
+}
+
+/**
+ * Opens the stream of one's own orders of the shown day (D77). It says when something
+ * has become of one of them: placed here or elsewhere, withdrawn, taken by a plan, put
+ * on a route or given back. It says nothing of anybody else's.
+ */
+function watchOrders() {
+  stopWatchingOrders();
+  const day = state.date;
+  link.orders = false;
+  stopWatchingOrders = watch(`/api/orders/events?service_date=${day}`, { orders: ordersChanged }, (open) => {
+    if (day !== state.date) return;
+    link.orders = open;
+    renderLink();
+  });
+}
+
+async function loadDay() {
+  forgetPlan();
+  state.plans = [];
+  state.orders = new Map();
+  state.stops = new Map();
+  elsewhere.clear();
+  heardOf.clear();
+  // An order that is being put together is for the day that is shown.
+  if (state.draft !== null && !canOrder()) dropOrder();
+  renderPlans();
+  // A client's page hears of their orders on a stream of its own. An operator's hears
+  // of everybody's on the stream of the queue, which is open already.
+  if (!isStaff()) watchOrders();
+  await loadOrders();
+  fit();
+  if (!isStaff()) return;
+  const day = state.date;
+  const plans = await api('GET', `/api/plans?service_date=${day}`);
+  if (day !== state.date) return;
+  state.plans = plans;
+  renderPlans();
+  renderPlan();
+  if (plans.length > 0) showPlan(plans[0].id);
+}
+
+/**
+ * Reads the plans of the shown day again, because a plan was heard of that this page
+ * does not know: one that was asked for elsewhere, by chat, by a script or in another
+ * window (D79). If the day has a plan that is new to the page, it is shown, as the
+ * newest plan of a day is when the day is opened.
+ */
+async function loadPlans() {
+  const day = state.date;
+  const heard = [...heardOf];
+  heardOf.clear();
+  const plans = await api('GET', `/api/plans?service_date=${day}`);
+  if (day !== state.date) return;
+  // What was heard of and is not among them is of another day. It is remembered, so
+  // that the next word of it is not asked about again.
+  for (const id of heard) {
+    if (!plans.some((plan) => plan.id === id)) elsewhere.add(id);
+  }
+  const known = new Set(state.plans.map((plan) => plan.id));
+  state.plans = plans;
+  renderPlans();
+  renderPlan();
+  if (plans.length > 0 && !known.has(plans[0].id) && plans[0].id !== state.planId) {
+    showPlan(plans[0].id);
+    // It may have taken its orders by now, which this page was not told of.
+    loadOrdersSoon();
+  }
+}
+
+/** Reads the plans again shortly, once, however many plans are heard of in between. */
+function loadPlansSoon(planId) {
+  heardOf.add(planId);
+  if (plansTimer !== null) return;
+  plansTimer = setTimeout(() => {
+    plansTimer = null;
+    if (state.session) loadPlans().catch((error) => state.session && say(describe(error), true));
+  }, 300);
+}
+
+// ---------------------------------------------------------------- what the streams say
+
+function planChanged(plan) {
+  const before = state.plan;
+  state.plan = plan;
+  const at = state.plans.findIndex((known) => known.id === plan.id);
+  if (at >= 0) state.plans[at] = plan;
+  else state.plans.unshift(plan);
+  renderPlans();
+  renderPlan();
+  // A route more is stored, or all of them are gone with a plan that was taken back.
+  loadRoutes(plan.id).catch((error) => state.session && say(describe(error), true));
+  // Clustering takes orders, and a plan that ends early or is discarded gives them back.
+  if (before && before.status !== plan.status) loadOrdersSoon();
+  if (plan.status !== 'routing' && plan.status !== 'done') dropAllProvisional();
+}
+
+function jobsChanged(jobs) {
+  state.jobs = jobs;
+  for (const job of jobs) {
+    const announced = state.progress.get(job.job_id);
+    // What was announced for an earlier claim of the job says nothing of this one.
+    if (announced && announced.attempt !== job.attempt) state.progress.delete(job.job_id);
+    if (job.status === 'cancelled' || job.status === 'failed') dropProvisional(job.job_id);
+    // An announcement that came before the page knew the job it was of.
+    const waiting = state.progress.get(job.job_id);
+    if (waiting && job.status === 'running') drawProvisional(job, waiting);
+  }
+  colourStops();
+  renderRoutes();
+  renderSystem();
+}
+
+function searchAnnounced(progress) {
+  const job = state.jobs.find((known) => known.job_id === progress.job_id);
+  if (job) {
+    // From a worker that has lost the job and has not heard so yet, or after the end.
+    if (progress.attempt !== job.attempt || job.status !== 'running') return;
+    if (state.routes.some((route) => route.courier_id === job.courier_id)) return;
+  }
+  const before = state.progress.get(progress.job_id);
+  if (before && before.attempt === progress.attempt && before.iterations > progress.iterations) return;
+  state.progress.set(progress.job_id, progress);
+  noteLength(progress);
+  if (!job) return;
+  drawProvisional(job, progress);
+  renderRoutes();
+}
+
+function statsChanged(stats) {
+  state.stats = stats;
+  renderSystem();
+  renderRoutes();
+}
+
+/**
+ * The orders of some day have changed: one was placed or withdrawn, here, on another
+ * page or by chat. To a client it is one of their own, and may as well be that a plan
+ * has taken it, stored its route or given it back (D77).
+ */
+function ordersChanged(changed) {
+  if (changed.service_date === state.date) loadOrdersSoon();
+}
+
+/**
+ * A plan has changed, or one of its jobs has, or it is new: a plan of the shown day,
+ * or of any other (D79). The one that is shown has a stream of its own to say what.
+ */
+function planHeard(changed) {
+  const planId = changed.plan_id;
+  if (planId === state.planId || elsewhere.has(planId)) return;
+  loadPlansSoon(planId);
+}
+
+// ---------------------------------------------------------------- what the buttons do
+
+async function askForPlan() {
+  const asked = { service_date: state.date };
+  const seed = $('seed').value.trim();
+  if (seed !== '') asked.seed = Number(seed);
+  const budget = $('budget').value.trim();
+  if (budget !== '') {
+    asked.budget = $('budget-unit').value === 'moves'
+      ? { iterations: Math.round(Number(budget) * 1e6) }
+      : { time_ms: Math.round(Number(budget) * 1000) };
+  }
+  const plan = await api('POST', '/api/plans', asked);
+  // The stream of the queue says so as well, and the page may have read the plans of
+  // the day on that word already. The plan is in the list once either way.
+  if (!state.plans.some((known) => known.id === plan.id)) state.plans.unshift(plan);
+  showPlan(plan.id);
+  say('');
+}
+
+async function endPlan(how) {
+  const plan = await api('POST', `/api/plans/${state.planId}/${how}`);
+  // The stream says so as well. Whichever comes first is taken.
+  planChanged(plan);
+  say('');
+}
+
+async function generateOrders() {
+  const made = await api('POST', '/api/demo/orders', {
+    service_date: state.date,
+    count: Number($('demo-count').value),
+    seed: Number($('demo-seed').value),
+  });
+  await loadOrders();
+  fit();
+  say(`${made.created} orders generated.`);
+}
+
+/**
+ * A depot and six vans, through the endpoints an admin would use by hand.
+ *
+ * A demo order has a demand of 1 to 3, and four in five are deliveries. So a day of
+ * them sends 1.6 times its number out of the depot, which is what the vans need room
+ * for: what is picked up comes on board when deliveries are off it (D65). The vans are
+ * sized to take that between the six of them with a tenth to spare. So the day that
+ * is generated next gives every van a route, whether it is of 300 orders or of 2000,
+ * and the four solvers of the stack more routes than they search for at once (D88).
+ */
+async function setUpDemoCity() {
+  if (!state.depot) {
+    state.depot = await api('PUT', '/api/depot', { name: 'Depot', location: KYIV });
+    drawDepot();
+  }
+  if (state.couriers.length === 0) {
+    const orders = Number($('demo-count').value) || 1200;
+    const capacity = Math.ceil(orders * 2 * DELIVERED * 1.1 / VANS);
+    for (let number = 1; number <= VANS; number += 1) {
+      await api('POST', '/api/couriers', { name: `Van ${number}`, capacity });
+    }
+    await loadCouriers();
+  }
+  renderDay();
+  renderPlan();
+  fit();
+  say('The demo city is set up.');
+}
+
+// ---------------------------------------------------------------- coming and going
+
+async function start() {
+  $('login-view').hidden = true;
+  $('bar').hidden = false;
+  $('app').hidden = false;
+  const user = state.session.user;
+  $('who').textContent = `${user.email} (${user.role})`;
+  for (const id of ['planning', 'system']) $(id).hidden = !isStaff();
+  $('date').value = state.date;
+  say('');
+  if (map === null) makeMap();
+  // The map was made, or last drawn, while it was not shown.
+  map.invalidateSize();
+  renderMine();
+  renderOrder();
+
+  try {
+    await loadDepot();
+    await loadCouriers();
+    if (isStaff()) {
+      link.stats = false;
+      const said = { stats: statsChanged, orders: ordersChanged, plans: planHeard };
+      stopWatchingStats = watch('/api/system/stats/events', said, (open) => {
+        link.stats = open;
+        renderLink();
+        // What was placed while the stream was not open was not heard of.
+        if (open) loadOrdersSoon();
+      });
+      // And a word can be lost on its way while the stream is open, too.
+      ordersEvery = setInterval(() => link.stats && loadOrdersSoon(), ORDERS_EVERY_MS);
+    }
+    await loadDay();
+  } catch (error) {
+    if (state.session) say(describe(error), true);
+  }
+}
+
+function leave(why) {
+  stopWatchingPlan();
+  stopWatchingStats();
+  stopWatchingOrders();
+  stopWatchingPlan = () => {};
+  stopWatchingStats = () => {};
+  stopWatchingOrders = () => {};
+  clearInterval(ordersEvery);
+  ordersEvery = null;
+  clearTimeout(plansTimer);
+  plansTimer = null;
+  link.plan = null;
+  link.stats = null;
+  link.orders = null;
+  try {
+    sessionStorage.removeItem(SESSION);
+  } catch {
+    // Nothing was kept there, then.
+  }
+  Object.assign(state, {
+    session: null, depot: null, planDepot: null, couriers: [], orders: new Map(), plans: [], planId: null,
+    plan: null, jobs: [], routes: [], sheetOf: null, shownStop: null, stats: null, stops: new Map(),
+    draft: null, shownOrder: null,
+  });
+  state.progress.clear();
+  ways.clear();
+  searches.clear();
+  rows.clear();
+  routeLines.clear();
+  orderRows.clear();
+  elsewhere.clear();
+  heardOf.clear();
+  sheetSays = '';
+  setOutFor = null;
+  haveDriven = false;
+  stopVans();
+  $('route-list').replaceChildren();
+  $('sheet-body').replaceChildren();
+  $('sheet').hidden = true;
+  $('order-list').replaceChildren();
+  $('order').hidden = true;
+  $('mine').hidden = true;
+  // What the next person puts into the form is theirs.
+  $('order-form').reset();
+  if (map !== null) {
+    for (const name of Object.keys(layers)) layers[name].clearLayers();
+    markers.clear();
+    provisional.clear();
+  }
+  $('bar').hidden = true;
+  $('app').hidden = true;
+  $('login-view').hidden = false;
+  $('login-message').textContent = why;
+  $('password').value = '';
+}
+
+function sessionEnded() {
+  if (state.session) leave('Your login has ended. Log in again.');
+}
+
+/**
+ * Opens an account with the address and the password of the form, and logs in to it.
+ * The account is a client's: it places orders and sees its own. An admin can make it
+ * an operator's.
+ */
+async function openAccount() {
+  if (!$('login').reportValidity()) return;
+  $('login-message').textContent = '';
+  $('register').disabled = true;
+  try {
+    await api('POST', '/api/auth/register', { email: $('email').value, password: $('password').value });
+  } catch (error) {
+    $('login-message').textContent = describe(error);
+    return;
+  } finally {
+    $('register').disabled = false;
+  }
+  await logIn();
+}
+
+async function logIn() {
+  $('login-message').textContent = '';
+  let session;
+  try {
+    session = await api('POST', '/api/auth/login', {
+      email: $('email').value,
+      password: $('password').value,
+    });
+  } catch (error) {
+    $('login-message').textContent = describe(error);
+    return;
+  }
+  state.session = {
+    token: session.token,
+    user: session.user,
+    expiresAt: Date.now() + session.expires_in * 1000,
+  };
+  try {
+    // For as long as the tab lives, so that a reload does not ask for the password again.
+    sessionStorage.setItem(SESSION, JSON.stringify(state.session));
+  } catch {
+    // Then the login lasts as long as the page does.
+  }
+  await start();
+}
+
+function rememberedSession() {
+  try {
+    const kept = JSON.parse(sessionStorage.getItem(SESSION));
+    return kept && kept.expiresAt > Date.now() ? kept : null;
+  } catch {
+    return null;
+  }
+}
+
+$('login').addEventListener('submit', (event) => {
+  event.preventDefault();
+  logIn();
+});
+$('register').addEventListener('click', openAccount);
+$('logout').addEventListener('click', () => leave(''));
+$('tiles').addEventListener('change', showTiles);
+$('order-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  act($('place'), placeOrder);
+});
+$('order-drop').addEventListener('click', dropOrder);
+$('date').addEventListener('change', () => {
+  if (!$('date').value) return;
+  state.date = $('date').value;
+  act($('refresh'), loadDay);
+});
+$('refresh').addEventListener('click', () => act($('refresh'), async () => {
+  await loadDepot();
+  await loadCouriers();
+  await loadDay();
+  say('');
+}));
+$('plans').addEventListener('change', () => showPlan($('plans').value));
+$('plan-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  act($('plan'), askForPlan);
+});
+$('cancel').addEventListener('click', () => act($('cancel'), () => endPlan('cancel')));
+$('discard').addEventListener('click', () => act($('discard'), () => endPlan('discard')));
+$('demo').addEventListener('submit', (event) => {
+  event.preventDefault();
+  act($('generate'), generateOrders).then(renderDay);
+});
+$('set-up').addEventListener('click', () => act($('set-up'), setUpDemoCity));
+$('sheet-close').addEventListener('click', closeSheet);
+$('drive').addEventListener('click', () => (drive !== null ? stopVans() : startVans()));
+
+state.session = rememberedSession();
+if (state.session) start();
+else leave('');
+})();
+</script>
+</body>
+</html>

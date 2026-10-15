@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT status, count(*) AS \"jobs!\"\n           FROM jobs\n           WHERE status IN ('queued', 'running')\n              OR finished_at > now() - $1::bigint * interval '1 millisecond'\n           GROUP BY status",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "jobs!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "909f1f51b596cf41a2cbc2952f327335101d78fca2940f11b274bab718434f85"
+}

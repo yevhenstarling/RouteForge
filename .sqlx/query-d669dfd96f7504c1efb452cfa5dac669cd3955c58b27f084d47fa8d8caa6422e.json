@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO couriers (id, name, capacity)\n         VALUES ($1, $2, $3)\n         RETURNING id, name, capacity, active, created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "capacity",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "capacity"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "active",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "active"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "couriers",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d669dfd96f7504c1efb452cfa5dac669cd3955c58b27f084d47fa8d8caa6422e"
+}

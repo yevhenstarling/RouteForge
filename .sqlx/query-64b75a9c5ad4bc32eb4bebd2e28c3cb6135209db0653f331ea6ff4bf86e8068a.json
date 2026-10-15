@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT workers.id, workers.hostname, workers.started_at, workers.last_seen_at,\n                  (\n                      SELECT jobs.id\n                      FROM jobs\n                      WHERE jobs.claimed_by = workers.id\n                        AND jobs.status = 'running'\n                        AND jobs.lease_expires_at > now()\n                      ORDER BY jobs.run_at, jobs.id\n                      LIMIT 1\n                  ) AS current_job\n           FROM workers\n           WHERE workers.last_seen_at > now() - $1::bigint * interval '1 millisecond'\n           ORDER BY workers.started_at, workers.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workers",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "hostname",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workers",
+            "name": "hostname"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "workers",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "workers",
+            "name": "last_seen_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "current_job",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "64b75a9c5ad4bc32eb4bebd2e28c3cb6135209db0653f331ea6ff4bf86e8068a"
+}

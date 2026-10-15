@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE plans SET status = $2, error = $3, finished_at = now()\n         WHERE id = $1 AND status IN ('queued', 'routing')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c79c3fc6d6ef18dc242c74e6ee27c88c1d63c9ccc5add8d7df22775cfdc68c79"
+}

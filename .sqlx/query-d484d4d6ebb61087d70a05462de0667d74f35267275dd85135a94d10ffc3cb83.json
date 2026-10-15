@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs SET status = 'cancelled', lease_expires_at = NULL, finished_at = now()\n         WHERE plan_id = $1 AND status IN ('queued', 'running')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d484d4d6ebb61087d70a05462de0667d74f35267275dd85135a94d10ffc3cb83"
+}

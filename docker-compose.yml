@@ -1,0 +1,181 @@
+name: routeforge
+
+# The whole stack. On a fresh clone, with no .env:
+#
+#   docker compose up --build --scale solver=4
+#
+# The page with the map is then at http://127.0.0.1:8080/ and Swagger UI at /docs/.
+#
+# Every setting has a value to fall back on, so a clone needs no .env (D54). Four of
+# those values are no secrets at all, and are marked below. They are for showing the
+# system on this machine, which is the only place the ports are open to.
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-routeforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-routeforge}
+      POSTGRES_DB: ${POSTGRES_DB:-routeforge}
+    ports:
+      # Published on localhost only, for running the services and tests outside Docker.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      # Asked over TCP and not over the socket. While a new database is being set up,
+      # the image runs a server that listens on the socket alone. A check that asked
+      # there would say yes, and the API, which is let go by it and comes over the
+      # network, would find the port closed (D54).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The HTTP API, with the page and Swagger UI inside it. It applies the schema when
+  # it starts (D32), and ends at once if the database does not answer (D47), which is
+  # why it waits for the database to be healthy.
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      # `db` is the service above, on the compose network. The URL in .env is for
+      # programs outside Docker and says 127.0.0.1.
+      DATABASE_URL: postgres://${POSTGRES_USER:-routeforge}:${POSTGRES_PASSWORD:-routeforge}@db:5432/${POSTGRES_DB:-routeforge}
+      # Every address of the container, which is where the published port arrives.
+      API_BIND: 0.0.0.0:8080
+      # For a demonstration, and no secrets. Whoever has read this file can sign a
+      # token, or log in as the admin. Set your own in .env before the port below is
+      # opened to anything but this machine.
+      JWT_SECRET: ${JWT_SECRET:-routeforge-demo-signing-key-not-a-secret}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-routeforge}
+      # The key the bot shows to be given a token of the Telegram user it talks to
+      # (D60). As little a secret as the three above: whoever has read this file can
+      # be given a token of any account the bot reaches.
+      BOT_SERVICE_KEY: ${BOT_SERVICE_KEY:-routeforge-demo-bot-key-not-a-secret}
+      # Passed on if set in .env or in the shell, and left to their defaults if not.
+      JWT_TTL_SECS:
+      BOT_JWT_TTL_SECS:
+      API_BUDGET_DEFAULT_MS:
+      API_BUDGET_MAX_MS:
+      API_BUDGET_MAX_ITERATIONS:
+      API_WORKER_ALIVE_SECS:
+      API_LOGIN_ATTEMPTS:
+      API_HASHES_AT_ONCE:
+      API_STREAMS_PER_USER:
+      LOG_FORMAT:
+      RUST_LOG:
+    ports:
+      # On localhost only, like the database: the login above is known to everybody.
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # The image has no curl. The binary asks its own /readyz (D55).
+      test: ["CMD", "routeforge-api", "healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The queue workers. `docker compose up --scale solver=4` runs four of them: the
+  # service has no container name and publishes no port, so nothing stands in the way.
+  #
+  # A solver applies no migrations. It waits until the database has the schema (D32),
+  # which the API applies when it starts. So it waits for the database alone, and the
+  # two may start in either order.
+  #
+  # It has no health check. Nothing waits for a solver, and which of them are alive
+  # is what the registry says (D27) and the page shows.
+  solver:
+    build:
+      context: .
+      target: solver
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-routeforge}:${POSTGRES_PASSWORD:-routeforge}@db:5432/${POSTGRES_DB:-routeforge}
+      # Passed on if set in .env or in the shell, and left to their defaults if not.
+      SOLVER_CONCURRENCY:
+      SOLVER_LEASE_SECS:
+      SOLVER_HEARTBEAT_SECS:
+      SOLVER_POLL_SECS:
+      SOLVER_PROGRESS_MS:
+      # Where to ask for distances by road: `http://osrm:5000` for the service below.
+      # Not set, the distances are great circles, which need nobody (D8).
+      OSRM_URL:
+      OSRM_TIMEOUT_SECS:
+      LOG_FORMAT:
+      RUST_LOG:
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Distances by road, for whoever wants them (D67). The service has a profile, so
+  # `docker compose up` leaves it out, and the stack asks nobody for anything. To have
+  # it:
+  #
+  #   scripts/osrm-prepare      once: fetches the roads of Kyiv and prepares them
+  #   in .env:                  COMPOSE_PROFILES=osrm and OSRM_URL=http://osrm:5000
+  #   docker compose up --build --scale solver=4
+  #
+  # A solver that is given OSRM_URL asks this service for the distances of each route,
+  # and then for the way the route takes along the streets, which the map draws (D73).
+  # A route it gets no distances for is searched for on great circles, and says so
+  # (D66). So nothing waits for this service, and it may come up late or not at all.
+  osrm:
+    image: &osrm ghcr.io/project-osrm/osrm-backend:v26.10.0-debian
+    profiles: ["osrm"]
+    # `ch`: the roads as scripts/osrm-prepare contracts them, which answers a table
+    # quickest. A table has a row for the depot and one for each stop of a route, and
+    # the demonstration makes days of up to 2000 orders. The way of a route starts at
+    # the depot and ends there, which is one position more. Left to itself the server
+    # takes a table of 100 positions and a way through 500.
+    command: ["osrm-routed", "--algorithm", "ch", "--max-table-size", "2001", "--max-viaroute-size", "2002", "/data/kyiv.osrm"]
+    volumes:
+      - ./osrm:/data:ro
+    ports:
+      # On localhost only, for a solver that runs outside Docker.
+      - "127.0.0.1:${OSRM_PORT:-5000}:5000"
+
+  # The tools of the same image, which scripts/osrm-prepare prepares the roads with:
+  # `docker compose run --rm osrm-tools osrm-extract ...`. It has a profile nobody
+  # names, so nothing starts it but that.
+  osrm-tools:
+    image: *osrm
+    profiles: ["osrm-tools"]
+    volumes:
+      - ./osrm:/data
+
+  # The Telegram bot. It reaches the system through the API alone, so that is what it
+  # waits for. It asks Telegram for its updates, so it publishes no port.
+  #
+  # Without a token it has nobody to talk to: it says so, and idles (D8). With one in
+  # .env it is a bot, and nothing else has to be set.
+  bot:
+    build:
+      context: .
+      target: bot
+    environment:
+      # What @BotFather gave. Passed on if it is set in .env or in the shell.
+      TELEGRAM_BOT_TOKEN:
+      # `api` is the service above, on the compose network.
+      BOT_API_URL: http://api:8080
+      # What the bot shows the API to be given a token of the person it talks to
+      # (D60). It has to be the key the API has, so the two fall back to the same.
+      BOT_SERVICE_KEY: ${BOT_SERVICE_KEY:-routeforge-demo-bot-key-not-a-secret}
+      # A service to ask where an address is, if the bot is to take addresses. Not
+      # set, the bot sends what people write to nobody (D72).
+      GEOCODER_URL:
+      # Passed on if set in .env or in the shell, and left to their defaults if not.
+      TELEGRAM_API_URL:
+      LOG_FORMAT:
+      RUST_LOG:
+      # The days the bot offers are those of its clock, which is on UTC without this.
+      TZ:
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  db-data:
