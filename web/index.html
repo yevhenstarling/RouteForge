@@ -182,7 +182,7 @@
         <div class="row"><button type="button" id="set-up">Set up a demo city</button></div>
       </div>
       <form id="demo" class="row" hidden>
-        <label>Orders <input type="number" id="demo-count" min="1" max="2000" value="300" required></label>
+        <label>Orders <input type="number" id="demo-count" min="1" max="2000" value="1200" required></label>
         <label>Seed <input type="number" id="demo-seed" min="0" max="4294967295" value="1" required></label>
         <button type="submit" id="generate">Generate demo orders</button>
       </form>
@@ -281,8 +281,9 @@ const TILE_CREDIT = '&copy; <a href="https://www.openstreetmap.org/copyright">Op
 const COLOURS = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf',
   '#e377c2', '#8c564b', '#bcbd22', '#3a5fcd', '#008080', '#b8860b'];
 const NO_COURIER = '#8a8f98';
-// How many vans the demo city has: one for each solver of the stack as it is shown.
-const VANS = 4;
+// How many vans the demo city has: more than the four solvers of the stack as it is
+// shown, so that routes wait in the queue for a solver (D88).
+const VANS = 6;
 // The share of the demo orders that are deliveries: four in five (D46).
 const DELIVERED = 0.8;
 // What the length of a route was measured along, as the API says it and in words (D66).
@@ -1146,7 +1147,7 @@ function renderDay() {
   if (isStaff() && state.couriers.length === 0) missing.push('no courier');
   $('setup').hidden = !isAdmin() || missing.length === 0;
   $('setup-note').textContent = `There is ${missing.join(' and ')} yet. The demo city is a depot in Kyiv `
-    + 'and four vans, each large enough for a quarter of the orders asked for below.';
+    + 'and six vans, each large enough for a sixth of the orders asked for below.';
   $('demo').hidden = !isAdmin();
   $('generate').disabled = !state.depot;
   $('generate').title = state.depot ? '' : 'No depot has been set to scatter the orders round.';
@@ -1852,14 +1853,14 @@ async function generateOrders() {
 }
 
 /**
- * A depot and four vans, through the endpoints an admin would use by hand.
+ * A depot and six vans, through the endpoints an admin would use by hand.
  *
  * A demo order has a demand of 1 to 3, and four in five are deliveries. So a day of
  * them sends 1.6 times its number out of the depot, which is what the vans need room
  * for: what is picked up comes on board when deliveries are off it (D65). The vans are
- * sized to take that between the four of them with a tenth to spare. So the day that
- * is generated next gives every van a route, and with it every one of four solvers
- * something to search for, whether it is of 300 orders or of 2000.
+ * sized to take that between the six of them with a tenth to spare. So the day that
+ * is generated next gives every van a route, whether it is of 300 orders or of 2000,
+ * and the four solvers of the stack more routes than they search for at once (D88).
  */
 async function setUpDemoCity() {
   if (!state.depot) {
@@ -1867,7 +1868,7 @@ async function setUpDemoCity() {
     drawDepot();
   }
   if (state.couriers.length === 0) {
-    const orders = Number($('demo-count').value) || 300;
+    const orders = Number($('demo-count').value) || 1200;
     const capacity = Math.ceil(orders * 2 * DELIVERED * 1.1 / VANS);
     for (let number = 1; number <= VANS; number += 1) {
       await api('POST', '/api/couriers', { name: `Van ${number}`, capacity });

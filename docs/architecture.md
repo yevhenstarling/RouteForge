@@ -157,6 +157,7 @@ Every decision with its number, what it holds, and whether it holds now. A decis
 | [D85](#d85-one-person-holds-only-so-many-event-streams-open-in-place) | One person holds only so many event streams open | in place |
 | [D86](#d86-a-script-tries-the-page-in-a-browser-in-place) | A script tries the page in a browser | in place |
 | [D87](#d87-demo-orders-lie-on-the-streets-of-kyiv-in-place) | Demo orders lie on the streets of Kyiv | in place |
+| [D88](#d88-the-demonstrations-day-is-1200-orders-on-six-vans-in-place) | The demonstration's day is 1200 orders on six vans | in place |
 
 ### D1. One order is one stop, relative to a depot (in place)
 
@@ -759,7 +760,7 @@ Every random choice comes from a ChaCha8 generator seeded with the request's see
 
 Why:
 
-- A demonstration needs a few hundred orders, and a tool to make them would be a sixth crate. In the API it is one more endpoint.
+- A demonstration needs a thousand orders or so (D88), and a tool to make them would be a sixth crate. In the API it is one more endpoint.
 - With a seed, the scaling run of Phase 6 plans the same day with one solver and with four, and anybody can repeat a demonstration.
 - On the disc, the distance from the depot is the radius times the square root of a random number. Without the root the orders would crowd round the depot, since a ring's share of the disc grows with its radius.
 - Beyond some 30 km the flat map the plans are clustered on is no longer a good one (D29).
@@ -902,7 +903,7 @@ What the page can do beyond the list in the plan was decided by the project owne
 
 - **Discard** a plan that is done, beside Cancel.
 - **Budget and seed** for a plan: seconds or millions of moves for each route, and a seed. Left empty, the API gives its own (D45).
-- **Set up a demo city**, for an admin, on a database with no depot or no courier: a depot in Kyiv and four vans, through the endpoints an admin would use by hand. The vans are sized for the number of orders in the field beside the button. A demo order has a demand of 1 to 3 (D46), so a day asks for twice its number. Four in five of its orders are deliveries, and it is the deliveries a van has to have room for, since what is picked up comes on board when they are off it (D65). Each van takes a quarter of them and a tenth more. So the day that is generated next gives every van a route, whether it has 300 orders or 2000.
+- **Set up a demo city**, for an admin, on a database with no depot or no courier: a depot in Kyiv and six vans, four until D88, through the endpoints an admin would use by hand. The vans are sized for the number of orders in the field beside the button, 1200 unless it is changed. A demo order has a demand of 1 to 3 (D46), so a day asks for twice its number. Four in five of its orders are deliveries, and it is the deliveries a van has to have room for, since what is picked up comes on board when they are off it (D65). Each van takes a sixth of them and a tenth more. So the day that is generated next gives every van a route, whether it has 300 orders or 2000.
 
 What Phase 8 added to it:
 
@@ -1036,7 +1037,7 @@ How:
 
 - **Through the API alone.** The scripts log in, ask for plans, read them and the stats. Nothing is read from the database behind the API's back.
 - **Where the API is, and who the admin is, they ask the stack:** `docker compose port api 8080`, and the environment of the api container. So a `.env` with other values needs no telling.
-- **What a day needs is made if it is missing:** a depot and four vans, as the page's demo city (D52), and orders. The orders are as many as the couriers can deliver with a tenth to spare, the page's sum turned round (D65). Then every courier gets a route, and every solver has one to search for.
+- **What a day needs is made if it is missing:** a depot and six vans, as the page's demo city (D52, D88), and orders. The orders are as many as the couriers can deliver with a tenth to spare, the page's sum turned round (D65). Then every courier gets a route, and every solver has one to search for.
 - **The day is tomorrow.** The page opens on today, and on its day a script cancels a plan in progress and discards a done one.
 - **The time of a plan is the plan's own:** `finished_at` less `created_at`, both from the database's clock (D6). How often the script looks does not enter into it.
 - **The routes of every scaling run are compared with those of the first:** whose route it is, how long, and which stops in which order. Other routes end the script as a failure, because the same seed and the same moves give the same routes (D5).
@@ -1284,7 +1285,7 @@ A courier leaves the depot with everything it is to deliver. A delivery takes it
 
 Why:
 
-- Under D7 a pickup took room from the deliveries although the two are never on board together in full. The same vans now take more. The demonstration's day of 300 orders, four in five of them deliveries, is carried by four vans of 132, where D7 needed four of 165.
+- Under D7 a pickup took room from the deliveries although the two are never on board together in full. The same vans now take more. A day of 300 demo orders, four in five of them deliveries, is carried by four vans of 132, where D7 needed four of 165.
 - The two sums are exact, and not a safe estimate. A set of stops can be driven if and only if both fit: the courier leaves with all the deliveries, and comes back with all the pickups.
 - The order of the stops is the search's to decide, so the search is what has to mind the load. A rule that held clustering to what any order could carry would be D7 again.
 - Checked after the length, the load costs something only for a move that is about to be taken. Most are not.
@@ -1892,3 +1893,22 @@ What it does not do:
 Measured in Phase 13, on the day of the demonstration's scripts, 300 orders with seed 7: all 300 were points of the file, on both banks of the river. As the crow flies the day is 226.70 km, where the day of 5 km was 126.13. By road it is 476.17 km, where that day was 475.92: the day is longer, and its detours are gone (D57, D66).
 
 Tests: the file whole and in Kyiv; the points within a radius all there and no others, and none round Lviv; 2000 orders round Kyiv each on a street, within the radius and on every side of the depot; round Lviv, evenly over the disc. Taking the streets out of `scatter`, the radius out of the streets, and the disc away from a depot with no streets each made a test fail.
+
+### D88. The demonstration's day is 1200 orders on six vans (in place)
+
+Decided with the project owner on 2026-10-15. Changes the sizes of D52 and D57.
+
+The demo city of the page and the demonstration's scripts make six vans, each with room for a sixth of the orders asked for and a tenth more. The page asks for 1200 orders unless it is told otherwise, and the scripts generate as many as the vans carry with that tenth to spare, which is 1200 again. That is six vans of 352, and routes of some 200 stops, where it was four vans of 132, 300 orders, and routes of 49 to 85 stops.
+
+- **The stack keeps four solvers.** Six routes are more than four solvers search for at once, so two of them wait in the queue until a solver is free.
+- **The day before is in it.** A longer run from the same seed starts as the shorter one did (D46), so the 300 orders of the old day are among the 1200 of the new one.
+
+Why:
+
+- Load. With four routes on four solvers the queue was empty as soon as the plan was split, and a fifth solver had nothing to do. With six routes, work waits in the queue for a solver.
+- Routes of 50 to 100 stops, nearer to what a courier calls at in a day, were weighed and not taken: they would have given the system less to do.
+
+What it does not do:
+
+- A database that has couriers keeps them. The demo city is set up only where there is no courier, so a database that was set up before keeps its four vans, and a new one gets six.
+- The numbers of earlier phases, in this log and in `docs/plan.md`, are of the day of their time. The README's are of this one.

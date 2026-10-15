@@ -11,7 +11,7 @@
 #
 # Needs Docker, and nothing else. It brings the stack up and builds what is missing,
 # logs in as the admin the stack was started with, and makes what a day needs if it is
-# not there: a depot, four vans, and orders.
+# not there: a depot, six vans, and orders.
 #
 # The day it plans is tomorrow unless -Day says otherwise, so that it stays out of the
 # way of whoever is at the page, which opens on today. On its day it cancels a plan
@@ -304,15 +304,15 @@ try {
         # As the page sets up its demo city. A demo order has a demand of 1 to 3, and
         # four in five are deliveries, so a day sends 1.6 times its number out of the
         # depot. That is what a van needs room for: a pickup comes on board when
-        # deliveries are off (D65). Four vans take it with a tenth to spare.
-        $sizedFor = 300
+        # deliveries are off (D65). Six vans take it with a tenth to spare (D88).
+        $sizedFor = 1200
         if ($Orders -gt 0) { $sizedFor = $Orders }
-        $capacity = [int][math]::Ceiling($sizedFor * 2 * 0.8 * 1.1 / 4)
-        foreach ($van in 1..4) {
+        $capacity = [int][math]::Ceiling($sizedFor * 2 * 0.8 * 1.1 / 6)
+        foreach ($van in 1..6) {
             Api POST '/api/couriers' @{ name = "Van $van"; capacity = $capacity } | Out-Null
         }
         $couriers = @(Api GET '/api/couriers')
-        Write-Host "Added four vans, each for $capacity."
+        Write-Host "Added six vans, each for $capacity."
     }
     if (@(Api GET "/api/orders?service_date=$Day&limit=1").Count -eq 0) {
         $count = $Orders

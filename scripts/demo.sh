@@ -12,7 +12,7 @@
 #
 # Needs Docker, curl and jq. It brings the stack up and builds what is missing, logs in
 # as the admin the stack was started with, and makes what a day needs if it is not
-# there: a depot, four vans, and orders.
+# there: a depot, six vans, and orders.
 #
 # The day it plans is tomorrow unless DEMO_DAY says otherwise, so that it stays out of
 # the way of whoever is at the page, which opens on today. On its day it cancels a plan
@@ -351,16 +351,16 @@ if [ "$(json "$couriers" length)" = 0 ]; then
     # As the page sets up its demo city. A demo order has a demand of 1 to 3, and four in
     # five are deliveries, so a day sends 1.6 times its number out of the depot. That is
     # what a van needs room for: a pickup comes on board when deliveries are off (D65).
-    # Four vans take it with a tenth to spare.
-    sized_for=300
+    # Six vans take it with a tenth to spare (D88).
+    sized_for=1200
     if [ "$orders" -gt 0 ]; then sized_for=$orders; fi
-    capacity=$(jq -n --argjson orders "$sized_for" '$orders * 2 * 0.8 * 1.1 / 4 | ceil')
-    for van in 1 2 3 4; do
+    capacity=$(jq -n --argjson orders "$sized_for" '$orders * 2 * 0.8 * 1.1 / 6 | ceil')
+    for van in 1 2 3 4 5 6; do
         api POST /api/couriers "$(jq -n --arg name "Van $van" --argjson capacity "$capacity" \
             '{name: $name, capacity: $capacity}')" >/dev/null
     done
     couriers=$(api GET /api/couriers)
-    echo "Added four vans, each for $capacity."
+    echo "Added six vans, each for $capacity."
 fi
 existing=$(api GET "/api/orders?service_date=$day&limit=1")
 if [ "$(json "$existing" length)" = 0 ]; then
